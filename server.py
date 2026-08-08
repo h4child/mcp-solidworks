@@ -1685,7 +1685,8 @@ async def hole_wizard(face_x: float, face_y: float, face_z: float,
     hole_type: 'simple', 'counterbore', 'countersink', 'tapped' (threaded).
     size: nominal hole diameter (or thread size for tapped).
     depth: hole depth (ignored for through-all; use depth=0 to drill through).
-    thread_standard: 'ISO' or 'ANSI'."""
+    thread_standard: 'ISO' or 'ANSI' metric. Hole Wizard uses metric M-size
+    families; tapped holes use the matching ISO coarse pitch automatically."""
 
     def _impl():
         if size <= 0:
@@ -1695,52 +1696,137 @@ async def hole_wizard(face_x: float, face_y: float, face_z: float,
         fx = to_meters(face_x, unit)
         fy = to_meters(face_y, unit)
         fz = to_meters(face_z, unit)
-        doc.ClearSelection2(True)
-        if not _select_by_id(doc, "", "FACE", fx, fy, fz):
-            raise RuntimeError(f"No face found at ({face_x}, {face_y}, {face_z}).")
-
         types = {
-            "simple": 0,      # swWzdGeneralHole
-            "counterbore": 1, # swWzdCounterBore
-            "countersink": 2, # swWzdCounterSink
-            "tapped": 3,      # swWzdTap
+            # swWzdGeneralHoleTypes_e
+            "simple": 2,       # swWzdHole
+            "counterbore": 0,  # swWzdCounterBore
+            "countersink": 1,  # swWzdCounterSink
+            "tapped": 4,       # swWzdTap
         }
-        hw_type = types.get(hole_type.lower())
+        kind = hole_type.lower()
+        hw_type = types.get(kind)
         if hw_type is None:
             raise ValueError(f"Unknown hole_type '{hole_type}'. Use: {', '.join(types)}")
 
         size_m = to_meters(size, unit)
         depth_m = to_meters(depth, unit) if depth > 0 else 0.0
         end_cond = 0 if depth > 0 else 1  # 0=Blind, 1=ThroughAll
-        std = 1 if thread_standard.upper() == "ISO" else 0
+        standard_name = thread_standard.strip().upper()
+        standards = {
+            # swWzdHoleStandards_e and swWzdHoleStandardFastenerTypes_e.
+            "ISO": {
+                "standard": 8,
+                "simple": 143,       # swStandardISODrillSizes
+                "counterbore": 139,  # swStandardISOSocketHeadCap
+                "countersink": 141,  # swStandardISOCTSKFlatHead
+                "tapped": 147,       # swStandardISOTappedHole
+            },
+            "ANSI": {
+                "standard": 1,
+                "simple": 39,        # swStandardAnsiMetricDrillSizes
+                "counterbore": 33,   # swStandardAnsiMetricSocketHeadCapScrew
+                "countersink": 36,   # swStandardAnsiMetricFlatHead82
+                "tapped": 43,        # swStandardAnsiMetricTappedHole
+            },
+        }
+        standard = standards.get(standard_name)
+        if standard is None:
+            raise ValueError("thread_standard must be 'ISO' or 'ANSI'.")
+
+        size_mm = size_m * 1000.0
+        size_label = f"M{int(round(size_mm))}" if math.isclose(size_mm, round(size_mm), abs_tol=1e-6) else f"M{size_mm:g}"
+        drill_angle = math.radians(118)
+
+        if kind == "simple":
+            values = [1.0, drill_angle, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, -1.0, -1.0, -1.0, -1.0]
+        elif kind == "counterbore":
+            counterbore_depth = min(depth_m, size_m) if depth_m > 0 else size_m
+            values = [size_m * 2, counterbore_depth, 0.0, 1.0, drill_angle, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        elif kind == "countersink":
+            values = [size_m * 2, math.radians(90), 0.0, 1.0, drill_angle, 0.0, 0.0, 0.0, 0.0, -1.0, -1.0, -1.0]
+        else:
+            # Hole Wizard expects a complete metric thread designation, rather
+            # than just its nominal diameter, for a tapped hole.
+            coarse_pitches = {
+                1.0: 0.25, 1.2: 0.25, 1.4: 0.3, 1.6: 0.35, 1.8: 0.35,
+                2.0: 0.4, 2.5: 0.45, 3.0: 0.5, 3.5: 0.6, 4.0: 0.7,
+                5.0: 0.8, 6.0: 1.0, 8.0: 1.25, 10.0: 1.5, 12.0: 1.75,
+                14.0: 2.0, 16.0: 2.0, 18.0: 2.5, 20.0: 2.5, 22.0: 2.5,
+                24.0: 3.0, 27.0: 3.0, 30.0: 3.5, 33.0: 3.5, 36.0: 4.0,
+                39.0: 4.0, 42.0: 4.5, 45.0: 4.5, 48.0: 5.0, 52.0: 5.0,
+                56.0: 5.5, 60.0: 5.5, 64.0: 6.0, 68.0: 6.0, 72.0: 6.0,
+            }
+            pitch = next(
+                (p for nominal, p in coarse_pitches.items() if math.isclose(size_mm, nominal, abs_tol=1e-6)),
+                None,
+            )
+            if pitch is None:
+                supported = ", ".join(f"M{nominal:g}" for nominal in coarse_pitches)
+                raise ValueError(f"Tapped holes support these metric nominal sizes: {supported}.")
+            pitch_label = (
+                f"{pitch:.1f}"
+                if math.isclose(pitch, round(pitch, 1), abs_tol=1e-9)
+                else f"{pitch:.2f}".rstrip("0")
+            )
+            size_label = f"{size_label}x{pitch_label}"
+            thread_depth = depth_m if depth_m > 0 else size_m * 3
+            values = [
+                size_m * 0.8, thread_depth, thread_depth,
+                0.0, 0.0, 0.0, 0.0, drill_angle,
+                0.0, float(end_cond), 0.0, 0.0,
+            ]
+
+        # A Hole Wizard feature is positioned by preselected sketch points.
+        # Create the point on the requested face before calling HoleWizard4;
+        # creating it afterwards cannot change the hole position.
+        doc.ClearSelection2(True)
+        if not _select_by_id(doc, "", "FACE", fx, fy, fz):
+            raise RuntimeError(f"No face found at ({face_x}, {face_y}, {face_z}).")
+        doc.InsertSketch2(True)
+        point = None
+        try:
+            point = doc.SketchManager.CreatePoint(to_meters(hole_x, unit), to_meters(hole_y, unit), 0)
+        finally:
+            if doc.SketchManager.ActiveSketch is not None:
+                doc.InsertSketch2(True)
+
+        doc.ClearSelection2(True)
+        if point is None or not point.Select2(False, 0):
+            raise RuntimeError("Could not select the Hole Wizard placement point.")
 
         feat = doc.FeatureManager.HoleWizard4(
-            hw_type,  # HoleType
-            std,      # Standard
-            0,        # FastenerType
-            end_cond, # EndCondition
-            size_m,   # Diameter
-            depth_m,  # Depth
-            True,     # NearCountereboreDepth
-            size_m * 2, 0.0, 0.0, 0.0,  # counterbore/sink params
-            False, False, False, False,
+            hw_type,
+            standard["standard"],
+            standard[kind],
+            size_label,
+            end_cond,
+            size_m,
+            depth_m,
+            *values,
+            "",     # ThreadClass (used by ANSI inch threads only)
+            False,  # RevDir
+            False,  # UseFeatScope
+            True,   # UseAutoSelect
+            False,  # AssemblyFeatureScope
+            False,  # AutoSelectComponents
+            False,  # PropagateFeatureToParts
         )
         if feat is None:
             raise RuntimeError(
                 f"Hole Wizard failed on face at ({face_x},{face_y},{face_z}). "
-                "Ensure the face is flat and the hole parameters are valid."
+                f"Ensure the face is flat and '{size_label}' is available in the {standard_name} table."
             )
 
-        try:
-            hx = to_meters(hole_x, unit)
-            hy = to_meters(hole_y, unit)
-            doc.SketchManager.CreatePoint(hx, hy, 0)
-            doc.SketchManager.InsertSketch(True)
-        except Exception:
-            pass
+        feature = win32com.client.Dispatch(feat)
 
-        return {"hole_type": hole_type, "size": size, "depth": depth if depth > 0 else "through",
-                "unit": unit or _default_unit}
+        return {
+            "feature": feature.Name,
+            "hole_type": kind,
+            "size": size,
+            "depth": depth if depth > 0 else "through",
+            "thread_standard": standard_name,
+            "unit": unit or _default_unit,
+        }
 
     return await _run(_impl)
 
