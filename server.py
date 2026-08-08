@@ -4513,13 +4513,19 @@ async def switch_configuration(name: str) -> dict:
                 target = cfg
                 break
 
-        ok = doc.ShowConfiguration2(target)
-        if not ok:
+        doc.ShowConfiguration2(target)
+        active_name = ""
+        try:
+            active = doc.ConfigurationManager.ActiveConfiguration
+            active_name = active.Name if not callable(getattr(active, "Name", None)) else active.Name()
+        except Exception:
+            pass
+        if active_name.lower() != target.lower():
             raise RuntimeError(
                 f"Could not switch to configuration '{name}'. "
                 f"Available configurations: {', '.join(available) if available else '(none)'}."
             )
-        return {"active_configuration": target, "available": available}
+        return {"active_configuration": active_name, "available": available}
 
     return await _run(_impl)
 
