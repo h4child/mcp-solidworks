@@ -1523,13 +1523,26 @@ async def shell_body(thickness: float = 2, remove_face_at_x: Optional[float] = N
             fx = to_meters(remove_face_at_x, unit)
             fy = to_meters(remove_face_at_y, unit)
             fz = to_meters(remove_face_at_z, unit)
-            if not _select_by_id(doc, "", "FACE", fx, fy, fz):
+            empty_callout = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+            if not doc.Extension.SelectByID2("", "FACE", fx, fy, fz, False, 1, empty_callout, 0):
                 raise RuntimeError(
                     f"No face found at ({remove_face_at_x}, {remove_face_at_y}, {remove_face_at_z})."
                 )
 
-        feat = doc.FeatureManager.InsertFeatureShell(t_m, False)
-        if feat is None:
+        shell_count_before = sum(
+            1
+            for raw_feature in doc.FeatureManager.GetFeatures(False) or ()
+            if win32com.client.Dispatch(raw_feature).GetTypeName2 == "Shell"
+        )
+        # InsertFeatureShell belongs to IModelDoc2 and returns void over COM.
+        doc.InsertFeatureShell(t_m, False)
+        _ = doc.EditRebuild3
+        shell_count_after = sum(
+            1
+            for raw_feature in doc.FeatureManager.GetFeatures(False) or ()
+            if win32com.client.Dispatch(raw_feature).GetTypeName2 == "Shell"
+        )
+        if shell_count_after <= shell_count_before:
             raise RuntimeError(
                 "Shell failed. Ensure the body has sufficient thickness "
                 "and select a face to remove for an open shell."

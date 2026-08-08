@@ -42,6 +42,11 @@ ferramentas na versão 4.2.0, consistentes com `manifest.json`.
 | `create_sketch_on_face` | Exige uma face plana real e coordenada em unidade de documento. | Bloco de teste extrudado de 10 mm e seleção da face superior em `(0, 0, 10)` mm. | Abriu e fechou um segundo esboço sobre a face superior com sucesso. |
 | `add_sketch_dimension` | `AddDimension2` podia abrir a caixa de valor e bloquear o COM; o objeto COM era chamado incorretamente como função ao definir o valor. | Desativa temporariamente `swInputDimValOnCreate`, restaura a preferência do usuário e usa diretamente `IDisplayDimension.GetDimension2(0).SystemValue`. | Criou uma dimensão de linha e confirmou o valor de 35 mm sem diálogo. |
 | `add_sketch_relation` | — | Linha diagonal isolada, seleção por coordenada e relação `horizontal`. | A relação foi inserida; `ISketchSegment.GetRelationsCount` retornou 1. |
+| `extrude_sketch` / `measure_body` | A primeira asserção de teste usava a chave errada (`volume` em vez de `volume_m3`) no retorno da medição. | Validação pela caixa de corpo e pelas propriedades de massa. | Extrusão de 40 × 20 × 10 mm aprovada; volume, área, massa, centro de massa e caixa retornaram valores coerentes. |
+| `cut_extrude` | — | Furo circular atravessante em bloco de teste. | Aprovado: volume caiu de `8.0e-06` para `7.2146e-06 m³`. |
+| `revolve_sketch` | — | Perfil fechado afastado de uma linha de centro. | Revolução completa aprovada; sólido medido com volume positivo. |
+| `fillet_edges` / `chamfer_edges` | — | Blocos extrudados com seleção automática de todas as 12 arestas. | Recursos `Fillet` e `Chamfer` criados e listados com sucesso. |
+| `shell_body` | Usava `IFeatureManager.InsertFeatureShell`, inexistente no binding 2025; a face removida recebia marca de seleção incorreta. | Uso de `IModelDoc2.InsertFeatureShell`, face com marca 1 e verificação pelo novo recurso `Shell`. | Casca aberta de 2 mm aprovada; volume caiu de `8.0e-06` para `3.392e-06 m³`. |
 
 ## Execução de integração real
 
