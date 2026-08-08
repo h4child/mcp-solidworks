@@ -58,6 +58,7 @@ ferramentas na versão 4.2.0, consistentes com `manifest.json`.
 | `create_3d_sketch` | — | Peça temporária vazia; verificação pelo status do esboço ativo. | Abriu `3DSketch1` e reportou corretamente o tipo `3D`. |
 | `draw_line_3d` | — | Novo esboço 3D temporário com uma linha espacial. | O esboço 3D fechado continha um segmento de `(0, 0, 0)` até `(100, 50, 25)` mm. |
 | `create_base_flange` | A chamada obsoleta `InsertSheetMetalBaseFlange2` retornava `None` mesmo com perfil fechado válido. | Definição moderna `swFmBaseFlange` inicializada por `IBaseFlangeFeatureData`, com allowance, alívio e parâmetros de chapa explicitamente configurados. | Criou `Flange-base1` (`SMBaseFlange`), `SheetMetal` e `FlatPattern` para uma chapa de 100 × 50 × 2 mm. |
+| `add_sheet_metal_bend` | Chamava `InsertBends2` no `FeatureManager`, que não o expõe; além disso, não fornecia K-factor e a API retornava `False`. | Uso de `IPartDoc.InsertBends2` com K-factor `0.5`, alívio automático e flat pattern. | Converteu uma caixa temporária com casca de 2 mm em `Chapa metálica2` e `Padrão-Plano2`. |
 
 ## Execução de integração real
 

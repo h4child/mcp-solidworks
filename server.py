@@ -2562,21 +2562,34 @@ async def add_sheet_metal_bend(
 
         r_m = to_meters(bend_radius, unit)
 
-        # InsertBends2(Radius, UseBendTable, UseKfactor, UseBendAllowance,
-        #   UseAutoRelief, OffsetRatio, DoFlatten)
-        feat = doc.FeatureManager.InsertBends2(
-            r_m, False, False, False, True, 0.5, False,
+        sheet_metal_before = {
+            win32com.client.Dispatch(raw_feature).Name
+            for raw_feature in doc.FeatureManager.GetFeatures(False) or ()
+            if win32com.client.Dispatch(raw_feature).GetTypeName2 == "SheetMetal"
+        }
+        # InsertBends2 belongs to IPartDoc, not IFeatureManager. It requires
+        # either a K-factor or a bend allowance; -1 for both silently fails
+        # on a newly shelled part. It returns a Boolean rather than an IFeature.
+        ok = doc.InsertBends2(
+            r_m, "", 0.5, -1.0, True, 0.5, True,
         )
 
-        if feat is None:
+        if not ok:
             raise RuntimeError(
                 "Insert-bends failed. The active part must be a constant-thickness "
                 "thin/shelled body (use shell_body first), and you must select a "
                 "fixed face. To add a folded lip instead, use add_sheet_metal_edge_flange."
             )
 
-        feat_dispatch = win32com.client.Dispatch(feat)
-        feat_name = feat_dispatch.Name if hasattr(feat_dispatch, "Name") else str(feat_dispatch)
+        sheet_metal_after = [
+            win32com.client.Dispatch(raw_feature).Name
+            for raw_feature in doc.FeatureManager.GetFeatures(False) or ()
+            if win32com.client.Dispatch(raw_feature).GetTypeName2 == "SheetMetal"
+        ]
+        feat_name = next(
+            (name for name in sheet_metal_after if name not in sheet_metal_before),
+            sheet_metal_after[-1] if sheet_metal_after else "SheetMetal",
+        )
 
         return {
             "feature": feat_name,
