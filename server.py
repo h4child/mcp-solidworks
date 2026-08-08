@@ -5482,6 +5482,193 @@ async def create_automotive_piston(
         ) from exc
 
 
+@mcp.tool()
+async def create_automotive_piston_assembly(
+    bore_diameter: float = 86,
+    piston_height: float = 75,
+    connecting_rod_length: float = 135,
+    wrist_pin_diameter: float = 22,
+    crank_bore_diameter: float = 42,
+    rod_width: float = 16,
+    unit: Optional[str] = None,
+    save_path: Optional[str] = None,
+) -> dict:
+    """Create a complete automotive piston-and-connecting-rod assembly.
+
+    This is the moving assembly represented in engine cutaway drawings: the
+    piston with three ring grooves and a hollow skirt, a transverse wrist pin,
+    an I-style connecting rod, a plain big-end bearing, and a separate rod cap.
+    Each component is saved as an editable SolidWorks part, then inserted into
+    a final ``.SLDASM`` assembly at the correct shared pin/crank centerlines.
+
+    ``connecting_rod_length`` is the distance between the wrist-pin and
+    crank-pin centers.  All dimensions use ``unit`` (mm by default).  Pass
+    ``save_path`` for the final assembly; component parts are saved beside it.
+    """
+
+    values = {
+        "bore_diameter": bore_diameter,
+        "piston_height": piston_height,
+        "connecting_rod_length": connecting_rod_length,
+        "wrist_pin_diameter": wrist_pin_diameter,
+        "crank_bore_diameter": crank_bore_diameter,
+        "rod_width": rod_width,
+    }
+    if any(value <= 0 for value in values.values()):
+        raise ValueError("All assembly dimensions must be positive.")
+    if wrist_pin_diameter >= bore_diameter:
+        raise ValueError("wrist_pin_diameter must be smaller than bore_diameter.")
+    if crank_bore_diameter >= bore_diameter:
+        raise ValueError("crank_bore_diameter must be smaller than bore_diameter.")
+    if connecting_rod_length < piston_height:
+        raise ValueError("connecting_rod_length must be at least piston_height.")
+    if rod_width >= bore_diameter:
+        raise ValueError("rod_width must be smaller than bore_diameter.")
+
+    completed: list[str] = []
+    stage = "initialization"
+    output_dir = os.path.dirname(os.path.abspath(save_path)) if save_path else os.path.join(os.getcwd(), "tests", "output")
+    assembly_path = os.path.abspath(save_path) if save_path else os.path.join(output_dir, "automotive_piston_connecting_rod_assembly.SLDASM")
+    base_name = os.path.splitext(os.path.basename(assembly_path))[0]
+    part_paths = {
+        "piston": os.path.join(output_dir, f"{base_name}_piston.SLDPRT"),
+        "connecting_rod": os.path.join(output_dir, f"{base_name}_connecting_rod.SLDPRT"),
+        "wrist_pin": os.path.join(output_dir, f"{base_name}_wrist_pin.SLDPRT"),
+        "bearing": os.path.join(output_dir, f"{base_name}_big_end_bearing.SLDPRT"),
+        "rod_cap": os.path.join(output_dir, f"{base_name}_rod_cap.SLDPRT"),
+    }
+
+    radius = bore_diameter / 2
+    pin_z = piston_height * 0.48
+    crank_z = pin_z - connecting_rod_length
+    small_end_outer = wrist_pin_diameter / 2 + 5
+    big_end_outer = crank_bore_diameter / 2 + 5
+    beam_half_width = max(5.0, wrist_pin_diameter * 0.30)
+
+    async def _save_colored_part(path: str, rgb: tuple[int, int, int]) -> None:
+        await set_appearance(*rgb, "body")
+        await save_document(path)
+        # Components are deliberately closed while the next part is built.
+        # SolidWorks reloads them silently during assembly insertion, avoiding
+        # a growing set of visible document windows on low-memory machines.
+        await close_document(save=False)
+
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+
+        stage = "piston component"
+        await create_automotive_piston(
+            bore_diameter=bore_diameter,
+            height=piston_height,
+            wrist_pin_diameter=wrist_pin_diameter,
+            unit=unit,
+            save_path=part_paths["piston"],
+        )
+        await close_document(save=False)
+        completed.append(stage)
+
+        # The rod is built on the Right plane (Y/Z): its small end shares the
+        # wrist-pin centerline and its big end is one rod length below it.
+        stage = "connecting-rod component"
+        await create_new_part()
+        await create_sketch("right")
+        await draw_circle(0, pin_z, small_end_outer, unit)
+        await close_sketch()
+        await extrude_sketch(rod_width, both_directions=True, unit=unit)
+        await create_sketch("right")
+        await draw_circle(0, crank_z, big_end_outer, unit)
+        await close_sketch()
+        await extrude_sketch(rod_width, both_directions=True, unit=unit)
+        await create_sketch("right")
+        await draw_rectangle(-beam_half_width, crank_z, beam_half_width, pin_z, unit)
+        await close_sketch()
+        await extrude_sketch(rod_width, both_directions=True, unit=unit)
+        await create_sketch("right")
+        await draw_circle(0, pin_z, wrist_pin_diameter / 2 + 0.5, unit)
+        await close_sketch()
+        await cut_extrude(through_all=True, both_directions=True, unit=unit)
+        await create_sketch("right")
+        await draw_circle(0, crank_z, crank_bore_diameter / 2, unit)
+        await close_sketch()
+        await cut_extrude(through_all=True, both_directions=True, unit=unit)
+        await _save_colored_part(part_paths["connecting_rod"], (65, 90, 125))
+        completed.append(stage)
+
+        stage = "wrist-pin component"
+        await create_new_part()
+        await create_sketch("right")
+        await draw_circle(0, pin_z, wrist_pin_diameter / 2, unit)
+        await close_sketch()
+        await extrude_sketch(bore_diameter + 6, both_directions=True, unit=unit)
+        await _save_colored_part(part_paths["wrist_pin"], (165, 175, 190))
+        completed.append(stage)
+
+        stage = "big-end bearing component"
+        await create_new_part()
+        await create_sketch("right")
+        await draw_circle(0, crank_z, crank_bore_diameter / 2 - 0.8, unit)
+        await draw_circle(0, crank_z, crank_bore_diameter / 2 - 3.3, unit)
+        await close_sketch()
+        await extrude_sketch(rod_width + 2, both_directions=True, unit=unit)
+        await _save_colored_part(part_paths["bearing"], (185, 140, 55))
+        completed.append(stage)
+
+        # A separate outer collar represents the removable big-end rod cap.
+        # It is offset to one side of the rod in the final assembly, making the
+        # cap visually distinct instead of being hidden inside the rod body.
+        stage = "rod-cap component"
+        await create_new_part()
+        await create_sketch("right")
+        await draw_circle(0, crank_z, big_end_outer + 2.5, unit)
+        await draw_circle(0, crank_z, crank_bore_diameter / 2 - 0.3, unit)
+        await close_sketch()
+        await extrude_sketch(4, both_directions=True, unit=unit)
+        await _save_colored_part(part_paths["rod_cap"], (95, 100, 110))
+        completed.append(stage)
+
+        stage = "assembly insertion"
+        assembly = await create_new_assembly()
+        await insert_component(part_paths["piston"], unit=unit)
+        await insert_component(part_paths["connecting_rod"], unit=unit)
+        await insert_component(part_paths["wrist_pin"], unit=unit)
+        await insert_component(part_paths["bearing"], unit=unit)
+        await insert_component(part_paths["rod_cap"], x=rod_width + 4, unit=unit)
+        completed.append(stage)
+
+        stage = "assembly save and view"
+        await save_document(assembly_path)
+        await set_view("isometric")
+        await zoom_to_fit()
+        await save_document()
+        completed.append(stage)
+
+        return {
+            "assembly": assembly["title"],
+            "save_path": assembly_path,
+            "components": part_paths,
+            "features": [
+                "piston crown/skirt with three ring grooves",
+                "hollow underside and wrist-pin bore",
+                "wrist pin",
+                "I-style connecting rod with small and big ends",
+                "plain big-end bearing",
+                "separate connecting-rod cap",
+            ],
+            "completed_stages": completed,
+        }
+    except Exception as exc:
+        try:
+            active = await get_document_info()
+        except Exception:
+            active = {"title": "(no active document)", "type": "Unknown"}
+        raise RuntimeError(
+            f"Automotive piston assembly creation stopped during '{stage}'. "
+            f"Completed stages: {', '.join(completed) or '(none)'}. "
+            f"Components saved in '{output_dir}'. Active document: {active}. "
+            f"Root cause: {exc}"
+        ) from exc
+
+
 # ===========================================================================
 # Configuration tools
 # ===========================================================================

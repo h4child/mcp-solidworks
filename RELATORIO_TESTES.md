@@ -134,6 +134,18 @@ permanece aprovada (5 de 5 testes). Os testes criaram documentos salvos apenas e
 `tests/output/`, fecharam somente esses documentos temporários e mantiveram os
 documentos já abertos pelo usuário intactos.
 
+## Current certified result
+
+The new `create_automotive_piston_assembly` tool was live-tested in SolidWorks
+2025 revision 33.4.1. It creates five editable components: piston, wrist pin,
+connecting rod, big-end plain bearing, and rod cap; then it saves and opens the
+final assembly `automotive_piston_connecting_rod_reference_001.SLDASM`.
+
+The five components were resolved in the active assembly and the full model is
+left open in isometric view. This extends the certified MCP surface to **98
+tools**. Component documents are silently loaded only as assembly references;
+the assembly is the one active visible document.
+
 ## Controles aplicados durante os testes
 
 - A conexão reutilizou a instância aberta, sem iniciar processo adicional.
