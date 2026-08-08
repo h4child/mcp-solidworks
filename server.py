@@ -5278,34 +5278,58 @@ async def set_appearance(
             if not doc.Extension.SelectByID2("", "FACE", fx, fy, fz, False, 0, empty, 0):
                 raise RuntimeError(f"No face found at ({face_x}, {face_y}, {face_z}).")
 
-        color_ref = red + (green << 8) + (blue << 16)
+        # The first three values are normalized RGB.  The remaining values
+        # describe ambient, diffuse, specular, shininess, transparency, and
+        # emission respectively (IModelDocExtension/IFace2 contract).
+        material_values = [
+            red / 255.0,
+            green / 255.0,
+            blue / 255.0,
+            0.2,
+            0.8,
+            0.5,
+            0.3,
+            0.0,
+            0.0,
+        ]
+        # SolidWorks requires a SAFEARRAY of doubles here. Passing a Python
+        # list creates a SAFEARRAY of VARIANTs and silently corrupts the color
+        # channels on this COM proxy.
+        material_values = win32com.client.VARIANT(
+            pythoncom.VT_ARRAY | pythoncom.VT_R8, material_values,
+        )
+        this_configuration = 1  # swThisConfiguration
 
         applied = False
         try:
             if target.lower() == "face":
                 sel = doc.SelectionManager.GetSelectedObject6(1, -1)
-                sel = win32com.client.Dispatch(sel)
-                mat_props = sel.MaterialPropertyValues
-                mat_props = list(mat_props) if mat_props else [0.0] * 9
-                mat_props[0] = red / 255.0
-                mat_props[1] = green / 255.0
-                mat_props[2] = blue / 255.0
-                sel.MaterialPropertyValues = mat_props
+                face = win32com.client.Dispatch(
+                    sel,
+                    "IFace2",
+                    "{4A8BA4D8-DA25-4B75-8E2D-4922B74D81ED}",
+                )
+                face.SetMaterialPropertyValues2(
+                    material_values, this_configuration, None,
+                )
                 applied = True
             else:
-                model = doc
-                mat_props = [red / 255.0, green / 255.0, blue / 255.0, 1.0, 1.0, 0.5, 0.3, 0.0, 0.0]
-                model.MaterialPropertyValues = mat_props
+                extension = win32com.client.Dispatch(
+                    doc.Extension,
+                    "IModelDocExtension",
+                    "{99F4D4AF-F268-4EE1-8C55-041F7BECF879}",
+                )
+                extension.SetMaterialPropertyValues(
+                    material_values, this_configuration, None,
+                )
                 applied = True
-        except Exception:
-            try:
-                doc.SetColorTable(color_ref)
-                applied = True
-            except Exception:
-                pass
+        except Exception as exc:
+            raise RuntimeError(f"Failed to set {target.lower()} appearance: {exc}") from exc
 
         try:
-            doc.GraphicsRedraw2()
+            redraw = doc.GraphicsRedraw2
+            if callable(redraw):
+                redraw()
         except Exception:
             pass
 
