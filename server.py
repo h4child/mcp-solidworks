@@ -2212,22 +2212,94 @@ async def add_end_cap(
         t_m = to_meters(thickness, unit)
         off_m = to_meters(offset, unit) if offset != 0 else 0.0
 
-        doc.ClearSelection2(True)
         fx, fy, fz = to_meters(face_x, unit), to_meters(face_y, unit), to_meters(face_z, unit)
-        empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+        requested_point = (fx, fy, fz)
 
-        if not doc.Extension.SelectByID2("", "FACE", fx, fy, fz, False, 0, empty, 0):
-            raise RuntimeError(f"No face found at ({face_x}, {face_y}, {face_z}).")
+        # A hollow member's end face shares its edges with the side faces.
+        # SelectByID2 at a coordinate can therefore select a side face even
+        # when the coordinate is on the end. Locate the closest planar end
+        # face and ray-select it from outside the member instead.
+        end_face_candidates = []
+        for raw_body in doc.GetBodies2(0, True) or ():
+            body = win32com.client.Dispatch(raw_body)
+            for raw_face in body.GetFaces() or ():
+                face = win32com.client.Dispatch(raw_face)
+                box = tuple(face.GetBox)
+                mins, maxs = box[:3], box[3:]
+                spans = [maxs[index] - mins[index] for index in range(3)]
+                axis = min(range(3), key=lambda index: spans[index])
+                if spans[axis] > 1e-7:
+                    continue
+                distance_sq = sum(
+                    (
+                        0.0
+                        if mins[index] <= requested_point[index] <= maxs[index]
+                        else min(
+                            abs(requested_point[index] - mins[index]),
+                            abs(requested_point[index] - maxs[index]),
+                        )
+                    ) ** 2
+                    for index in range(3)
+                )
+                end_face_candidates.append((distance_sq, axis, mins[axis]))
 
-        # InsertEndCapFeature(Depth, BIsGivenOffset, BIsChamfer, OffsetValue,
-        #   WallThicknessRatio, ChamferValue) — 6 args.
-        feat = doc.FeatureManager.InsertEndCapFeature(
-            t_m,                        # Depth (cap thickness)
-            bool(offset != 0),          # BIsGivenOffset
-            False,                      # BIsChamfer
-            off_m,                      # OffsetValue
-            0.5,                        # WallThicknessRatio
-            0.0,                        # ChamferValue
+        if not end_face_candidates:
+            raise RuntimeError(
+                f"No planar structural-member end face was found near ({face_x}, {face_y}, {face_z})."
+            )
+
+        _, axis, face_coordinate = min(end_face_candidates, key=lambda item: item[0])
+        ray_radius = 1e-4
+        selected_end_face = False
+        for outward_sign in (1.0, -1.0):
+            ray_start = list(requested_point)
+            ray_start[axis] = face_coordinate + outward_sign * 0.01
+            ray_vector = [0.0, 0.0, 0.0]
+            ray_vector[axis] = -outward_sign
+            doc.ClearSelection2(True)
+            if not doc.Extension.SelectByRay(
+                *ray_start,
+                *ray_vector,
+                ray_radius,
+                2,      # swSelFACES
+                False,
+                0,
+                0,
+            ):
+                continue
+            selected_face = doc.SelectionManager.GetSelectedObject6(1, 0)
+            if selected_face is None:
+                continue
+            selected_box = tuple(win32com.client.Dispatch(selected_face).GetBox)
+            selected_spans = [
+                selected_box[index + 3] - selected_box[index] for index in range(3)
+            ]
+            if (
+                selected_spans[axis] <= 1e-7
+                and abs(selected_box[axis] - face_coordinate) <= 1e-6
+            ):
+                selected_end_face = True
+                break
+
+        if not selected_end_face:
+            raise RuntimeError(
+                f"Could not select the structural-member end face near ({face_x}, {face_y}, {face_z})."
+            )
+
+        # InsertEndCapFeature3 is the supported API in SolidWorks 2025. The
+        # final value must be a swEndCapThicknessDirection_e value; 1 means
+        # extend the cap outward from the selected end.
+        feat = doc.FeatureManager.InsertEndCapFeature3(
+            t_m,               # Depth (cap thickness)
+            bool(offset != 0), # BIsGivenOffset
+            False,             # BIsChamfer
+            off_m,             # OffsetValue
+            0.5,               # WallThicknessRatio
+            0.0,               # ChamferValue / fillet radius
+            False,             # BIsCornerTreatment
+            0.0,               # DepthOffset
+            False,             # BIsReverse
+            1,                 # swExtendOutward
         )
 
         if feat is None:
