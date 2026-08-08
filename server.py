@@ -1544,8 +1544,10 @@ async def loft_sketches(sketch_names: list) -> dict:
                 raise RuntimeError(f"Could not select sketch '{name}'.")
 
         feat = doc.FeatureManager.InsertProtrusionBlend2(
-            False, True, True, 1, 0, 0, False, 0, 0, 0,
-            True, True, True,
+            False, True, True, 1.0, 0, 0,
+            0.0, 0.0, False, False,
+            False, 0.0, 0.0, 0,
+            True, True, True, 0,
         )
         if feat is None:
             raise RuntimeError(

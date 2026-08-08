@@ -110,6 +110,7 @@ ferramentas na versão 4.2.0, consistentes com `manifest.json`.
 | `get_sketch_status` | Sem defeito. | Não aplicável. | Confirmou estado inativo antes/depois e estado ativo com nome de esboço durante a edição. |
 | `close_sketch` | Sem defeito. | Não aplicável. | Encerrou o esboço ativo e retornou confirmação de fechamento. |
 | `sweep_sketch` | `InsertProtrusionSwept4` recebia 21 argumentos, enquanto a interface SolidWorks 2025 exige 20. | Assinatura corrigida para os 20 parâmetros publicados, inclusive `PathAlign`, escopo e direção. | Varreu um perfil circular por uma trajetória ortogonal e confirmou a criação de um sólido. |
+| `loft_sketches` | `InsertProtrusionBlend2` recebia somente 13 parâmetros e a API exigia 18. | Assinatura completada com comprimentos/direções de tangência, opções de corpo fino, escopo e influência de curva-guia. | Criou recurso `Blend` e um sólido a partir de dois perfis circulares em planos distintos. |
 
 ## Execução de integração real
 
