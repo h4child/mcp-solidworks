@@ -5073,26 +5073,29 @@ async def interference_check() -> dict:
         assy = _active_assembly()
         assy.ClearSelection2(True)
 
-        # ToolsCheckInterference2(NumComponents, LpComponents, CoincidentInterference,
-        #   PComp[out], PFace[out]) -> count. NumComponents=0 checks the whole
-        #   assembly. (There is no CreateInterferenceDetectionMgr in this API.)
-        count = 0
+        # IInterferenceDetectionMgr calculates actual interference pairs. In
+        # contrast, ToolsCheckInterference2 is void and only fills output arrays,
+        # so treating its return as a count silently reports false negatives.
+        manager = None
         try:
-            comp_out = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_VARIANT, None)
-            face_out = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_VARIANT, None)
-            empty_arr = win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, None)
-            count = assy.ToolsCheckInterference2(0, empty_arr, False, comp_out, face_out)
+            manager = win32com.client.Dispatch(
+                assy.InterferenceDetectionManager,
+                "IInterferenceDetectionMgr",
+                "{EAE282BD-588A-4C1B-AD99-5FE6081C4585}",
+            )
+            manager.TreatCoincidenceAsInterference = False
+            count = int(manager.GetInterferenceCount())
         except Exception as e:
-            log.warning("ToolsCheckInterference2 failed: %s", e)
-            try:
-                count = assy.ToolsCheckInterference2(0, None, False)
-            except Exception as e2:
-                raise RuntimeError(
-                    f"Interference check is not available through this SolidWorks API "
-                    f"build ({e2})."
-                )
+            raise RuntimeError(
+                f"Interference check is not available through this SolidWorks API build ({e})."
+            ) from e
+        finally:
+            if manager is not None:
+                try:
+                    manager.Done()
+                except Exception:
+                    pass
 
-        count = int(count) if count else 0
         return {
             "interferences": count,
             "clear": count == 0,
