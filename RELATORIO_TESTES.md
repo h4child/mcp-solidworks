@@ -114,6 +114,10 @@ ferramentas na versão 4.2.0, consistentes com `manifest.json`.
 | `create_configuration` | Sem defeito. | Não aplicável. | Criou `MCP_LIVE_VARIANT` com comentário e confirmou sua presença no gerenciador de configurações. |
 | `set_custom_property` | Sem defeito. | Não aplicável. | Gravou `PartNumber=MCP-218` no nível do documento de uma peça temporária. |
 | `get_custom_properties` | Sem defeito. | Não aplicável. | Retornou a propriedade gravada com valor bruto e resolvido iguais a `MCP-218`. |
+| `set_units` | Sem defeito. | Não aplicável. | Definiu `cm`; uma extrusão sem unidade explícita resultou em 0,02 m e a unidade foi restaurada para `mm`. |
+| `set_view` | Sem defeito. | Não aplicável. | Alternou de vista frontal para isométrica e confirmou mudança na orientação do `IModelView`. |
+| `zoom_to_fit` | Sem defeito. | Não aplicável. | Ajustou a vista do modelo; a escala do `IModelView` permaneceu positiva. |
+| `zoom_to_area` | Sem defeito. | Não aplicável. | Ampliou uma região de 6 cm; a escala da vista aumentou de 1,38 para 3,60. |
 
 ## Execução de integração real
 
