@@ -5691,9 +5691,10 @@ async def create_automotive_piston_with_connecting_rod(
 ) -> dict:
     """Create a clear single-part automotive piston and connecting-rod model.
 
-    The tool produces the complete silhouette shown in engine reference
-    drawings: a cylindrical piston with three ring grooves, a small-end pad,
-    a straight connecting-rod beam, and a circular big-end pad.  It is a
+    The tool produces the complete upright silhouette shown in engine reference
+    drawings: a cylindrical piston with crown and three ring grooves at the
+    top, a small-end pad below the skirt, a straight connecting-rod beam, and
+    a circular big-end pad.  It is a
     *single-body conceptual/reference model* intended for visual design and
     demonstrations; use ``create_automotive_piston_assembly`` when separately
     editable piston, pin, bearing, cap, and rod component files are required.
@@ -5725,8 +5726,10 @@ async def create_automotive_piston_with_connecting_rod(
             await save_document(save_path)
             completed.append(stage)
 
-        stage = "piston crown and skirt"
-        await create_sketch("front")
+        # The Top-plane extrusion makes the piston axis vertical in the final
+        # model: crown/ring pack at the top and rod under the skirt.
+        stage = "upright piston crown and skirt"
+        await create_sketch("top")
         await draw_circle(0, 0, radius, unit)
         await close_sketch()
         await extrude_sketch(piston_height, unit=unit)
@@ -5734,7 +5737,7 @@ async def create_automotive_piston_with_connecting_rod(
 
         stage = "three ring grooves"
         for offset in ring_offsets:
-            plane = await create_reference_plane("front", offset, unit=unit)
+            plane = await create_reference_plane("top", offset, unit=unit)
             await create_sketch(plane["plane"])
             await draw_circle(0, 0, radius + 1.5, unit)
             await draw_circle(0, 0, radius - 1.5, unit)

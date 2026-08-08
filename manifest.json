@@ -2,7 +2,7 @@
   "manifest_version": "0.2",
   "name": "solidworks-mcp",
   "display_name": "SolidWorks MCP",
-  "version": "4.5.0",
+  "version": "4.5.1",
   "description": "Servidor MCP para automacao do SolidWorks via API COM, escrito com o SDK oficial (FastMCP)",
   "long_description": "Controla o SolidWorks (criar pecas/montagens, esbocos, extrusao, corte, filete, chanfro, etc.) via COM, exposto como ferramentas MCP.",
   "author": {

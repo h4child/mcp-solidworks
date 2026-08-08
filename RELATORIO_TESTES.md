@@ -142,9 +142,10 @@ rod, big-end plain bearing, and rod cap.
 
 The new `create_automotive_piston_with_connecting_rod` tool was then live-tested
 as the reliable visual-reference workflow. It generated and left open
-`automotive_piston_with_rod_final_001.SLDPRT`, a clean one-body silhouette with
-the piston crown/skirt, three ring grooves, visible connecting-rod beam, small
-end pad, and big-end pad. The exported isometric view was visually inspected.
+`automotive_piston_with_rod_upright_final_001.SLDPRT`, a clean one-body
+silhouette with crown/ring pack at the top, skirt below it, visible
+connecting-rod beam, small-end pad, and big-end pad. Front, back, top, bottom,
+and isometric exports were visually inspected after the orientation correction.
 
 This extends the certified MCP surface to **99 tools**. The integrated tool is
 explicitly documented as a conceptual one-body model; the assembly tool remains
