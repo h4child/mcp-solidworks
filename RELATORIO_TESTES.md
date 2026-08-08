@@ -112,6 +112,8 @@ ferramentas na versão 4.2.0, consistentes com `manifest.json`.
 | `sweep_sketch` | `InsertProtrusionSwept4` recebia 21 argumentos, enquanto a interface SolidWorks 2025 exige 20. | Assinatura corrigida para os 20 parâmetros publicados, inclusive `PathAlign`, escopo e direção. | Varreu um perfil circular por uma trajetória ortogonal e confirmou a criação de um sólido. |
 | `loft_sketches` | `InsertProtrusionBlend2` recebia somente 13 parâmetros e a API exigia 18. | Assinatura completada com comprimentos/direções de tangência, opções de corpo fino, escopo e influência de curva-guia. | Criou recurso `Blend` e um sólido a partir de dois perfis circulares em planos distintos. |
 | `create_configuration` | Sem defeito. | Não aplicável. | Criou `MCP_LIVE_VARIANT` com comentário e confirmou sua presença no gerenciador de configurações. |
+| `set_custom_property` | Sem defeito. | Não aplicável. | Gravou `PartNumber=MCP-218` no nível do documento de uma peça temporária. |
+| `get_custom_properties` | Sem defeito. | Não aplicável. | Retornou a propriedade gravada com valor bruto e resolvido iguais a `MCP-218`. |
 
 ## Execução de integração real
 
