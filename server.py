@@ -4592,10 +4592,10 @@ async def add_surface_finish(
 
     def _impl():
         doc = _active_drawing()
-        doc.ClearSelection2(True)
         x_m, y_m = to_meters(x, unit), to_meters(y, unit)
-        empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
-        doc.Extension.SelectByID2("", "EDGE", x_m, y_m, 0, False, 0, empty, 0)
+        if ra_value <= 0:
+            raise ValueError("ra_value must be positive.")
+        _select_drawing_edge_near(doc, x_m, y_m)
 
         types = {"basic": 0, "machined": 1, "nomachining": 2}
         sym_code = types.get(symbol_type.lower(), 1)
@@ -4605,7 +4605,7 @@ async def add_surface_finish(
         #   MaxRoughness, MinRoughness, RoughnessSpacing) — 14 args.
         sf = None
         try:
-            sf = doc.InsertSurfaceFinishSymbol3(
+            sf = doc.Extension.InsertSurfaceFinishSymbol3(
                 sym_code,          # SymType
                 0,                 # LeaderType
                 x_m, y_m, 0.0,     # LocX, LocY, LocZ
@@ -4651,34 +4651,49 @@ async def add_gdt_symbol(
 
     def _impl():
         doc = _active_drawing()
-        doc.ClearSelection2(True)
         x_m, y_m = to_meters(x, unit), to_meters(y, unit)
-        empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
-        doc.Extension.SelectByID2("", "EDGE", x_m, y_m, 0, False, 0, empty, 0)
+        if tolerance <= 0:
+            raise ValueError("tolerance must be positive.")
 
+        # A projected drawing edge is not discoverable through SelectByID2 by sheet
+        # coordinates. Resolve and select it through the owning drawing view instead.
+        _select_drawing_edge_near(doc, x_m, y_m)
+
+        # InsertGtol is surfaced as an already-evaluated IDispatch member by the
+        # SolidWorks 2025 COM proxy; calling it again raises "member not found".
+        gtol = win32com.client.Dispatch(doc.InsertGtol)
+        symbol_map = {
+            "position": "<IGTOL-POSI>",
+            "concentricity": "<IGTOL-CONC>",
+            "perpendicularity": "<IGTOL-PERP>",
+            "parallelism": "<IGTOL-PARA>",
+            "flatness": "<IGTOL-FLAT>",
+            "straightness": "<IGTOL-STRAIGHT>",
+            "circularity": "<IGTOL-CIRC>",
+            "cylindricity": "<IGTOL-CYL>",
+            "angularity": "<IGTOL-ANGULAR>",
+            "symmetry": "<IGTOL-SYMMETRY>",
+            "runout": "<IGTOL-TRUN>",
+        }
         try:
-            gtol = doc.InsertGtol()
-            if gtol is not None:
-                gtol = win32com.client.Dispatch(gtol)
-                symbol_map = {
-                    "position": 8, "concentricity": 10, "perpendicularity": 5,
-                    "parallelism": 4, "flatness": 1, "straightness": 0,
-                    "circularity": 2, "cylindricity": 3, "angularity": 6,
-                    "symmetry": 11, "runout": 12,
-                }
-                sym_code = symbol_map.get(symbol.lower(), 8)
-                try:
-                    gtol.SetFrameValues2(1, "", str(tolerance), datum, "", "")
-                except Exception:
-                    pass
-        except Exception:
-            gtol = None
+            symbol_code = symbol_map[symbol.lower()]
+        except KeyError as e:
+            raise ValueError(
+                "Unsupported GD&T symbol. Use one of: "
+                + ", ".join(symbol_map)
+            ) from e
 
-        if gtol is None:
-            raise RuntimeError(
-                "GD&T frame insertion failed. This annotation often requires the "
-                "property manager; consider adding it manually."
-            )
+        # SetFrameSymbols2 uses the documented <library-symbol> representation;
+        # SetFrameValues2 then fills the tolerance and datum cells in frame one.
+        gtol.SetFrameSymbols2(1, symbol_code, False, "", False, "", "", "", "")
+        if not gtol.SetFrameValues2(1, str(tolerance), "", datum, "", ""):
+            raise RuntimeError("SolidWorks did not set the GD&T frame values.")
+
+        attached = gtol.IsAttached
+        if callable(attached):
+            attached = attached()
+        if not attached:
+            raise RuntimeError("SolidWorks created a GD&T frame without attaching it to the selected edge.")
 
         return {"symbol": symbol, "tolerance": tolerance, "datum": datum,
                 "placed_at": [x, y], "unit": unit or _default_unit}
