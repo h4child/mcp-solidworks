@@ -7,7 +7,7 @@ Data: 08 de agosto de 2026
 Foi criado um projeto de testes em `tests/`, sem dependências adicionais:
 
 - `tests/test_contract.py`: validação estática do servidor e do manifesto;
-- `tests/run_live_test_project.py`: matriz de integração para as 96 ferramentas;
+- `tests/run_live_test_project.py`: matriz de integração para as 96 ferramentas-base;
 - `tests/README.md`: instruções de execução e limites do teste;
 - `tests/output/`: diretório de resultados locais, ignorado pelo Git.
 
@@ -24,7 +24,7 @@ ferramentas na versão 4.2.0, consistentes com `manifest.json`.
 | Ferramentas no manifesto | 96, idênticas ao servidor |
 | Varredura de credenciais comuns | Nenhum padrão encontrado |
 | Pacotes MCPB e resultados de teste no Git | Ignorados |
-| Matriz de integração em modo seco | 96 de 96 casos planejados |
+| Matriz de integração em modo seco | 96 de 96 casos-base planejados |
 
 ## Correções validadas posteriormente no SolidWorks 2025 PT-BR
 
@@ -119,15 +119,17 @@ ferramentas na versão 4.2.0, consistentes com `manifest.json`.
 | `zoom_to_fit` | Sem defeito. | Não aplicável. | Ajustou a vista do modelo; a escala do `IModelView` permaneceu positiva. |
 | `zoom_to_area` | Sem defeito. | Não aplicável. | Ampliou uma região de 6 cm; a escala da vista aumentou de 1,38 para 3,60. |
 | `execute_python` | Sem defeito na ferramenta; o proxy COM expõe `GetPathName` como propriedade nesta instalação. | Não aplicável. | Executou leitura controlada do caminho da peça temporária e confirmou que o builtin `open` está bloqueado. |
+| `create_sketch` (plano nomeado) | Aceitava somente três planos padrão, impedindo esboços em planos deslocados. | Aceita agora o nome exato de qualquer plano de referência existente. | Criou esboços nos três planos deslocados usados para os canais do pistão. |
+| `create_automotive_piston` | O perfil revolvido e o corte revolvido tinham orientação local frágil; o corte central por extrusão também era rejeitado após os canais. | Corpo por extrusão, três cortes anulares em planos de referência, `shell_body` para a cavidade e corte transversal do pino. | Criou e salvou `automotive_piston_reference_228.SLDPRT`: um corpo sólido, três canais, casca interna e furo do pino. |
 
 ## Execução de integração real
 
 A certificação final foi executada contra a instância já aberta do SolidWorks
-2025, revisão `33.4.1`. As 96 ferramentas do servidor e do manifesto possuem
-evidência de integração real na tabela acima; cada falha encontrada foi corrigida
-e testada novamente antes de avançar para a próxima ferramenta.
+2025, revisão `33.4.1`. As 96 ferramentas-base e a nova ferramenta paramétrica
+de pistão do servidor possuem evidência de integração real na tabela acima; cada
+falha encontrada foi corrigida e testada novamente antes de avançar.
 
-Resultado final: **96 de 96 ferramentas validadas**. A suíte de contrato também
+Resultado final: **97 de 97 ferramentas validadas**. A suíte de contrato também
 permanece aprovada (5 de 5 testes). Os testes criaram documentos salvos apenas em
 `tests/output/`, fecharam somente esses documentos temporários e mantiveram os
 documentos já abertos pelo usuário intactos.

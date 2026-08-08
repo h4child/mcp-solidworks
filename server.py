@@ -1080,11 +1080,20 @@ async def export_document(filepath: str) -> dict:
 
 @mcp.tool()
 async def create_sketch(plane: str = "front") -> dict:
-    """Create a new sketch on a standard plane: 'front', 'top', or 'right'."""
+    """Create a sketch on a standard plane or a named reference plane.
+
+    Standard values are 'front', 'top', and 'right'. Any other value is treated
+    as the exact name of an existing reference plane, enabling offset-plane
+    workflows such as independent piston ring grooves.
+    """
 
     def _impl():
         doc = _active_doc()
-        plane_name = _standard_plane_name(doc, plane)
+        plane_name = (
+            _standard_plane_name(doc, plane)
+            if plane.lower() in {"front", "top", "right"}
+            else plane
+        )
         if not _select_by_id(doc, plane_name, "PLANE"):
             raise RuntimeError(f"Could not select plane '{plane_name}'.")
         doc.InsertSketch2(True)
@@ -5339,6 +5348,138 @@ async def set_appearance(
         return {"rgb": [red, green, blue], "target": target}
 
     return await _run(_impl)
+
+
+# ===========================================================================
+# Parametric example tools
+# ===========================================================================
+
+@mcp.tool()
+async def create_automotive_piston(
+    bore_diameter: float = 86,
+    height: float = 75,
+    skirt_thickness: float = 3.5,
+    crown_thickness: float = 6,
+    ring_width: float = 3,
+    ring_depth: float = 1.5,
+    wrist_pin_diameter: float = 22,
+    unit: Optional[str] = None,
+    save_path: Optional[str] = None,
+) -> dict:
+    """Create a parametric automotive piston as a new SolidWorks part.
+
+    The model has a crowned cylindrical skirt, three compression/oil-ring
+    grooves, a hollow underside, and a transverse wrist-pin bore. All values
+    are dimensional; use ``unit`` to override the MCP default. If ``save_path``
+    is provided, the part is saved before features are created so an incomplete
+    model remains available for diagnosis if SolidWorks rejects a later feature.
+    """
+
+    if bore_diameter <= 0 or height <= 0 or wrist_pin_diameter <= 0:
+        raise ValueError("bore_diameter, height, and wrist_pin_diameter must be positive.")
+    if min(skirt_thickness, crown_thickness, ring_width, ring_depth) <= 0:
+        raise ValueError("Wall, crown, ring width, and ring depth must be positive.")
+    if wrist_pin_diameter >= bore_diameter:
+        raise ValueError("wrist_pin_diameter must be smaller than bore_diameter.")
+    if 3 * ring_width + crown_thickness >= height:
+        raise ValueError("height is too small for the requested crown and three ring grooves.")
+    if skirt_thickness + ring_depth >= bore_diameter / 2:
+        raise ValueError("Skirt thickness and ring depth leave no material in the piston wall.")
+
+    completed: list[str] = []
+    stage = "initialization"
+    radius = bore_diameter / 2
+    crown_start = height - crown_thickness
+    ring_gap = ring_width * 1.25
+    ring_bottoms = [
+        crown_start - ring_width,
+        crown_start - ring_width - ring_gap - ring_width,
+        crown_start - 2 * ring_width - 2 * ring_gap - ring_width,
+    ]
+
+    try:
+        stage = "new part"
+        part = await create_new_part()
+        completed.append(stage)
+
+        if save_path:
+            stage = "initial save"
+            await save_document(save_path)
+            completed.append(stage)
+
+        stage = "extruded piston skirt"
+        await create_sketch("front")
+        await draw_circle(0, 0, radius, unit)
+        await close_sketch()
+        await extrude_sketch(height, unit=unit)
+        completed.append(stage)
+
+        # Offset planes let each annular cut start at its intended axial height.
+        # This avoids relying on a revolved cut's local-plane orientation.
+        stage = "three ring grooves"
+        for ring_bottom in reversed(ring_bottoms):
+            plane = await create_reference_plane("front", ring_bottom, unit=unit)
+            await create_sketch(plane["plane"])
+            await draw_circle(0, 0, radius + ring_depth, unit)
+            await draw_circle(0, 0, radius - ring_depth, unit)
+            await close_sketch()
+            await cut_extrude(ring_width, unit=unit)
+        completed.append(stage)
+
+        # Open the underside with the supported shell feature, preserving the
+        # crown and a controlled skirt wall behind the ring grooves.
+        stage = "hollow underside"
+        await shell_body(
+            skirt_thickness,
+            remove_face_at_x=0,
+            remove_face_at_y=0,
+            remove_face_at_z=0,
+            unit=unit,
+        )
+        completed.append(stage)
+
+        # A right-plane through cut creates the transverse wrist-pin bore
+        # without needing to sketch directly on the cylindrical skirt.
+        stage = "wrist-pin bore"
+        await create_sketch("right")
+        await draw_circle(0, height * 0.48, wrist_pin_diameter / 2, unit)
+        await close_sketch()
+        await cut_extrude(through_all=True, both_directions=True, unit=unit)
+        completed.append(stage)
+
+        stage = "appearance and view"
+        await set_appearance(185, 190, 200, "body")
+        await set_view("isometric")
+        await zoom_to_fit()
+        completed.append(stage)
+
+        if save_path:
+            stage = "final save"
+            await save_document()
+            completed.append(stage)
+
+        return {
+            "document": part["title"],
+            "save_path": os.path.abspath(save_path) if save_path else None,
+            "dimensions": {
+                "bore_diameter": bore_diameter,
+                "height": height,
+                "wrist_pin_diameter": wrist_pin_diameter,
+                "unit": unit or _default_unit,
+            },
+            "features": ["extruded skirt/crown", "three ring grooves", "hollow underside", "wrist-pin bore"],
+            "completed_stages": completed,
+        }
+    except Exception as exc:
+        try:
+            active = await get_document_info()
+        except Exception:
+            active = {"title": "(no active document)", "type": "Unknown"}
+        raise RuntimeError(
+            f"Automotive piston creation stopped during '{stage}'. "
+            f"Completed stages: {', '.join(completed) or '(none)'}. "
+            f"Active document: {active}. Root cause: {exc}"
+        ) from exc
 
 
 # ===========================================================================

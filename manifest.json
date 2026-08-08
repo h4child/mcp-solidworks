@@ -2,7 +2,7 @@
   "manifest_version": "0.2",
   "name": "solidworks-mcp",
   "display_name": "SolidWorks MCP",
-  "version": "4.2.0",
+  "version": "4.3.0",
   "description": "Servidor MCP para automacao do SolidWorks via API COM, escrito com o SDK oficial (FastMCP)",
   "long_description": "Controla o SolidWorks (criar pecas/montagens, esbocos, extrusao, corte, filete, chanfro, etc.) via COM, exposto como ferramentas MCP.",
   "author": {
@@ -104,6 +104,7 @@
     { "name": "create_assembly_pattern", "description": "Pattern a component in the assembly (linear or circular)." },
     { "name": "set_material", "description": "Assign a material to the active part (drives mass and BOM)." },
     { "name": "set_appearance", "description": "Set the color/appearance of the part or a specific face (RGB)." },
+    { "name": "create_automotive_piston", "description": "Create a parametric automotive piston with ring grooves, hollow underside, and wrist-pin bore." },
     { "name": "create_configuration", "description": "Create a configuration (design variant) in the active document." },
     { "name": "switch_configuration", "description": "Switch the active document to a named configuration." },
     { "name": "list_features", "description": "List the feature tree of the active document." },
