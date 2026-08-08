@@ -5500,6 +5500,91 @@ async def set_appearance(
     return await _run(_impl)
 
 
+@mcp.tool()
+async def apply_metal_finish(
+    finish: str = "chrome",
+    target: str = "body",
+    face_x: float = 0, face_y: float = 0, face_z: float = 0,
+    unit: Optional[str] = None,
+) -> dict:
+    """Apply a native SolidWorks metallic visual finish to a body or face.
+
+    finish: ``chrome``, ``polished_steel``, ``brushed_steel``, ``cast_iron``,
+            or ``aluminum``. These presets are embedded material-property
+            channels, not external bitmap texture files.
+    target: ``body`` (whole part) or ``face`` (face at face_x/y/z).
+
+    Use ``set_material`` as well when mass/BOM material data is required.
+    """
+
+    presets = {
+        # A bright neutral gray keeps chrome recognizable in the default
+        # SolidWorks scene, where a highly reflective dark preset otherwise
+        # appears nearly black on faces that do not reflect the light source.
+        "chrome": ((225, 230, 235), 0.70, 0.90, 0.95, 0.75),
+        "polished_steel": ((140, 150, 160), 0.25, 0.55, 0.85, 0.75),
+        "brushed_steel": ((115, 125, 135), 0.25, 0.65, 0.55, 0.45),
+        "cast_iron": ((55, 60, 65), 0.25, 0.60, 0.35, 0.32),
+        "aluminum": ((175, 180, 185), 0.30, 0.65, 0.70, 0.60),
+    }
+    finish_key = finish.strip().lower().replace(" ", "_").replace("-", "_")
+    target_key = target.strip().lower()
+    if finish_key not in presets:
+        raise ValueError(f"Unsupported finish '{finish}'. Choose: {', '.join(presets)}.")
+    if target_key not in {"body", "face"}:
+        raise ValueError("target must be 'body' or 'face'.")
+
+    def _impl():
+        (red, green, blue), ambient, diffuse, specular, shininess = presets[finish_key]
+        doc = _active_doc()
+        if target_key == "face":
+            doc.ClearSelection2(True)
+            fx, fy, fz = to_meters(face_x, unit), to_meters(face_y, unit), to_meters(face_z, unit)
+            empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+            if not doc.Extension.SelectByID2("", "FACE", fx, fy, fz, False, 0, empty, 0):
+                raise RuntimeError(f"No face found at ({face_x}, {face_y}, {face_z}).")
+
+        # SolidWorks requires a SAFEARRAY of doubles. Native material-property
+        # channels travel with the saved file and avoid external texture paths.
+        values = win32com.client.VARIANT(
+            pythoncom.VT_ARRAY | pythoncom.VT_R8,
+            [red / 255.0, green / 255.0, blue / 255.0,
+             ambient, diffuse, specular, shininess, 0.0, 0.0],
+        )
+        try:
+            if target_key == "face":
+                selected = doc.SelectionManager.GetSelectedObject6(1, -1)
+                face = win32com.client.Dispatch(
+                    selected, "IFace2", "{4A8BA4D8-DA25-4B75-8E2D-4922B74D81ED}",
+                )
+                face.SetMaterialPropertyValues2(values, 1, None)  # swThisConfiguration
+            else:
+                extension = win32com.client.Dispatch(
+                    doc.Extension, "IModelDocExtension", "{99F4D4AF-F268-4EE1-8C55-041F7BECF879}",
+                )
+                extension.SetMaterialPropertyValues(values, 1, None)  # swThisConfiguration
+        except Exception as exc:
+            raise RuntimeError(f"Failed to apply {finish_key} finish to {target_key}: {exc}") from exc
+
+        try:
+            redraw = doc.GraphicsRedraw2
+            if callable(redraw):
+                redraw()
+        except Exception:
+            pass
+        return {
+            "finish": finish_key,
+            "target": target_key,
+            "rgb": [red, green, blue],
+            "appearance": {
+                "ambient": ambient, "diffuse": diffuse,
+                "specular": specular, "shininess": shininess,
+            },
+        }
+
+    return await _run(_impl)
+
+
 # ===========================================================================
 # Parametric example tools
 # ===========================================================================
@@ -5863,7 +5948,8 @@ async def create_automotive_piston_with_connecting_rod(
     small_end_outer = wrist_pin_diameter / 2 + 5
     big_end_outer = crank_bore_diameter / 2 + 5
     beam_half_width = max(5.0, wrist_pin_diameter * 0.30)
-    small_end_y = -(radius * 0.45)
+    # Overlap the skirt by 3 mm so the small-end pad visibly joins the piston.
+    small_end_y = -(small_end_outer - 3.0)
     big_end_y = small_end_y - connecting_rod_length
     ring_offsets = (piston_height - 18, piston_height - 12, piston_height - 6)
 
@@ -5931,7 +6017,7 @@ async def create_automotive_piston_with_connecting_rod(
             return selected
 
         await _run(_hide_reference_geometry)
-        await set_appearance(75, 90, 115, "body")
+        await apply_metal_finish("chrome", "body")
         await set_view("isometric")
         await zoom_to_fit()
         completed.append(stage)

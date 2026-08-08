@@ -2,6 +2,21 @@
 
 Data: 08 de agosto de 2026
 
+## Acabamento metalico e correcao de encaixe
+
+- Foi adicionada a ferramenta `apply_metal_finish`, que aplica os acabamentos
+  nativos chrome, polished steel, brushed steel, cast iron e aluminum a um
+  corpo inteiro ou a uma face. Os canais RGB, ambiente, difuso, especular e
+  brilho ficam salvos no arquivo SolidWorks, sem depender de textura bitmap.
+- O modelo conceitual de pistao agora recebe o acabamento chrome automaticamente.
+- O olhal menor da biela passou a sobrepor a saia do pistao em 3 mm, eliminando
+  a separacao visual entre as duas partes nas vistas frontal, traseira e isometrica.
+- Teste real concluido no SolidWorks 2025 com
+  `automotive_piston_with_rod_chrome_final_001.SLDPRT`: criacao, acabamento,
+  salvamento e capturas das vistas frontal, traseira, superior, inferior e
+  isometrica aprovados. Um erro de desempacotamento detectado na primeira
+  execucao do novo preset foi corrigido e a criacao foi repetida com sucesso.
+
 ## Entregas
 
 Foi criado um projeto de testes em `tests/`, sem dependências adicionais:
