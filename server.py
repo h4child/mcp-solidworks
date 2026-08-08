@@ -2898,10 +2898,18 @@ async def create_helix(
         start_rad = math.radians(start_angle)
         height_m = pitch_m * revolutions
 
+        # InsertHelix is declared as void in the SolidWorks 2025 type library.
+        # Capture the feature names first and locate the generated Helix feature
+        # afterwards instead of treating its Python None return value as failure.
+        features_before = {
+            win32com.client.Dispatch(raw_feature).Name
+            for raw_feature in doc.FeatureManager.GetFeatures(False) or ()
+        }
+
         # InsertHelix(Reversed, Clockwised, Tapered, Outward, Helixdef, Height,
         #   Pitch, Revolution, TaperAngle, Startangle) — 10 args, verified against
         #   the SW 2025 typelib. Helixdef 0 = swHelixDefinedByPitchAndRevolution.
-        feat = doc.InsertHelix(
+        doc.InsertHelix(
             False,        # Reversed
             clockwise,    # Clockwised
             False,        # Tapered
@@ -2914,14 +2922,20 @@ async def create_helix(
             start_rad,    # Startangle
         )
 
-        if feat is None:
+        new_helixes = [
+            win32com.client.Dispatch(raw_feature).Name
+            for raw_feature in doc.FeatureManager.GetFeatures(False) or ()
+            if (
+                win32com.client.Dispatch(raw_feature).GetTypeName2 == "Helix"
+                and win32com.client.Dispatch(raw_feature).Name not in features_before
+            )
+        ]
+        if not new_helixes:
             raise RuntimeError(
                 "Helix creation failed. Ensure the sketch has exactly one circle "
                 "and no other geometry, and that it is a closed profile."
             )
-
-        feat_dispatch = win32com.client.Dispatch(feat)
-        feat_name = feat_dispatch.Name if hasattr(feat_dispatch, "Name") else "Helix"
+        feat_name = new_helixes[-1]
 
         return {
             "feature": feat_name,
