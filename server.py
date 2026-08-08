@@ -271,6 +271,59 @@ def _active_doc():
     return doc
 
 
+def _split_com_result(result):
+    """Normalize a pywin32 result that may include COM ``out`` parameters.
+
+    With the SolidWorks type library generated for Python 3.14, methods such
+    as OpenDoc6 and ActivateDoc3 return ``(value, out1, ...)`` when their
+    output parameters are supplied as plain integers.  Older/dynamic pywin32
+    dispatch returns only the primary value.  Keeping that difference here
+    avoids passing unsupported VARIANT-by-reference wrappers to the generated
+    proxy and makes the public document tools work in either configuration.
+    """
+    if isinstance(result, tuple):
+        return result[0], result[1:]
+    return result, ()
+
+
+def _open_doc6(app, filepath: str, doc_type: int, options: int = 0):
+    """Open a document through OpenDoc6 and return ``(document, errors, warnings)``."""
+    result = app.OpenDoc6(filepath, doc_type, options, "", 0, 0)
+    doc, outputs = _split_com_result(result)
+    errors = int(outputs[0]) if len(outputs) > 0 else 0
+    warnings = int(outputs[1]) if len(outputs) > 1 else 0
+    return doc, errors, warnings
+
+
+def _activate_doc3(app, title: str, make_visible: bool = True):
+    """Activate a document while tolerating typed and dynamic COM dispatch."""
+    result = app.ActivateDoc3(title, make_visible, 0, 0)
+    doc, outputs = _split_com_result(result)
+    errors = int(outputs[0]) if outputs else 0
+    return doc, errors
+
+
+def _save_doc3(doc, options: int = 0):
+    """Save a document and return ``(succeeded, errors, warnings)``."""
+    # Active document objects are commonly exposed as dynamic IDispatch even
+    # when the application object is type-library generated.  That dispatch
+    # requires real by-reference VARIANTs for Save3; the typed fallback emits
+    # an ``(value, error, warning)`` tuple instead.
+    errors_out = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+    warnings_out = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+    try:
+        result = doc.Save3(options, errors_out, warnings_out)
+        succeeded, outputs = _split_com_result(result)
+        errors = int(outputs[0]) if len(outputs) > 0 else int(errors_out.value)
+        warnings = int(outputs[1]) if len(outputs) > 1 else int(warnings_out.value)
+    except TypeError:
+        result = doc.Save3(options, 0, 0)
+        succeeded, outputs = _split_com_result(result)
+        errors = int(outputs[0]) if len(outputs) > 0 else 0
+        warnings = int(outputs[1]) if len(outputs) > 1 else 0
+    return bool(succeeded), errors, warnings
+
+
 def _doc_title(doc) -> str:
     t = doc.GetTitle
     return t() if callable(t) else t
@@ -453,15 +506,16 @@ def _preload_and_insert_component(assy, filepath: str, x: float, y: float, z: fl
     is re-activated as ActiveDoc right before the call.
     """
     assy_title = _doc_title(assy)
-    errors = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-    warnings = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
     app = _connect()
     ext = os.path.splitext(filepath)[1].lower()
     doc_type = {".sldprt": 1, ".sldasm": 2}.get(ext, 1)
-    app.OpenDoc6(filepath, doc_type, 1, "", errors, warnings)
+    loaded_doc, errors, _warnings = _open_doc6(app, filepath, doc_type, 1)
+    if loaded_doc is None:
+        raise RuntimeError(f"Failed to load component '{filepath}' (error code {errors}).")
 
-    reactivate_errors = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-    app.ActivateDoc3(assy_title, False, 0, reactivate_errors)
+    active_assy, reactivate_errors = _activate_doc3(app, assy_title, False)
+    if active_assy is None:
+        raise RuntimeError(f"Failed to re-activate assembly '{assy_title}' (error code {reactivate_errors}).")
     assy = app.ActiveDoc
 
     comp = assy.AddComponent5(filepath, 0, "", False, "", x, y, z)
@@ -636,17 +690,22 @@ async def insert_drawing_view(source_filepath: str, view_type: str = "front",
         drawing_title = _doc_title(doc)
         ext = os.path.splitext(source_filepath)[1].lower()
         src_type = {".sldprt": 1, ".sldasm": 2}.get(ext, 1)
-        open_errs = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-        open_warns = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
         try:
-            source_doc = app.OpenDoc6(source_filepath, src_type, 0, "", open_errs, open_warns)
+            source_doc, _open_errs, _open_warns = _open_doc6(app, source_filepath, src_type)
         except Exception as e:
             log.warning("Could not pre-load source model: %s", e)
             source_doc = app.GetOpenDocumentByName(source_filepath)
-        available_views = tuple(getattr(source_doc, "GetModelViewNames", ()) or ())
+        model_view_names = getattr(source_doc, "GetModelViewNames", ())
+        # Dynamic IDispatch exposes this no-argument member as an already
+        # evaluated property, while the generated SolidWorks proxy exposes it
+        # as a callable method.
+        if callable(model_view_names):
+            model_view_names = model_view_names()
+        available_views = tuple(model_view_names or ())
         sw_view = next((name for name in view_candidates if name in available_views), view_candidates[0])
-        react_err = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-        app.ActivateDoc3(drawing_title, False, 0, react_err)
+        active_drawing, react_err = _activate_doc3(app, drawing_title, False)
+        if active_drawing is None:
+            raise RuntimeError(f"Could not reactivate drawing '{drawing_title}' (error code {react_err}).")
         doc = app.ActiveDoc
 
         x_m, y_m = to_meters(x, unit), to_meters(y, unit)
@@ -678,17 +737,14 @@ async def open_document(filepath: str) -> dict:
         app = _connect()
         ext = os.path.splitext(filepath)[1].lower()
         doc_type = {".sldprt": 1, ".sldasm": 2, ".slddrw": 3}.get(ext, 1)
-        errors = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-        warnings = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-        doc = app.OpenDoc6(filepath, doc_type, 0, "", errors, warnings)
+        doc, errors, _warnings = _open_doc6(app, filepath, doc_type)
         if doc is None:
-            raise RuntimeError(f"Failed to open '{filepath}' (error code {errors.value}).")
+            raise RuntimeError(f"Failed to open '{filepath}' (error code {errors}).")
         title = _doc_title(doc)
-        activate_errors = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-        active_doc = app.ActivateDoc3(title, True, 0, activate_errors)
+        active_doc, activate_errors = _activate_doc3(app, title, True)
         if active_doc is None:
             raise RuntimeError(
-                f"Opened '{filepath}' but could not activate it (error code {activate_errors.value})."
+                f"Opened '{filepath}' but could not activate it (error code {activate_errors})."
             )
         return {"title": title, "path": filepath}
 
@@ -706,9 +762,9 @@ async def close_document(save: bool = False) -> dict:
             return {"closed": False, "message": "No document was open."}
         title = _doc_title(doc)
         if save:
-            errs = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-            wrns = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-            doc.Save3(0, errs, wrns)
+            saved, errs, _wrns = _save_doc3(doc)
+            if not saved or errs != 0:
+                raise RuntimeError(f"Failed to save '{title}' before closing (error code {errs}).")
         app.CloseDoc(title)
         return {"closed": True, "title": title}
 
@@ -738,11 +794,9 @@ async def save_document(filepath: Optional[str] = None) -> dict:
                 raise RuntimeError(f"Failed to save to '{abs_path}'.")
             return {"path": abs_path}
         else:
-            errors = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-            warnings = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-            doc.Save3(0, errors, warnings)
-            if errors.value != 0:
-                raise RuntimeError(f"Save failed (error code {errors.value}).")
+            saved, errors, _warnings = _save_doc3(doc)
+            if not saved or errors != 0:
+                raise RuntimeError(f"Save failed (error code {errors}).")
             return {"path": _doc_path(doc)}
 
     return await _run(_impl)
@@ -3268,42 +3322,54 @@ async def add_rib(
     rib's centerline on a plane between the surfaces to be reinforced.
 
     thickness: rib wall thickness.
-    direction: 'parallel' (rib thickness perpendicular to sketch) or
-               'normal' (rib thickness along sketch normal).
-    flip: reverse the extrusion direction if the rib grows the wrong way."""
+    direction: 'parallel' or 'normal', relative to the sketch plane.
+    flip: reverse the material-growth direction if the rib grows the wrong way."""
 
     def _impl():
         if thickness <= 0:
             raise ValueError(f"Thickness must be positive, got {thickness}.")
+        direction_normalized = direction.lower()
+        if direction_normalized not in {"parallel", "normal"}:
+            raise ValueError("direction must be either 'parallel' or 'normal'.")
 
         doc = _active_doc()
         t_m = to_meters(thickness, unit)
-
         sketch_name = _select_last_sketch(doc)
 
-        edge_type = 1 if direction.lower() == "parallel" else 0
+        # IFeatureManager::InsertRib is a void method in SolidWorks 2025.
+        # Its first two parameters describe two-sided thickness and thickness
+        # reversal (not an "edge type"), so the legacy seven-argument call
+        # silently failed.  Capture the feature tree, invoke its documented
+        # ten-argument signature, then identify the new Rib feature.
+        before_names = set()
+        for raw_feature in doc.FeatureManager.GetFeatures(False):
+            feature = win32com.client.Dispatch(raw_feature)
+            before_names.add(feature.Name)
 
-        try:
-            feat = doc.FeatureManager.InsertRib(
-                edge_type,   # EdgeType: 0=Normal, 1=Parallel
-                t_m,         # Thickness
-                0,           # ThicknessSide: 0=OneSide
-                flip,        # FlipSide
-                False,       # IsTwoSided
-                False,       # NextRefIsThinFeat
-                False,       # ExtrudeDir
-            )
-        except Exception:
-            feat = None
+        doc.FeatureManager.InsertRib(
+            True,                              # Is2Sided: centered wall thickness
+            False,                             # ReverseThicknessDir: N/A for two-sided
+            t_m,                               # Thickness (meters)
+            0,                                 # ReferenceEdgeIndex
+            flip,                              # ReverseMaterialDir
+            False,                             # IsDrafted
+            False,                             # DraftOutward
+            0.0,                               # DraftAngle
+            direction_normalized == "normal",  # IsNormToSketch
+            False,                             # IsDraftedFromWall
+        )
+        doc.ForceRebuild3(False)
 
-        if feat is None:
-            try:
-                feat = doc.FeatureManager.InsertRib3(
-                    edge_type, t_m, 0, flip, False, False, False, 0, False,
-                )
-            except Exception:
-                feat = None
+        feat = None
+        for raw_feature in doc.FeatureManager.GetFeatures(False):
+            feature = win32com.client.Dispatch(raw_feature)
+            if feature.Name in before_names:
+                continue
+            if feature.GetTypeName2 == "Rib":
+                feat = feature
+                break
 
+        doc.ClearSelection2(True)
         if feat is None:
             raise RuntimeError(
                 f"Rib failed on sketch '{sketch_name}'. "
@@ -3311,14 +3377,11 @@ async def add_rib(
                 "and its lines must touch or extend to those surfaces when extruded."
             )
 
-        feat_dispatch = win32com.client.Dispatch(feat)
-        feat_name = feat_dispatch.Name if hasattr(feat_dispatch, "Name") else "Rib"
-
         return {
-            "feature": feat_name,
+            "feature": feat.Name,
             "sketch": sketch_name,
             "thickness": thickness,
-            "direction": direction,
+            "direction": direction_normalized,
             "flip": flip,
             "unit": unit or _default_unit,
         }
