@@ -104,6 +104,8 @@ ferramentas na versão 4.2.0, consistentes com `manifest.json`.
 | `create_new_drawing` | Sem defeito. | Não aplicável. | Criou um desenho a partir do template padrão, confirmou o tipo `Drawing`, salvou-o e o fechou isoladamente. |
 | `get_document_info` | Sem defeito. | Não aplicável. | Confirmou título, caminho absoluto e tipo `Part` de uma peça temporária salva. |
 | `close_document` | Sem defeito. | Não aplicável. | Fechou somente a peça temporária ativa e confirmou que ela não permaneceu na coleção de documentos abertos. |
+| `fix_component` | Sem defeito. | Não aplicável. | Em montagem temporária, fixou a segunda instância de componente e confirmou `IsFixed=true` pela API. |
+| `float_component` | Sem defeito. | Não aplicável. | Em outra montagem temporária, liberou a primeira instância fixa e confirmou `IsFixed=false` pela API. |
 
 ## Execução de integração real
 
