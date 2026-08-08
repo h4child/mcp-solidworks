@@ -862,12 +862,9 @@ async def unsuppress_component(name: str) -> dict:
 
 @mcp.tool()
 async def add_mate(mate_type: str, point1: dict, point2: dict) -> dict:
-    """EXPERIMENTAL: attempt to mate two faces/planes, each chosen by a point that
+    """Mate two faces/planes, each chosen by a point that
     lies on it, e.g. point1={"x":0,"y":0,"z":0,"unit":"mm"}. Supported mate_type
-    values: 'coincident', 'concentric', 'parallel', 'perpendicular', 'tangent'.
-    This call could not be fully verified against a live SolidWorks session
-    (the AddMate5 COM signature behaved inconsistently); treat the result with
-    suspicion and confirm visually in SolidWorks."""
+    values: 'coincident', 'concentric', 'parallel', 'perpendicular', 'tangent'."""
 
     def _impl():
         assy = _active_assembly()
@@ -884,19 +881,23 @@ async def add_mate(mate_type: str, point1: dict, point2: dict) -> dict:
         x2, y2, z2 = pt(point2)
 
         assy.ClearSelection2(True)
-        if not _select_by_id(assy, "", "FACE", x1, y1, z1):
+        empty_callout = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+        if not assy.Extension.SelectByID2("", "FACE", x1, y1, z1, False, 1, empty_callout, 0):
             raise RuntimeError(f"No face/plane found at point1 {point1}.")
-        empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
-        if not assy.Extension.SelectByID2("", "FACE", x2, y2, z2, True, 0, empty, 0):
+        if not assy.Extension.SelectByID2("", "FACE", x2, y2, z2, True, 1, empty_callout, 0):
             raise RuntimeError(f"No face/plane found at point2 {point2}.")
 
         mate_err = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-        mate = assy.AddMate5(mate_code, 0, False, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, False, mate_err)
-        if mate is None:
-            raise RuntimeError(
-                f"Mate creation failed (error code {mate_err.value}). "
-                "This tool is experimental; consider creating the mate manually in SolidWorks."
-            )
+        mate = assy.AddMate5(
+            mate_code, 0, False,
+            0.0, 0.0, 0.0,
+            0.0, 0.0,
+            0.0, 0.0, 0.0,
+            False, False, 0, mate_err,
+        )
+        # swAddMateError_NoError is 1; COM can return an object even on failure.
+        if mate is None or mate_err.value != 1:
+            raise RuntimeError(f"Mate creation failed (error code {mate_err.value}).")
         return {"mate_type": mate_type, "error_code": mate_err.value}
 
     return await _run(_impl)
@@ -909,36 +910,22 @@ async def list_mates() -> dict:
     def _impl():
         assy = _active_assembly()
         mates = []
-        feat = assy.FirstFeature
-        while feat is not None:
+        for raw_feature in assy.FeatureManager.GetFeatures(False) or ():
+            feat = win32com.client.Dispatch(raw_feature)
             try:
-                if feat.GetTypeName2 == "MateGroup":
-                    sub = feat.GetFirstSubFeature
-                    if callable(sub):
-                        sub = sub()
-                    while sub is not None:
-                        try:
-                            suppressed = sub.IsSuppressed
-                            if callable(suppressed):
-                                suppressed = suppressed()
-                            mates.append({
-                                "name": sub.Name,
-                                "type": sub.GetTypeName2,
-                                "suppressed": bool(suppressed),
-                            })
-                        except Exception:
-                            pass
-                        try:
-                            nxt = sub.GetNextSubFeature
-                            sub = nxt() if callable(nxt) else nxt
-                        except Exception:
-                            break
+                feature_type = feat.GetTypeName2
+                if not str(feature_type).startswith("Mate") or feature_type == "MateGroup":
+                    continue
+                suppressed = feat.IsSuppressed
+                if callable(suppressed):
+                    suppressed = suppressed()
+                mates.append({
+                    "name": feat.Name,
+                    "type": feature_type,
+                    "suppressed": bool(suppressed),
+                })
             except Exception:
                 pass
-            try:
-                feat = feat.GetNextFeature
-            except Exception:
-                break
         return {"count": len(mates), "mates": mates}
 
     return await _run(_impl)
@@ -4556,16 +4543,12 @@ async def list_features() -> dict:
     def _impl():
         doc = _active_doc()
         features = []
-        feat = doc.FirstFeature
-        while feat is not None:
+        for raw_feature in doc.FeatureManager.GetFeatures(False) or ():
+            feat = win32com.client.Dispatch(raw_feature)
             try:
                 features.append({"name": feat.Name, "type": feat.GetTypeName2})
             except Exception:
                 pass
-            try:
-                feat = feat.GetNextFeature
-            except Exception:
-                break
         return {"count": len(features), "features": features}
 
     return await _run(_impl)

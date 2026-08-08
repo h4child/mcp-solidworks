@@ -37,6 +37,7 @@ ferramentas na versão 4.2.0, consistentes com `manifest.json`.
 | `measure_body` / `set_material` | Exigiam uma peça sólida ativa. | Ambiente isolado com bloco 100 × 50 × 10 mm. | Medição e atribuição de AISI 1020 aprovadas. |
 | `suppress_component` / `unsuppress_component` | As chamadas `EditSuppress2` e `EditUnsuppress2` não são métodos invocáveis no COM desta versão. | Busca direta de `IComponent2` e uso de `SetSuppression2`; o código de sucesso `swSuppressionChangeOk` (2) passou a ser aceito. | Suprimiu e restaurou `base_part-1` em assemblies novos e isolados, verificando `IsSuppressed` após cada chamada. |
 | `delete_component` / `list_components` | Após remover o único item, `GetComponents` devolve `None` e a listagem falhava ao iterar. | Normalização de coleção vazia para uma tupla vazia. | Excluiu `base_part-1` e confirmou `{"count": 0, "components": []}` no assembly temporário. |
+| `add_mate` / `list_mates` / `list_features` | `AddMate5` recebia parâmetros incompletos; as listagens percorriam apenas o primeiro recurso COM. | Assinatura completa de `AddMate5`, marca de seleção 1, verificação de `swAddMateError_NoError` e enumeração por `FeatureManager.GetFeatures(False)`. | Criou `Coincidente1` entre duas cópias da peça-base; a mate e 25 recursos do assembly foram listados corretamente. |
 
 ## Execução de integração real
 
