@@ -567,10 +567,9 @@ async def connect_solidworks() -> dict:
 
     def _impl():
         app = _connect()
-        try:
-            version = app.RevisionNumber
-        except Exception:
-            version = app.RevisionNumber()
+        version = app.RevisionNumber
+        if callable(version):
+            version = version()
         return {"connected": True, "version": str(version), "launched": _last_launch_happened}
 
     return await _run(_impl)
@@ -582,10 +581,9 @@ async def get_solidworks_info() -> dict:
 
     def _impl():
         app = _connect()
-        try:
-            version = app.RevisionNumber
-        except Exception:
-            version = app.RevisionNumber()
+        version = app.RevisionNumber
+        if callable(version):
+            version = version()
         return {"version": str(version), "visible": bool(app.Visible)}
 
     return await _run(_impl)
