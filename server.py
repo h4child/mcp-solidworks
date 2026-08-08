@@ -1571,37 +1571,46 @@ async def linear_pattern(feature_name: str, direction: str = "x",
         spacing_m = to_meters(spacing, unit)
         spacing2_m = to_meters(spacing2, unit)
 
-        doc.ClearSelection2(True)
-        if not _select_by_id(doc, feature_name, "BODYFEATURE"):
-            raise RuntimeError(f"Could not select feature '{feature_name}'.")
-
-        dir_map = {"x": 0, "y": 1, "z": 2}
-        axis_idx = dir_map.get(direction.lower())
-        if axis_idx is None:
+        # SolidWorks expects a true linear reference with selection mark 1 and
+        # the seed feature with mark 4.  Resolve a reusable reference axis
+        # constructed from the localized standard planes.
+        if direction.lower() not in {"x", "y", "z"}:
             raise ValueError(f"Direction must be 'x', 'y', or 'z', got '{direction}'.")
 
-        axes = []
-        feat = doc.FirstFeature
-        while feat is not None and len(axes) <= axis_idx:
-            try:
-                if feat.GetTypeName2 == "RefAxis":
-                    axes.append(feat.Name)
-            except Exception:
-                pass
-            try:
-                feat = feat.GetNextFeature
-            except Exception:
-                break
-
-        if axis_idx < len(axes):
-            empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
-            doc.Extension.SelectByID2(axes[axis_idx], "AXIS", 0, 0, 0, True, 1, empty, 0)
-
+        primary_axis = _ensure_pattern_axis(doc, direction)
         use_dir2 = count2 > 1
+        secondary_axis = None
+        if use_dir2:
+            # The public tool accepts one direction, so choose a deterministic
+            # perpendicular standard direction for a rectangular pattern.
+            secondary_directions = {"x": "y", "y": "x", "z": "x"}
+            secondary_axis = _ensure_pattern_axis(
+                doc, secondary_directions[direction.lower()]
+            )
+
+        doc.ClearSelection2(True)
+        if not doc.Extension.SelectByID2(
+            primary_axis, "AXIS", 0, 0, 0, False, 1,
+            win32com.client.VARIANT(pythoncom.VT_DISPATCH, None), 0,
+        ):
+            raise RuntimeError(f"Could not select the {direction} direction reference.")
+        if use_dir2:
+            # The API requires the second direction reference with mark 2.
+            if not doc.Extension.SelectByID2(
+                secondary_axis, "AXIS", 0, 0, 0, True, 2,
+                win32com.client.VARIANT(pythoncom.VT_DISPATCH, None), 0,
+            ):
+                raise RuntimeError("Could not select the secondary pattern direction reference.")
+        empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+        if not doc.Extension.SelectByID2(
+            feature_name, "BODYFEATURE", 0, 0, 0, True, 4, empty, 0
+        ):
+            raise RuntimeError(f"Could not select feature '{feature_name}'.")
+
         feat = doc.FeatureManager.FeatureLinearPattern4(
             count, spacing_m, count2 if use_dir2 else 1, spacing2_m if use_dir2 else 0,
-            True, False, use_dir2, False,
-            True, False,
+            False, False, "", "", False, False,
+            False, False, False, False, True, True, False, False, 0.0, 0.0,
         )
         if feat is None:
             raise RuntimeError(
@@ -1630,37 +1639,27 @@ async def circular_pattern(feature_name: str, axis: str = "z",
             raise ValueError(f"Angle must be between 0 and 360, got {angle}.")
         doc = _active_doc()
 
-        doc.ClearSelection2(True)
-        if not _select_by_id(doc, feature_name, "BODYFEATURE"):
-            raise RuntimeError(f"Could not select feature '{feature_name}'.")
-
-        dir_map = {"x": 0, "y": 1, "z": 2}
-        axis_idx = dir_map.get(axis.lower())
-        if axis_idx is None:
+        if axis.lower() not in {"x", "y", "z"}:
             raise ValueError(f"Axis must be 'x', 'y', or 'z', got '{axis}'.")
 
-        axes = []
-        feat = doc.FirstFeature
-        while feat is not None and len(axes) <= axis_idx:
-            try:
-                if feat.GetTypeName2 == "RefAxis":
-                    axes.append(feat.Name)
-            except Exception:
-                pass
-            try:
-                feat = feat.GetNextFeature
-            except Exception:
-                break
-
-        if axis_idx < len(axes):
-            empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
-            doc.Extension.SelectByID2(axes[axis_idx], "AXIS", 0, 0, 0, True, 1, empty, 0)
+        axis_name = _ensure_pattern_axis(doc, axis)
+        doc.ClearSelection2(True)
+        if not doc.Extension.SelectByID2(
+            axis_name, "AXIS", 0, 0, 0, False, 1,
+            win32com.client.VARIANT(pythoncom.VT_DISPATCH, None), 0,
+        ):
+            raise RuntimeError(f"Could not select the {axis} rotation reference.")
+        empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+        if not doc.Extension.SelectByID2(
+            feature_name, "BODYFEATURE", 0, 0, 0, True, 4, empty, 0
+        ):
+            raise RuntimeError(f"Could not select feature '{feature_name}'.")
 
         angle_rad = math.radians(angle)
         equal_spacing = abs(angle - 360) < 0.01
 
         feat = doc.FeatureManager.FeatureCircularPattern4(
-            count, angle_rad, equal_spacing,
+            count, angle_rad, False,
             "", False, True, False,
         )
         if feat is None:
@@ -2898,6 +2897,66 @@ def _select_plane_by_name(doc, plane_name: str, append: bool = False, mark: int 
     return bool(doc.Extension.SelectByID2(plane_name, "PLANE", 0, 0, 0, append, mark, empty, 0))
 
 
+def _ensure_pattern_axis(doc, direction: str) -> str:
+    """Return a reusable reference axis aligned to a model standard direction.
+
+    Origin-axis display names are localized and are not normal FeatureManager
+    entries on every SolidWorks installation. A named reference axis made from
+    two standard planes provides the same global direction and remains stable
+    for feature patterns in all supported UI languages.
+    """
+    normalized = direction.lower()
+    axis_planes = {
+        "x": ("front", "top"),
+        "y": ("front", "right"),
+        "z": ("top", "right"),
+    }
+    plane_pair = axis_planes.get(normalized)
+    if plane_pair is None:
+        raise ValueError(f"Direction must be 'x', 'y', or 'z', got '{direction}'.")
+
+    axis_name = f"MCP Pattern Axis {normalized.upper()}"
+    axis_features = []
+    for raw_feature in doc.FeatureManager.GetFeatures(False) or ():
+        feature = win32com.client.Dispatch(raw_feature)
+        if feature.GetTypeName2 == "RefAxis":
+            axis_features.append(feature)
+            if feature.Name == axis_name:
+                return axis_name
+
+    doc.ClearSelection2(True)
+    if not _select_plane_by_name(doc, plane_pair[0], append=False, mark=0):
+        raise RuntimeError(f"Could not select standard plane '{plane_pair[0]}'.")
+    if not _select_plane_by_name(doc, plane_pair[1], append=True, mark=0):
+        raise RuntimeError(f"Could not select standard plane '{plane_pair[1]}'.")
+
+    axis_count_before = len(axis_features)
+    try:
+        # InsertAxis2 is an IModelDoc2 method and returns void over COM.
+        doc.InsertAxis2(True)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not create the {normalized}-direction reference axis."
+        ) from exc
+
+    axes_after = [
+        win32com.client.Dispatch(raw_feature)
+        for raw_feature in doc.FeatureManager.GetFeatures(False) or ()
+        if win32com.client.Dispatch(raw_feature).GetTypeName2 == "RefAxis"
+    ]
+    if len(axes_after) <= axis_count_before:
+        raise RuntimeError(f"SolidWorks did not create the {normalized}-direction reference axis.")
+
+    created_axis = axes_after[-1]
+    try:
+        created_axis.Name = axis_name
+    except Exception:
+        # The generated name is still usable if a protected document prevents
+        # renaming, although subsequent calls will then create a new axis.
+        axis_name = created_axis.Name
+    return axis_name
+
+
 @mcp.tool()
 async def mirror_feature(
     feature_name: str,
@@ -3273,22 +3332,30 @@ async def create_reference_axis(
         else:
             raise ValueError(f"method must be 'two_planes' or 'cylinder', got '{method}'.")
 
-        # InsertAxis2 takes a single AutoSize boolean and infers the axis type
-        # from the current selection (two planes, one cylindrical face, etc.).
+        axis_count_before = sum(
+            1
+            for raw_feature in doc.FeatureManager.GetFeatures(False) or ()
+            if win32com.client.Dispatch(raw_feature).GetTypeName2 == "RefAxis"
+        )
+        # InsertAxis2 belongs to IModelDoc2 and infers the axis type from the
+        # current selection (two planes, one cylindrical face, etc.).
         try:
-            feat = doc.FeatureManager.InsertAxis2(True)
+            doc.InsertAxis2(True)
         except Exception:
-            feat = None
+            pass
 
-        if feat is None:
+        axes_after = [
+            win32com.client.Dispatch(raw_feature)
+            for raw_feature in doc.FeatureManager.GetFeatures(False) or ()
+            if win32com.client.Dispatch(raw_feature).GetTypeName2 == "RefAxis"
+        ]
+        if len(axes_after) <= axis_count_before:
             raise RuntimeError(
                 f"Reference axis creation failed. method='{method}'. "
                 "For 'two_planes' the planes must actually intersect; for 'cylinder' "
                 "the point must lie on a cylindrical/conical face."
             )
-
-        feat_dispatch = win32com.client.Dispatch(feat)
-        name = feat_dispatch.Name if hasattr(feat_dispatch, "Name") else "Axis"
+        name = axes_after[-1].Name
 
         return {
             "axis": name,

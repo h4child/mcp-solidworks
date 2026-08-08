@@ -47,6 +47,9 @@ ferramentas na versão 4.2.0, consistentes com `manifest.json`.
 | `revolve_sketch` | — | Perfil fechado afastado de uma linha de centro. | Revolução completa aprovada; sólido medido com volume positivo. |
 | `fillet_edges` / `chamfer_edges` | — | Blocos extrudados com seleção automática de todas as 12 arestas. | Recursos `Fillet` e `Chamfer` criados e listados com sucesso. |
 | `shell_body` | Usava `IFeatureManager.InsertFeatureShell`, inexistente no binding 2025; a face removida recebia marca de seleção incorreta. | Uso de `IModelDoc2.InsertFeatureShell`, face com marca 1 e verificação pelo novo recurso `Shell`. | Casca aberta de 2 mm aprovada; volume caiu de `8.0e-06` para `3.392e-06 m³`. |
+| `create_reference_axis` | Chamava `InsertAxis2` no `FeatureManager`, embora a API 2025 o exponha em `IModelDoc2`. | Chamada de `IModelDoc2.InsertAxis2` e descoberta do novo recurso `RefAxis` na lista completa de recursos. | Criou o eixo `Eixo1` pela interseção dos planos frontal e superior. |
+| `linear_pattern` | A chamada `FeatureLinearPattern4` tinha apenas 10 dos 20 argumentos e não marcava corretamente as direções/recursos selecionados. | Assinatura completa, marcas 1/2/4 exigidas pela API e eixos de referência reutilizáveis derivados dos planos-padrão localizados. | Criou `Padrão linear1` com 3 × 2 instâncias e os eixos `MCP Pattern Axis X/Y`. |
+| `circular_pattern` | Tratava o parâmetro `FlipDirection` como `EqualSpacing` e tentava usar um plano como eixo de rotação. | Assinatura corrigida e eixo `MCP Pattern Axis Z` criado/reutilizado como referência real. | Criou `PadrãoCircular1` de quatro instâncias a 360°. |
 
 ## Execução de integração real
 
