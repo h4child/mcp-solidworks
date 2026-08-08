@@ -4932,6 +4932,27 @@ async def create_exploded_view(
         dist_m = to_meters(explode_distance, unit)
         dir_index = {"x": 0, "y": 1, "z": 2}[axis]
 
+        # Explode steps belong to IConfiguration, not IAssemblyDoc. Create and
+        # activate an explode view before selecting components for its steps.
+        created_view = assy.CreateExplodedView
+        if callable(created_view):
+            created_view = created_view()
+        if not created_view:
+            raise RuntimeError("SolidWorks could not create an exploded view for the active configuration.")
+        explode_names = assy.GetExplodedViewNames
+        if callable(explode_names):
+            explode_names = explode_names()
+        if isinstance(explode_names, str):
+            explode_names = (explode_names,)
+        explode_name = (explode_names or ())[-1] if explode_names else ""
+        if not explode_name or not assy.ShowExploded2(True, explode_name):
+            raise RuntimeError("SolidWorks could not activate the new exploded view.")
+        configuration = win32com.client.Dispatch(
+            assy.ConfigurationManager.ActiveConfiguration,
+            "IConfiguration",
+            "{83A33D98-27C5-11CE-BFD4-00400513BB57}",
+        )
+
         # AddExplodeStep2(ExplDist, ExplDirIndex, ReverseDir, ExplAng, RotAxisIndex,
         #   ReverseAng, RotateAboutOrigin, AutoSpaceComponentsOnDrag, Error) — one
         #   step per component, each moved a bit further along the axis.
@@ -4941,17 +4962,21 @@ async def create_exploded_view(
             comp = win32com.client.Dispatch(raw)
             assy.ClearSelection2(True)
             try:
-                comp.Select4(False, None, False)
-            except Exception:
-                try:
-                    comp.Select2(False, 0)
-                except Exception:
+                if not comp.SelectByMark(False, 1):
                     continue
+            except Exception:
+                continue
             step_dist = dist_m * (i + 1)
-            err = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
             try:
-                assy.AddExplodeStep2(step_dist, dir_index, False, 0.0, 0, False, True, False, err)
-                created_steps += 1
+                result = configuration.AddExplodeStep2(
+                    step_dist, dir_index, False, 0.0, 0, False, False, False
+                )
+                step, outputs = _split_com_result(result)
+                error_code = int(outputs[0]) if outputs else 0
+                if step is not None and error_code == 0:
+                    created_steps += 1
+                else:
+                    last_err = error_code
             except Exception as e:
                 last_err = e
 
@@ -4960,6 +4985,10 @@ async def create_exploded_view(
                 "Exploded view creation could not add steps automatically "
                 f"({last_err}). Create the explode manually if needed."
             )
+
+        rebuilt = assy.EditRebuild3
+        if callable(rebuilt):
+            rebuilt()
 
         return {"steps": created_steps, "direction": direction,
                 "distance": explode_distance, "unit": unit or _default_unit}
