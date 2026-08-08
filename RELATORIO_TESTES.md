@@ -59,6 +59,7 @@ ferramentas na versão 4.2.0, consistentes com `manifest.json`.
 | `draw_line_3d` | — | Novo esboço 3D temporário com uma linha espacial. | O esboço 3D fechado continha um segmento de `(0, 0, 0)` até `(100, 50, 25)` mm. |
 | `create_base_flange` | A chamada obsoleta `InsertSheetMetalBaseFlange2` retornava `None` mesmo com perfil fechado válido. | Definição moderna `swFmBaseFlange` inicializada por `IBaseFlangeFeatureData`, com allowance, alívio e parâmetros de chapa explicitamente configurados. | Criou `Flange-base1` (`SMBaseFlange`), `SheetMetal` e `FlatPattern` para uma chapa de 100 × 50 × 2 mm. |
 | `add_sheet_metal_bend` | Chamava `InsertBends2` no `FeatureManager`, que não o expõe; além disso, não fornecia K-factor e a API retornava `False`. | Uso de `IPartDoc.InsertBends2` com K-factor `0.5`, alívio automático e flat pattern. | Converteu uma caixa temporária com casca de 2 mm em `Chapa metálica2` e `Padrão-Plano2`. |
+| `add_sheet_metal_edge_flange` | Chamava `InsertSheetMetalEdgeFlange2` com parâmetros escalares incompatíveis, sem o perfil associado à aresta exigido pela API. | Criação do esboço de flange por `InsertSketchForEdgeFlange`, conversão da aresta em geometria de esboço e associação por `IEdgeFlangeFeatureData.AddEdges` antes de `CreateFeature`. | Criou `Aresta-Flange1` (`EdgeFlange`) em uma chapa-base temporária de 100 × 50 × 2 mm; o recurso foi confirmado no FeatureManager. |
 
 ## Execução de integração real
 

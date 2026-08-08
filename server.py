@@ -2633,23 +2633,129 @@ async def add_sheet_metal_edge_flange(
 
         fl_m = to_meters(flange_length, unit)
         angle_rad = math.radians(flange_angle)
+        edge = doc.SelectionManager.GetSelectedObject6(1, 0)
 
-        feat = doc.FeatureManager.InsertSheetMetalEdgeFlange2(
-            fl_m,       # Length
-            angle_rad,  # Angle
-            0,          # FlangePosition (0=MaterialInside)
-            0,          # Relief type
-            0.5,        # Relief ratio
-            False,      # UseReliefRatio
-            0.0,        # Relief depth
-            0.0,        # Relief width
-            0,          # OffsetType
-            False,      # FlipDirection
-            True,       # UseDefaultBendRadius
-            0.0,        # CustomBendRadius
-            0,          # CustomBendAllowance
-            0.0,        # CustomKFactor
+        # An edge flange is not created from scalar parameters alone.  The
+        # SolidWorks API requires a profile sketch associated with every
+        # selected edge.  Create the profile using InsertSketchForEdgeFlange,
+        # convert the selected model edge into sketch geometry, then add the
+        # profile and edge to the current EdgeFlangeFeatureData definition.
+        #
+        # GetActiveSketch2 and GetSketchSegments are exposed through the COM
+        # type library but are not always resolved by late-bound Python COM.
+        # Their documented DISPIDs are used below so this remains compatible
+        # with the SolidWorks 2025 late-bound connection used by this server.
+        sketch_feature = doc.InsertSketchForEdgeFlange(edge, angle_rad, False)
+        if sketch_feature is None:
+            raise RuntimeError(
+                "SolidWorks could not create the edge-flange profile sketch. "
+                "Ensure the selected edge is linear and belongs to a sheet metal body."
+            )
+
+        # IFeature::Select2(False, 0), invoked directly because the returned
+        # feature is an untyped IDispatch object in the Python COM binding.
+        if not sketch_feature._oleobj_.InvokeTypes(
+            67, 0, 1, (11, 0), ((11, 1), (3, 1)), False, 0
+        ):
+            raise RuntimeError("SolidWorks could not select the edge-flange profile sketch.")
+
+        sketch_open = False
+        try:
+            doc.EditSketch()
+            sketch_open = True
+            raw_sketch = doc._oleobj_.InvokeTypes(66054, 0, 1, (9, 0), ())
+            edge_flange_sketch = win32com.client.Dispatch(raw_sketch)
+
+            doc.ClearSelection2(True)
+            if not doc.Extension.SelectByID2("", "EDGE", ex, ey, ez, False, 0, empty, 0):
+                raise RuntimeError(
+                    "SolidWorks could not reselect the edge while creating the flange profile."
+                )
+            if not doc.SketchManager.SketchUseEdge2(False):
+                raise RuntimeError("SolidWorks could not convert the selected edge into the flange profile.")
+
+            sketch_segments = edge_flange_sketch._oleobj_.InvokeTypes(37, 0, 1, (12, 0), ())
+            if not sketch_segments:
+                raise RuntimeError("SolidWorks did not create sketch geometry for the selected edge.")
+
+            base_line = win32com.client.Dispatch(sketch_segments[0])
+            start_point = win32com.client.Dispatch(
+                base_line._oleobj_.InvokeTypes(5, 0, 1, (9, 0), ())
+            )
+            end_point = win32com.client.Dispatch(
+                base_line._oleobj_.InvokeTypes(7, 0, 1, (9, 0), ())
+            )
+            start_x = start_point._oleobj_.InvokeTypes(1, 0, 2, (5, 0), ())
+            start_y = start_point._oleobj_.InvokeTypes(2, 0, 2, (5, 0), ())
+            end_x = end_point._oleobj_.InvokeTypes(1, 0, 2, (5, 0), ())
+            end_y = end_point._oleobj_.InvokeTypes(2, 0, 2, (5, 0), ())
+
+            # Create a valid open flange profile.  Its first line is the
+            # converted model edge; the remaining five lines define the lip
+            # height and a small tapered top, following the API example.
+            edge_width = end_x - start_x
+            doc.SetAddToDB(True)
+            doc.SetDisplayWhenAdded(False)
+            try:
+                doc.CreateLine2(start_x, start_y, 0, start_x, start_y + fl_m, 0)
+                doc.CreateLine2(
+                    start_x, start_y + fl_m, 0,
+                    start_x + 0.1 * edge_width, start_y + 1.25 * fl_m, 0,
+                )
+                doc.CreateLine2(
+                    start_x + 0.1 * edge_width, start_y + 1.25 * fl_m, 0,
+                    end_x - 0.1 * edge_width, start_y + 1.25 * fl_m, 0,
+                )
+                doc.CreateLine2(
+                    end_x - 0.1 * edge_width, start_y + 1.25 * fl_m, 0,
+                    end_x, end_y + fl_m, 0,
+                )
+                doc.CreateLine2(end_x, end_y, 0, end_x, end_y + fl_m, 0)
+            finally:
+                doc.SetDisplayWhenAdded(True)
+                doc.SetAddToDB(False)
+
+            doc.InsertSketch2(True)
+            sketch_open = False
+        except Exception:
+            if sketch_open:
+                try:
+                    doc.InsertSketch2(True)
+                except Exception:
+                    pass
+            raise
+
+        flange_edges = win32com.client.VARIANT(
+            pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, (edge,)
         )
+        flange_sketches = win32com.client.VARIANT(
+            pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, (edge_flange_sketch,)
+        )
+        flange_data = win32com.client.Dispatch(doc.FeatureManager.CreateDefinition(37))
+        add_error = flange_data._oleobj_.InvokeTypes(
+            37, 0, 1, (3, 0), ((12, 1), (12, 1)), flange_edges, flange_sketches
+        )
+        if add_error != 0:
+            raise RuntimeError(f"SolidWorks rejected the edge-flange profile (error code {add_error}).")
+
+        # swFlangeOffsetBlind=1, swFlangeDimTypeInnerVirtualSharp=2, and
+        # swFlangePositionTypeMaterialInside=1.  Reuse the parent sheet
+        # metal feature's bend allowance and relief settings.
+        flange_data.UseDefaultBendRadius = False
+        flange_data.BendRadius = 0.001
+        flange_data.GapDistance = 0.001
+        flange_data.BendAngle = angle_rad
+        flange_data.LockAngle = True
+        flange_data.OffsetType = 1
+        flange_data.OffsetDistance = fl_m
+        flange_data.OffsetDimType = 2
+        flange_data.PositionType = 1
+        flange_data.UsePositionOffset = True
+        flange_data.PositionOffsetType = 1
+        flange_data.PositionOffsetDistance = 0.01
+        flange_data.UseDefaultBendAllowance = True
+        flange_data.UseDefaultBendRelief = True
+        feat = doc.FeatureManager.CreateFeature(flange_data)
 
         if feat is None:
             raise RuntimeError(
