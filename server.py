@@ -1203,7 +1203,17 @@ async def add_sketch_dimension(x1: float, y1: float,
                 doc.Extension.SelectByID2("", "SKETCHPOINT", x2_m, y2_m, 0, True, 0, empty, 0)
 
         dim_x_m, dim_y_m = to_meters(dim_x, unit), to_meters(dim_y, unit)
-        disp_dim = doc.AddDimension2(dim_x_m, dim_y_m, 0)
+        # AddDimension2 can open the interactive value dialog and block COM.
+        # Temporarily disable swInputDimValOnCreate (10), then restore the user's
+        # original setting even if SolidWorks rejects the selected geometry.
+        app = _connect()
+        input_value_preference = 10  # swInputDimValOnCreate
+        original_input_value = bool(app.GetUserPreferenceToggle(input_value_preference))
+        try:
+            app.SetUserPreferenceToggle(input_value_preference, False)
+            disp_dim = doc.AddDimension2(dim_x_m, dim_y_m, 0)
+        finally:
+            app.SetUserPreferenceToggle(input_value_preference, original_input_value)
         if disp_dim is None:
             raise RuntimeError("Failed to add dimension. Ensure the sketch entities are valid for dimensioning.")
 
@@ -1212,19 +1222,11 @@ async def add_sketch_dimension(x1: float, y1: float,
 
         if value is not None:
             val_m = to_meters(value, unit)
-            try:
-                dim = disp_dim.GetDimension2(0)
-                if callable(dim):
-                    dim = dim()
-                dim = win32com.client.Dispatch(dim)
-                dim.SystemValue = val_m
-                result["value"] = value
-            except Exception:
-                try:
-                    disp_dim.SystemValue = val_m
-                    result["value"] = value
-                except Exception:
-                    result["value_set"] = False
+            dim = win32com.client.Dispatch(disp_dim.GetDimension2(0))
+            dim.SystemValue = val_m
+            if not math.isclose(float(dim.SystemValue), val_m, rel_tol=0.0, abs_tol=1e-9):
+                raise RuntimeError("SolidWorks did not apply the requested sketch dimension value.")
+            result["value"] = value
 
         doc.ClearSelection2(True)
         return result
