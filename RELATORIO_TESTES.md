@@ -57,6 +57,7 @@ ferramentas na versão 4.2.0, consistentes com `manifest.json`.
 | `add_gusset` | `SelectByID2` não localizava faces anônimas de membros estruturais, o array obrigatório de faces era `None` e a semântica do perfil triangular estava invertida. | Resolução por `IFace2.GetClosestPointOn`, SAFEARRAY das duas faces de suporte e parâmetros completos para perfis triangular e poligonal. | Criou `Cantoneira1` (`Gusset`) de 5 mm tanto para o perfil triangular quanto para o perfil poligonal (`flat`). |
 | `create_3d_sketch` | — | Peça temporária vazia; verificação pelo status do esboço ativo. | Abriu `3DSketch1` e reportou corretamente o tipo `3D`. |
 | `draw_line_3d` | — | Novo esboço 3D temporário com uma linha espacial. | O esboço 3D fechado continha um segmento de `(0, 0, 0)` até `(100, 50, 25)` mm. |
+| `create_base_flange` | A chamada obsoleta `InsertSheetMetalBaseFlange2` retornava `None` mesmo com perfil fechado válido. | Definição moderna `swFmBaseFlange` inicializada por `IBaseFlangeFeatureData`, com allowance, alívio e parâmetros de chapa explicitamente configurados. | Criou `Flange-base1` (`SMBaseFlange`), `SheetMetal` e `FlatPattern` para uma chapa de 100 × 50 × 2 mm. |
 
 ## Execução de integração real
 

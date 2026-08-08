@@ -2446,17 +2446,15 @@ async def create_base_flange(
 ) -> dict:
     """Create a sheet metal base flange from the last sketch.
 
-    This is the first step to create a sheet metal part. Draw a sketch profile
-    (open or closed), then call this to turn it into a sheet metal body.
-
-    An OPEN profile (e.g. a single line, arc, or open polyline) produces a
-    flat strip or bent plate extruded to the given depth.
-    A CLOSED profile (e.g. a rectangle) produces a hollow box/tube.
+    This is the first step to create a sheet metal part. Draw a closed sketch
+    profile, then call this to turn it into a flat sheet metal body. Add edge
+    flanges afterwards to create folded walls.
 
     thickness: sheet metal gauge thickness.
-    depth: extrusion depth (how far the sheet extends).
-    direction: 'blind' (one side) or 'midplane' (centered on sketch).
-    both_directions: if True, extrude equally on both sides.
+    depth, direction, and both_directions are retained for API compatibility.
+    For a closed base-flange outline, SolidWorks creates a flat sheet whose
+    profile dimensions come from the sketch; its thickness comes from
+    ``thickness``.
     bend_radius: default inside bend radius for all bends."""
 
     def _impl():
@@ -2474,35 +2472,45 @@ async def create_base_flange(
 
         sketch_name = _select_last_sketch(doc)
 
-        end_cond = 6 if (both_directions or direction.lower() == "midplane") else 0
-
-        # InsertSheetMetalBaseFlange2 argument order (19 args, verified against the
-        # SW 2025 type library):
-        #   Thickness, ThickenDir, Radius, ExtrudeDist1, ExtrudeDist2, FlipExtruDir,
-        #   EndCondition1, EndCondition2, DirToUse, PCBA, UseDefaultRelief, ReliefType,
-        #   ReliefWidth, ReliefDepth, ReliefRatio, UseReliefRatio, Merge, UseFeatScope,
-        #   UseAutoSelect
-        feat = doc.FeatureManager.InsertSheetMetalBaseFlange2(
-            t_m,        # Thickness
-            False,      # ThickenDir
-            br_m,       # Radius
-            d_m,        # ExtrudeDist1
-            0.0,        # ExtrudeDist2
-            False,      # FlipExtruDir
-            end_cond,   # EndCondition1 (0=Blind, 6=MidPlane)
-            0,          # EndCondition2
-            0,          # DirToUse
-            win32com.client.VARIANT(pythoncom.VT_DISPATCH, None),  # PCBA (null object)
-            True,       # UseDefaultRelief
-            0,          # ReliefType (0=Rectangular)
-            0.0,        # ReliefWidth
-            0.0,        # ReliefDepth
-            0.5,        # ReliefRatio
-            False,      # UseReliefRatio
-            True,       # Merge
-            True,       # UseFeatScope
-            True,       # UseAutoSelect
+        # InsertSheetMetalBaseFlange2 is obsolete in the current API and
+        # returns None under the SolidWorks 2025 Python COM binding. Create a
+        # base-flange definition instead, initialize its sheet-metal data, and
+        # then create the feature. The definition object is returned as an
+        # untyped IDispatch, so Initialize and GetCustomBendAllowance must be
+        # invoked by their documented DISPIDs with explicit COM types.
+        base_flange = win32com.client.Dispatch(doc.FeatureManager.CreateDefinition(34))
+        custom_bend_allowance = win32com.client.Dispatch(
+            base_flange._oleobj_.InvokeTypes(38, 0, 1, (9, 0), ())
         )
+        custom_bend_allowance.Type = 3  # swBendAllowanceDirect
+        custom_bend_allowance.BendAllowance = t_m * 0.5
+
+        # swEndCondThroughAll = 1. This is the documented base-flange
+        # definition setup; the actual closed outline supplies the sheet size.
+        base_flange.D1EndConditionType = 1
+        base_flange.D1EndConditionDistance = d_m
+        base_flange.D2EndConditionType = 1
+        base_flange.D2EndConditionDistance = d_m
+        base_flange.OffsetDirections = 2
+        base_flange.ReverseDirection = False
+        base_flange.OverrideDefaultSheetMetalParameters = True
+        base_flange.Thickness = t_m
+        base_flange.BendRadius = br_m
+        base_flange._oleobj_.InvokeTypes(
+            52, 0, 1, (24, 0),
+            ((11, 1), (11, 1), (9, 1), (11, 1), (3, 1), (11, 1),
+             (5, 1), (5, 1), (5, 1)),
+            False,  # UseMaterialSheetMetalParameters
+            False,  # OverrideDefaultBendAllowance
+            custom_bend_allowance,
+            False,  # OverrideDefaultBendRelief
+            1,      # swSheetMetalReliefRectangular
+            True,   # UseReliefRatio
+            0.5,    # ReliefRatio
+            0.0,    # ReliefWidth
+            0.0,    # ReliefDepth
+        )
+        feat = doc.FeatureManager.CreateFeature(base_flange)
 
         if feat is None:
             raise RuntimeError(
