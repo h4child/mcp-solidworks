@@ -5132,31 +5132,35 @@ async def create_assembly_pattern(
         if count < 2:
             raise ValueError(f"count must be >= 2, got {count}.")
         assy = _active_assembly()
-        _select_component(assy, component_name)
 
         if pattern_type.lower() == "linear":
             spacing_m = to_meters(spacing, unit)
             axis = direction.lower()
+            if axis not in {"x", "y", "z"}:
+                raise ValueError(f"direction must be 'x', 'y', or 'z', got '{direction}'.")
 
-            edge_name = None
-            feat = assy.FirstFeature
-            axis_count = {"x": 0, "y": 1, "z": 2}[axis]
-            found = 0
-            while feat is not None:
-                try:
-                    if feat.GetTypeName2 in ("RefPlane",):
-                        pass
-                except Exception:
-                    pass
-                try:
-                    feat = feat.GetNextFeature
-                except Exception:
-                    break
+            # Component patterns require the seed with mark 1 and the direction
+            # reference with mark 2. A reusable assembly reference axis gives the
+            # public x/y/z contract a deterministic SolidWorks selection target.
+            axis_name = _ensure_pattern_axis(assy, axis)
+            component = _find_component(assy, component_name)
+            if component is None:
+                raise RuntimeError(f"Component '{component_name}' not found in the assembly.")
+            assy.ClearSelection2(True)
+            if not component.SelectByMark(False, 1):
+                raise RuntimeError(f"Could not select component '{component_name}' for patterning.")
+            if not assy.Extension.SelectByID2(
+                axis_name, "AXIS", 0, 0, 0, True, 2,
+                win32com.client.VARIANT(pythoncom.VT_DISPATCH, None), 0,
+            ):
+                raise RuntimeError(f"Could not select the {axis} direction reference for patterning.")
 
             try:
                 feat = assy.FeatureManager.FeatureLinearPattern4(
-                    count, spacing_m, 1, 0.0, False, False,
-                    "NULL", "NULL", False, False, False, False, False, False, True,
+                    count, spacing_m, 1, 0.0,
+                    False, False, "", "", False, False,
+                    False, False, False, False, False, False,
+                    False, False, 0.0, 0.0,
                 )
             except Exception:
                 feat = None
@@ -5171,14 +5175,26 @@ async def create_assembly_pattern(
                     "count": count, "spacing": spacing, "unit": unit or _default_unit}
 
         elif pattern_type.lower() == "circular":
+            if angle <= 0 or angle > 360:
+                raise ValueError(f"angle must be between 0 and 360, got {angle}.")
             fx, fy, fz = to_meters(axis_face_x, unit), to_meters(axis_face_y, unit), to_meters(axis_face_z, unit)
             angle_rad = math.radians(angle)
-            empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
-            assy.Extension.SelectByID2("", "FACE", fx, fy, fz, True, 4, empty, 0)
+            component = _find_component(assy, component_name)
+            if component is None:
+                raise RuntimeError(f"Component '{component_name}' not found in the assembly.")
+            assy.ClearSelection2(True)
+            if not component.SelectByMark(False, 1):
+                raise RuntimeError(f"Could not select component '{component_name}' for patterning.")
+            if not assy.Extension.SelectByID2(
+                "", "FACE", fx, fy, fz, True, 2,
+                win32com.client.VARIANT(pythoncom.VT_DISPATCH, None), 0,
+            ):
+                raise RuntimeError("Circular component pattern could not select the requested axis face.")
 
             try:
                 feat = assy.FeatureManager.FeatureCircularPattern5(
-                    count, angle_rad, False, "NULL", False, True, False,
+                    count, angle_rad, False, "", False, True, False,
+                    False, False, False, 1, 0.0, "", False,
                 )
             except Exception:
                 feat = None
