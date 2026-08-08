@@ -151,6 +151,17 @@ This extends the certified MCP surface to **99 tools**. The integrated tool is
 explicitly documented as a conceptual one-body model; the assembly tool remains
 available when separately editable component files are required.
 
+## Component positioning and visual review
+
+Three positioning-review tools were added and live-tested in SolidWorks 2025:
+`get_component_transform`, `set_component_transform`, and
+`capture_standard_views`. In a temporary assembly, the transform tool applied
+an absolute 25 mm X translation and 90 degree Z rotation to the piston
+component, then read back the expected translation and rotation matrix before
+locking the component. The view tool exported front, back, top, bottom, and
+isometric PNG files, then restored the isometric camera. The final upright
+piston part was reopened after the test.
+
 ## Controles aplicados durante os testes
 
 - A conexão reutilizou a instância aberta, sem iniciar processo adicional.

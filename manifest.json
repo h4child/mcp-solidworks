@@ -2,7 +2,7 @@
   "manifest_version": "0.2",
   "name": "solidworks-mcp",
   "display_name": "SolidWorks MCP",
-  "version": "4.5.1",
+  "version": "4.6.0",
   "description": "Servidor MCP para automacao do SolidWorks via API COM, escrito com o SDK oficial (FastMCP)",
   "long_description": "Controla o SolidWorks (criar pecas/montagens, esbocos, extrusao, corte, filete, chanfro, etc.) via COM, exposto como ferramentas MCP.",
   "author": {
@@ -33,6 +33,9 @@
     { "name": "export_document", "description": "Export to STEP, STL, IGES, PDF, DXF, or Parasolid." },
     { "name": "insert_component", "description": "Insert a part/sub-assembly into the active assembly." },
     { "name": "list_components", "description": "List components in the active assembly." },
+    { "name": "get_component_transform", "description": "Read a component's exact assembly translation and rotation matrix." },
+    { "name": "set_component_transform", "description": "Set a component's absolute assembly position and Euler rotation." },
+    { "name": "capture_standard_views", "description": "Export front, back, top, bottom, and isometric PNG views of the active model." },
     { "name": "fix_component", "description": "Fix a component in place." },
     { "name": "float_component", "description": "Float a fixed component." },
     { "name": "delete_component", "description": "Remove a component from the assembly." },

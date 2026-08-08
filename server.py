@@ -878,6 +878,156 @@ async def list_components() -> dict:
 
 
 @mcp.tool()
+async def get_component_transform(name: str, unit: Optional[str] = None) -> dict:
+    """Read an assembly component's exact position and orientation.
+
+    Returns translation in ``unit`` (mm by default), the 3x3 rotation matrix,
+    and whether the component is fixed. Use this before changing an assembly
+    pose so a placement can be checked or restored deterministically.
+    """
+
+    def _impl():
+        assy = _active_assembly()
+        component = _find_component(assy, name)
+        if component is None:
+            raise RuntimeError(f"Component '{name}' not found in the assembly.")
+        transform = component.Transform2
+        data = transform.ArrayData
+        if callable(data):
+            data = data()
+        values = list(data or ())
+        if len(values) < 12:
+            raise RuntimeError(f"Component '{name}' returned an invalid transform.")
+        active_unit = (unit or _default_unit).lower()
+        if active_unit not in UNIT_TO_METERS:
+            raise ValueError(f"Unknown unit '{unit}'. Use one of: {', '.join(UNIT_TO_METERS)}")
+        factor = 1.0 / UNIT_TO_METERS[active_unit]
+        return {
+            "name": name,
+            "translation": {
+                "x": values[9] * factor,
+                "y": values[10] * factor,
+                "z": values[11] * factor,
+                "unit": active_unit,
+            },
+            "rotation_matrix": [values[0:3], values[3:6], values[6:9]],
+            "fixed": bool(component.IsFixed),
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def set_component_transform(
+    name: str,
+    x: float = 0,
+    y: float = 0,
+    z: float = 0,
+    rotation_x: float = 0,
+    rotation_y: float = 0,
+    rotation_z: float = 0,
+    unit: Optional[str] = None,
+    fix_after: bool = False,
+) -> dict:
+    """Set a component's absolute assembly position and Euler rotation.
+
+    Translations use ``unit`` (mm by default); rotations are degrees. The
+    rotation is composed X then Y then Z, and is applied as an absolute pose,
+    not an incremental drag. Fixed components are floated automatically before
+    the transform is applied. Set ``fix_after`` to lock the verified pose.
+    """
+
+    def _impl():
+        assy = _active_assembly()
+        component = _find_component(assy, name)
+        if component is None:
+            raise RuntimeError(f"Component '{name}' not found in the assembly.")
+
+        was_fixed = bool(component.IsFixed)
+        if was_fixed:
+            _select_component(assy, name)
+            assy.UnfixComponent()
+
+        rx, ry, rz = (math.radians(value) for value in (rotation_x, rotation_y, rotation_z))
+        cx, sx = math.cos(rx), math.sin(rx)
+        cy, sy = math.cos(ry), math.sin(ry)
+        cz, sz = math.cos(rz), math.sin(rz)
+        # Rz * Ry * Rx: the convention documented by this tool.
+        rotation = (
+            cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx,
+            sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx,
+            -sy, cy * sx, cy * cx,
+        )
+        transform_data = rotation + (
+            to_meters(x, unit), to_meters(y, unit), to_meters(z, unit),
+            1.0, 0.0, 0.0, 0.0,
+        )
+        transform_variant = win32com.client.VARIANT(
+            pythoncom.VT_ARRAY | pythoncom.VT_R8, transform_data,
+        )
+        # The installed dynamic SolidWorks 2025 proxy does not expose
+        # IMathUtility.CreateTransform.  Every component already owns a valid
+        # IMathTransform, however, and ArrayData is the documented mutable
+        # representation of the 4x4 pose matrix.
+        transform = component.Transform2
+        transform.ArrayData = transform_variant
+        component.Transform2 = transform
+        rebuild = assy.EditRebuild3
+        if callable(rebuild):
+            rebuild()
+
+        if fix_after:
+            _select_component(assy, name)
+            assy.FixComponent()
+
+        return {
+            "name": name,
+            "translation": {"x": x, "y": y, "z": z, "unit": unit or _default_unit},
+            "rotation_degrees": {"x": rotation_x, "y": rotation_y, "z": rotation_z},
+            "fixed": bool(fix_after),
+            "previously_fixed": was_fixed,
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def capture_standard_views(output_dir: str = "tests/output", prefix: str = "model") -> dict:
+    """Export front, back, top, bottom, and isometric PNG views of the active model.
+
+    Use this immediately after positioning components. The tool restores the
+    isometric camera after exporting, returns every image path, and fails if a
+    requested image is not written by SolidWorks.
+    """
+
+    def _impl():
+        if not prefix or any(char in prefix for char in '\\/:*?"<>|'):
+            raise ValueError("prefix must be a non-empty filename stem without path characters.")
+        doc = _active_doc()
+        target_dir = os.path.abspath(output_dir)
+        os.makedirs(target_dir, exist_ok=True)
+        views = (
+            ("front", "*Front", 1), ("back", "*Back", 2),
+            ("top", "*Top", 5), ("bottom", "*Bottom", 6),
+            ("isometric", "*Isometric", 7),
+        )
+        paths = {}
+        for label, view_name, view_id in views:
+            path = os.path.join(target_dir, f"{prefix}_{label}.png")
+            doc.ShowNamedView2(view_name, view_id)
+            doc.ViewZoomtofit2()
+            doc.SaveAs3(path, 0, 0)
+            if not os.path.exists(path) or os.path.getsize(path) == 0:
+                raise RuntimeError(f"SolidWorks did not export the {label} view to '{path}'.")
+            paths[label] = path
+        doc.ShowNamedView2("*Isometric", 7)
+        doc.ViewZoomtofit2()
+        return {"views": paths, "restored_view": "isometric"}
+
+    return await _run(_impl)
+
+
+@mcp.tool()
 async def fix_component(name: str) -> dict:
     """Fix a component in place (removes its remaining degrees of freedom)."""
 
