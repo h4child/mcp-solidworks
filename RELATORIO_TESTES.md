@@ -70,6 +70,8 @@ ferramentas na versão 4.2.0, consistentes com `manifest.json`.
 | `add_cosmetic_thread` | Chamava as APIs de rosca no documento, usava valor incorreto para condição passante e não validava comprimento cego. | Uso de `IFeatureManager.InsertCosmeticThread3`, `swEndConditionThrough` (2) e validação de comprimento positivo. | Criou `Representação de rosca1` (`CosmeticThread`) passante em cilindro temporário de 10 mm. |
 | `create_knurl` | Gerava mais de 80 contornos abertos, inválidos para Wrap/Engrave, e invertia as marcas de seleção de face e esboço. | Perfil leve de três células fechadas, `Wrap/Engrave` analítico e marcas obrigatórias: face 1, esboço 4. | Criou `Envolver1` (`Emboss`, recurso de Wrap) em cilindros temporários para os padrões `diamond` e `straight`. |
 | `add_rib` | Enviava sete argumentos com semântica incorreta e tratava o retorno vazio de `InsertRib` como falha. | Assinatura 2025 de dez argumentos, espessura bilateral centrada, direção normal/paralela correta e confirmação pela árvore de recursos. | Em `block20.sldprt`, criou e validou `Nervura1` (`Rib`) com 2,54 mm no ambiente oficial de casca/plano/esboço. |
+| `mirror_feature` | Nenhum defeito adicional no ciclo atual. | Validação em peça isolada com ressalto lateral e plano direito. | Criou `Espelhar1` (`MirrorPattern`) a partir de `Ressalto-extrusão2`. |
+| `mirror_body` | Enviava `BMirrorBody=False` para `InsertMirrorFeature2`, pedindo espelhamento de recurso mesmo com um corpo sólido selecionado. | Uso de `BMirrorBody=True` e manutenção das marcas de seleção de plano/corpo da API. | Criou `Espelhar1` (`MirrorSolid`) e confirmou dois corpos sólidos separados na peça temporária. |
 
 ## Execução de integração real
 

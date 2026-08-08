@@ -3543,7 +3543,7 @@ async def mirror_body(
             raise RuntimeError(f"Body '{body_name}' not found. Use list_features to see body names.")
 
         feat = doc.FeatureManager.InsertMirrorFeature2(
-            False,  # BScopeOptions
+            True,   # BMirrorBody: mirror selected solid bodies, not body features
             False,  # BGeometryPattern
             merge,  # BMerge
             False,  # BKnit
