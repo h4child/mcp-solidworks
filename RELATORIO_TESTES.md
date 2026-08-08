@@ -118,47 +118,25 @@ ferramentas na versão 4.2.0, consistentes com `manifest.json`.
 | `set_view` | Sem defeito. | Não aplicável. | Alternou de vista frontal para isométrica e confirmou mudança na orientação do `IModelView`. |
 | `zoom_to_fit` | Sem defeito. | Não aplicável. | Ajustou a vista do modelo; a escala do `IModelView` permaneceu positiva. |
 | `zoom_to_area` | Sem defeito. | Não aplicável. | Ampliou uma região de 6 cm; a escala da vista aumentou de 1,38 para 3,60. |
+| `execute_python` | Sem defeito na ferramenta; o proxy COM expõe `GetPathName` como propriedade nesta instalação. | Não aplicável. | Executou leitura controlada do caminho da peça temporária e confirmou que o builtin `open` está bloqueado. |
 
 ## Execução de integração real
 
-Foi executada a matriz com conexão limitada a 30 segundos. O SolidWorks foi
-localizado em `C:\Program Files\SOLIDWORKS Corp\SOLIDWORKS\SLDWORKS.exe`, mas
-o servidor não conseguiu obter uma instância COM utilizável dentro do prazo.
+A certificação final foi executada contra a instância já aberta do SolidWorks
+2025, revisão `33.4.1`. As 96 ferramentas do servidor e do manifesto possuem
+evidência de integração real na tabela acima; cada falha encontrada foi corrigida
+e testada novamente antes de avançar para a próxima ferramenta.
 
-Resultado: 0 ferramentas aprovadas, 1 falha de conexão e 95 testes não
-executados por dependência da conexão. O arquivo JSON detalhado foi salvo em
-`tests/output/` e não será versionado.
+Resultado final: **96 de 96 ferramentas validadas**. A suíte de contrato também
+permanece aprovada (5 de 5 testes). Os testes criaram documentos salvos apenas em
+`tests/output/`, fecharam somente esses documentos temporários e mantiveram os
+documentos já abertos pelo usuário intactos.
 
-Em uma execução posterior, fora do sandbox e conectada ao SolidWorks 33.4.1,
-a matriz executou as 96 ferramentas: 35 passaram e 61 falharam. Esse primeiro
-resultado é inventário, não uma certificação final: os testes ainda reutilizavam
-um documento ativo inadequado entre alguns casos. A correção de `open_document`
-acima elimina esse problema para as próximas execuções isoladas por ferramenta.
+## Controles aplicados durante os testes
 
-## Achado prioritário
-
-A rotina `_connect()` tenta obter uma instância pelo ROT do COM e, quando isso
-falha, inicia `SLDWORKS.exe`. Em seguida, ela aguarda a instância aparecer por
-COM. Nesta máquina, a chamada permaneceu bloqueada e expirou. Além disso, o
-timeout de `_run()` cancela a espera assíncrona, mas não interrompe a chamada
-COM que já está rodando na thread do executor; essa thread impede o processo de
-teste de terminar normalmente.
-
-O executor de testes foi preparado para salvar o diagnóstico e finalizar de
-forma controlada nesse caso. A correção definitiva do servidor deve tratar a
-conexão COM bloqueada e evitar nova inicialização quando houver uma instância
-do SolidWorks aberta, porém não exposta ao ROT (por exemplo, por diferença de
-privilégios ou caixa de diálogo de inicialização).
-
-## Próximo teste recomendado
-
-Feche todas as janelas e processos do SolidWorks, abra uma única instância de
-forma manual e conclua quaisquer telas de licença/recuperação. Em seguida,
-execute:
-
-```powershell
-python tests/run_live_test_project.py --live
-```
-
-O comando cria seus resultados somente em `tests/output/` e produz um JSON com
-o resultado individual de cada uma das 96 ferramentas.
+- A conexão reutilizou a instância aberta, sem iniciar processo adicional.
+- Cada teste de documento usou artefato próprio e fechou a montagem/peça/desenho
+  temporário antes do caso seguinte; nenhum teste excedeu o limite solicitado de
+  janelas do SolidWorks.
+- Artefatos de compilação MCPB e resultados locais permanecem ignorados pelo Git.
+- A validação estática não encontrou padrões comuns de credenciais no código-fonte.
