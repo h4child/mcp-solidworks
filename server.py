@@ -4016,6 +4016,76 @@ def _get_selected_view(doc):
     return None
 
 
+_DRAWING_EDGE_IID = "{83A33D42-27C5-11CE-BFD4-00400513BB57}"
+
+
+def _select_drawing_edge_near(doc, x_m: float, y_m: float, tolerance_m: float = 0.002):
+    """Select the visible drawing edge closest to a sheet-space point.
+
+    ``SelectByID2`` does not reliably hit projected model edges in drawings.
+    This uses the documented IView entity enumeration and selection APIs while
+    preserving the public MCP contract of accepting sheet coordinates.
+    """
+    source_view = _get_selected_view(doc)
+    if source_view is None:
+        raise RuntimeError("No model view is available to select a drawing edge.")
+
+    empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+    try:
+        entities = source_view.GetVisibleEntities2(empty, 1) or ()  # swViewEntityType_Edge
+        xform = tuple(source_view.GetViewXform)
+        if len(xform) != 13:
+            raise RuntimeError("SolidWorks returned an invalid drawing-view transform.")
+    except Exception as exc:
+        raise RuntimeError("Could not enumerate visible edges in the selected drawing view.") from exc
+
+    def project(point):
+        x, y, z = point
+        # IView.GetViewXform: rotation [0:9], translation [9:12], and scale
+        # [12]. SolidWorks stores the rotation matrix by columns.
+        scale = xform[12]
+        return (
+            (xform[0] * x + xform[3] * y + xform[6] * z) * scale + xform[9],
+            (xform[1] * x + xform[4] * y + xform[7] * z) * scale + xform[10],
+        )
+
+    def distance_to_segment_sq(start, end):
+        sx, sy = start
+        ex, ey = end
+        dx, dy = ex - sx, ey - sy
+        length_sq = dx * dx + dy * dy
+        if length_sq == 0:
+            return (x_m - sx) ** 2 + (y_m - sy) ** 2
+        fraction = max(0.0, min(1.0, ((x_m - sx) * dx + (y_m - sy) * dy) / length_sq))
+        cx, cy = sx + fraction * dx, sy + fraction * dy
+        return (x_m - cx) ** 2 + (y_m - cy) ** 2
+
+    closest_edge = None
+    closest_distance_sq = float("inf")
+    for raw_entity in entities:
+        try:
+            edge = win32com.client.Dispatch(raw_entity, "IEdge", _DRAWING_EDGE_IID)
+            params = tuple(edge.GetCurveParams())
+            if len(params) < 6:
+                continue
+            distance_sq = distance_to_segment_sq(project(params[:3]), project(params[3:6]))
+            if distance_sq < closest_distance_sq:
+                closest_edge = raw_entity
+                closest_distance_sq = distance_sq
+        except Exception:
+            continue
+
+    if closest_edge is None or closest_distance_sq > tolerance_m ** 2:
+        raise RuntimeError(
+            f"No edge found near ({x_m:.6f}, {y_m:.6f}) m on the sheet."
+        )
+
+    doc.ClearSelection2(True)
+    if not source_view.SelectEntity(closest_edge, False):
+        raise RuntimeError("SolidWorks could not select the requested reference edge.")
+    return source_view
+
+
 @mcp.tool()
 async def insert_section_view(
     x1: float, y1: float, x2: float, y2: float,
@@ -4285,70 +4355,7 @@ async def insert_auxiliary_view(
         ex_m, ey_m = to_meters(edge_x, unit), to_meters(edge_y, unit)
         px_m, py_m = to_meters(place_x, unit), to_meters(place_y, unit)
 
-        source_view = _get_selected_view(doc)
-        if source_view is None:
-            raise RuntimeError("No model view is available to create an auxiliary view.")
-
-        # In drawings, SelectByID2 does not reliably hit projected model edges
-        # from sheet coordinates. Resolve the nearest visible IEdge instead,
-        # using IView.GetViewXform to project the model endpoints to the sheet,
-        # then select it through IView.SelectEntity (the documented API).
-        edge_iid = "{83A33D42-27C5-11CE-BFD4-00400513BB57}"
-        empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
-        try:
-            entities = source_view.GetVisibleEntities2(empty, 1) or ()  # swViewEntityType_Edge
-            xform = tuple(source_view.GetViewXform)
-            if len(xform) != 13:
-                raise RuntimeError("SolidWorks returned an invalid drawing-view transform.")
-        except Exception as exc:
-            raise RuntimeError("Could not enumerate visible edges in the selected drawing view.") from exc
-
-        def _project(point):
-            x, y, z = point
-            # IView.GetViewXform: 3x3 rotation [0:9], translation [9:12],
-            # and scale [12]. SolidWorks stores the matrix by columns.
-            scale = xform[12]
-            return (
-                (xform[0] * x + xform[3] * y + xform[6] * z) * scale + xform[9],
-                (xform[1] * x + xform[4] * y + xform[7] * z) * scale + xform[10],
-            )
-
-        def _distance_to_segment_sq(px, py, start, end):
-            sx, sy = start
-            ex, ey = end
-            dx, dy = ex - sx, ey - sy
-            length_sq = dx * dx + dy * dy
-            if length_sq == 0:
-                return (px - sx) ** 2 + (py - sy) ** 2
-            fraction = max(0.0, min(1.0, ((px - sx) * dx + (py - sy) * dy) / length_sq))
-            cx, cy = sx + fraction * dx, sy + fraction * dy
-            return (px - cx) ** 2 + (py - cy) ** 2
-
-        closest_edge = None
-        closest_distance_sq = float("inf")
-        for raw_entity in entities:
-            try:
-                edge = win32com.client.Dispatch(raw_entity, "IEdge", edge_iid)
-                params = tuple(edge.GetCurveParams())
-                if len(params) < 6:
-                    continue
-                distance_sq = _distance_to_segment_sq(
-                    ex_m, ey_m, _project(params[:3]), _project(params[3:6])
-                )
-                if distance_sq < closest_distance_sq:
-                    closest_edge = raw_entity
-                    closest_distance_sq = distance_sq
-            except Exception:
-                continue
-
-        # Permit a practical 2 mm click tolerance while preventing a request
-        # from silently selecting an unrelated edge on another part of a sheet.
-        if closest_edge is None or closest_distance_sq > to_meters(2, "mm") ** 2:
-            raise RuntimeError(f"No edge found near ({edge_x}, {edge_y}) on the sheet.")
-
-        doc.ClearSelection2(True)
-        if not source_view.SelectEntity(closest_edge, False):
-            raise RuntimeError("SolidWorks could not select the requested reference edge.")
+        _select_drawing_edge_near(doc, ex_m, ey_m)
 
         # CreateAuxiliaryViewAt2(X, Y, Z, NotAligned, Label, Showarrow, Flip) — 7 args.
         try:
@@ -4532,26 +4539,37 @@ async def add_weld_symbol(
 
     def _impl():
         doc = _active_drawing()
-        doc.ClearSelection2(True)
         x_m, y_m = to_meters(x, unit), to_meters(y, unit)
-        empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+        if size <= 0:
+            raise ValueError("size must be positive.")
 
-        if not doc.Extension.SelectByID2("", "EDGE", x_m, y_m, 0, False, 0, empty, 0):
-            log.warning("No edge at weld point; inserting symbol unattached")
+        # IDrawingDoc.InsertWeldSymbol is the API that creates an attached,
+        # configured drawing annotation. InsertWeldSymbol3 only creates a
+        # generic symbol object and cannot reliably attach it in this binding.
+        symbols = {
+            "fillet": "<WELD-FILL>",
+            "square": "<WELD-BUTT>",
+            "bevel": "<WELD-BUSB>",
+            "vee": "<WELD-BUSV>",
+            "plug": "<WELD-PLUG>",
+        }
+        symbol = symbols.get(weld_type.lower())
+        if symbol is None:
+            raise ValueError(f"Unsupported weld_type '{weld_type}'. Use: {', '.join(symbols)}.")
 
-        try:
-            sym = doc.InsertWeldSymbol3()
-        except Exception:
-            try:
-                sym = doc.InsertWeldSymbol()
-            except Exception:
-                sym = None
-
-        if sym is None:
-            raise RuntimeError(
-                "Weld symbol insertion failed. Some SolidWorks versions require the "
-                "symbol to be configured through a property manager dialog."
-            )
+        source_view = _select_drawing_edge_near(doc, x_m, y_m)
+        before = source_view.GetWeldSymbolCount
+        if callable(before):
+            before = before()
+        doc.InsertWeldSymbol(
+            f"{size:g}", symbol, "",
+            False, False, False, False, False, False, "",
+        )
+        after = source_view.GetWeldSymbolCount
+        if callable(after):
+            after = after()
+        if after <= before:
+            raise RuntimeError("SolidWorks did not create the requested weld symbol.")
 
         return {"weld_type": weld_type, "size": size, "placed_at": [x, y],
                 "unit": unit or _default_unit}
