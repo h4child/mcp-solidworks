@@ -106,6 +106,9 @@ ferramentas na versão 4.2.0, consistentes com `manifest.json`.
 | `close_document` | Sem defeito. | Não aplicável. | Fechou somente a peça temporária ativa e confirmou que ela não permaneceu na coleção de documentos abertos. |
 | `fix_component` | Sem defeito. | Não aplicável. | Em montagem temporária, fixou a segunda instância de componente e confirmou `IsFixed=true` pela API. |
 | `float_component` | Sem defeito. | Não aplicável. | Em outra montagem temporária, liberou a primeira instância fixa e confirmou `IsFixed=false` pela API. |
+| `create_sketch` | Sem defeito. | Não aplicável. | Criou um esboço no plano frontal localizado em SolidWorks PT-BR. |
+| `get_sketch_status` | Sem defeito. | Não aplicável. | Confirmou estado inativo antes/depois e estado ativo com nome de esboço durante a edição. |
+| `close_sketch` | Sem defeito. | Não aplicável. | Encerrou o esboço ativo e retornou confirmação de fechamento. |
 
 ## Execução de integração real
 
