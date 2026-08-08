@@ -64,6 +64,7 @@ ferramentas na versão 4.2.0, consistentes com `manifest.json`.
 | `create_helix` | Tratava o retorno `None` de `InsertHelix` como falha, embora a API 2025 declare o método como `void`. | Inventário dos recursos antes/depois da chamada e identificação do novo recurso do tipo `Helix`. | Criou `Hélice/Espiral1` (`Helix`) com círculo de 20 mm, passo de 2 mm e cinco revoluções. |
 | `add_thread_feature` | Chamava `InsertCosmeticThread3` no documento e passava texto onde a API exige o enum inteiro de padrão. | Uso de `IFeatureManager.InsertCosmeticThread3` com `swStandardType_StandardNone` e callout que preserva a designação solicitada. | Criou `Representação de rosca1` (`CosmeticThread`) M6 × 1,0 de 10 mm em cilindro temporário. |
 | `add_cosmetic_thread` | Chamava as APIs de rosca no documento, usava valor incorreto para condição passante e não validava comprimento cego. | Uso de `IFeatureManager.InsertCosmeticThread3`, `swEndConditionThrough` (2) e validação de comprimento positivo. | Criou `Representação de rosca1` (`CosmeticThread`) passante em cilindro temporário de 10 mm. |
+| `create_knurl` | Gerava mais de 80 contornos abertos, inválidos para Wrap/Engrave, e invertia as marcas de seleção de face e esboço. | Perfil leve de três células fechadas, `Wrap/Engrave` analítico e marcas obrigatórias: face 1, esboço 4. | Criou `Envolver1` (`Emboss`, recurso de Wrap) em cilindros temporários para os padrões `diamond` e `straight`. |
 
 ## Execução de integração real
 

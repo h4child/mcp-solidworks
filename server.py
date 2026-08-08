@@ -3149,6 +3149,9 @@ async def create_knurl(
         if pattern.lower() not in ("diamond", "straight"):
             raise ValueError(f"pattern must be 'diamond' or 'straight', got '{pattern}'.")
 
+        if not 5 <= angle <= 85:
+            raise ValueError(f"Angle must be between 5 and 85 degrees, got {angle}.")
+
         doc = _active_doc()
         doc.ClearSelection2(True)
         fx, fy, fz = to_meters(face_x, unit), to_meters(face_y, unit), to_meters(face_z, unit)
@@ -3161,68 +3164,91 @@ async def create_knurl(
         d_m = to_meters(depth, unit)
         angle_rad = math.radians(angle)
 
-        doc.InsertSketch2(True)
+        # Wrap requires a *closed* 2D profile (open sketch lines are rejected)
+        # and specific selection marks: target face=1, sketch=4.  Create a
+        # compact three-cell texture on the front plane, then engrave it onto
+        # the selected cylindrical face. This avoids the expensive, fragile
+        # 80-plus open-contour approximation previously used here.
+        doc.ClearSelection2(True)
+        front_plane = _standard_plane_name(doc, "front")
+        if not _select_by_id(doc, front_plane, "PLANE"):
+            raise RuntimeError("Could not select the front plane for the knurl profile.")
 
+        sketch_open = False
         try:
-            radius_m = 0.010
+            doc.InsertSketch2(True)
+            sketch_open = True
 
-            offset_dir1 = to_meters(1.0, "mm")
+            center_u = 2.5 * p_m
+            center_v = 2.5 * p_m
+            half_width = max(p_m * 0.22, to_meters(0.1, "mm"))
+            half_height = half_width / math.tan(angle_rad)
 
-            for i in range(-20, 21):
-                offset = i * p_m
-                doc.SketchManager.CreateLine(
-                    offset, -0.05, 0,
-                    offset + math.tan(angle_rad) * 0.1, 0.05, 0,
-                )
+            for index in (-1, 0, 1):
+                cell_u = center_u + index * p_m
                 if pattern.lower() == "diamond":
-                    doc.SketchManager.CreateLine(
-                        offset, -0.05, 0,
-                        offset - math.tan(angle_rad) * 0.1, 0.05, 0,
-                    )
+                    points = [
+                        (cell_u, center_v + half_height),
+                        (cell_u + half_width, center_v),
+                        (cell_u, center_v - half_height),
+                        (cell_u - half_width, center_v),
+                    ]
+                else:
+                    # A straight knurl uses three narrow, closed axial-groove
+                    # profiles. Closed profiles are required for Engrave.
+                    points = [
+                        (cell_u - half_width * 0.45, center_v + half_height),
+                        (cell_u + half_width * 0.45, center_v + half_height),
+                        (cell_u + half_width * 0.45, center_v - half_height),
+                        (cell_u - half_width * 0.45, center_v - half_height),
+                    ]
+                for start, end in zip(points, points[1:] + points[:1]):
+                    if doc.SketchManager.CreateLine(start[0], start[1], 0, end[0], end[1], 0) is None:
+                        raise RuntimeError("SolidWorks could not create a closed knurl profile cell.")
 
-            doc.SketchManager.InsertSketch(True)
-
-            doc.ClearSelection2(True)
-            sketch_name = _find_last_sketch(doc)
-            if sketch_name is None:
-                raise RuntimeError("Failed to create knurl sketch.")
-
-            if not _select_by_id(doc, sketch_name, "SKETCH"):
-                raise RuntimeError(f"Could not select sketch '{sketch_name}'.")
-
-            if not doc.Extension.SelectByID2("", "FACE", fx, fy, fz, True, 4, empty, 0):
-                raise RuntimeError("Could not re-select the cylindrical face.")
-
-            try:
-                feat = doc.FeatureManager.InsertWrapFeature2(
-                    0,          # WrapType: 0=Emboss, 1=Deboss, 2=Scribe
-                    d_m,        # Thickness
-                    False,      # ReverseDirection
-                    0,          # WrapMethod: 0=Analytical
-                    0,          # PullDir
-                )
-            except Exception:
+            doc.InsertSketch2(True)
+            sketch_open = False
+        except Exception:
+            if sketch_open:
                 try:
-                    feat = doc.FeatureManager.InsertWrapFeature(d_m, False, 1)
+                    doc.InsertSketch2(True)
                 except Exception:
-                    feat = None
+                    pass
+            raise
 
-            if feat is None:
-                raise RuntimeError(
-                    "Knurl (wrap+deboss) failed. This tool requires the face to be "
-                    "a simple cylinder and the SolidWorks 'Wrap' feature to be available. "
-                    "Consider using an appearance/texture map for cosmetic-only knurling."
-                )
+        sketch_name = _find_last_sketch(doc)
+        if sketch_name is None:
+            raise RuntimeError("SolidWorks did not create the knurl profile sketch.")
 
-            return {
-                "pattern": pattern,
-                "pitch": pitch,
-                "depth": depth,
-                "angle": angle,
-                "unit": unit or _default_unit,
-            }
-        except Exception as e:
-            raise RuntimeError(f"Knurl creation failed: {e}")
+        doc.ClearSelection2(True)
+        if not doc.Extension.SelectByID2(sketch_name, "SKETCH", 0, 0, 0, False, 4, empty, 0):
+            raise RuntimeError(f"Could not select knurl sketch '{sketch_name}'.")
+        if not doc.Extension.SelectByID2("", "FACE", fx, fy, fz, True, 1, empty, 0):
+            raise RuntimeError("Could not re-select the cylindrical face for the knurl.")
+
+        feat = doc.FeatureManager.InsertWrapFeature2(
+            1,          # swWrapSketchType_Engrave
+            d_m,
+            False,
+            0,          # swWrapMethods_Analytical
+            1,          # lowest valid mesh factor
+        )
+        doc.ClearSelection2(True)
+        if feat is None:
+            raise RuntimeError(
+                "Knurl engraving failed. Ensure the selected face is a simple cylindrical face "
+                "reachable from the front-plane profile."
+            )
+
+        feat_dispatch = win32com.client.Dispatch(feat)
+        return {
+            "feature": feat_dispatch.Name if hasattr(feat_dispatch, "Name") else "Wrap",
+            "pattern": pattern.lower(),
+            "pitch": pitch,
+            "depth": depth,
+            "angle": angle,
+            "unit": unit or _default_unit,
+        }
 
     return await _run(_impl)
 
