@@ -74,6 +74,9 @@ ferramentas na versão 4.2.0, consistentes com `manifest.json`.
 | `mirror_body` | Enviava `BMirrorBody=False` para `InsertMirrorFeature2`, pedindo espelhamento de recurso mesmo com um corpo sólido selecionado. | Uso de `BMirrorBody=True` e manutenção das marcas de seleção de plano/corpo da API. | Criou `Espelhar1` (`MirrorSolid`) e confirmou dois corpos sólidos separados na peça temporária. |
 | `move_copy_body` | Nenhum defeito adicional no ciclo atual. | Validação com cópia linear de um bloco isolado. | Criou `Corpo-Mover/Copiar1` (`MoveCopyBody`) a 40 mm e confirmou dois corpos sólidos. |
 | `combine_bodies` | Para `add`/`common`, passava um corpo principal onde a API exige nulo; também montava `ToolVar` com objetos COM brutos, produzindo incompatibilidade de tipos. | `MainBody` nulo explícito para `add`/`common` e `SAFEARRAY` de `IDispatch` dos corpos participantes. | Criou `Combinar1` a partir de dois blocos adjacentes e confirmou um único corpo sólido resultante. |
+| `create_reference_plane` | Nenhum defeito adicional no ciclo atual. | Validação de plano paralelo deslocado a partir do plano frontal. | Criou `Plano1` (`RefPlane`) com deslocamento de 25 mm. |
+| `create_reference_axis` | Nenhum defeito adicional no ciclo atual. | Validação de eixo por interseção de dois planos padrão. | Criou `Eixo1` (`RefAxis`) pela interseção de `front` e `top`. |
+| `split_body` | Tentava criar uma divisão cosmética de face e métodos inexistentes em vez do fluxo de divisão de sólidos. | Uso de `PreSplitBody2` para obter as regiões e `PostSplitBody2` com `SAFEARRAY` de corpos, origens e caminhos vazios. | Criou `Dividir1` (`Split`) e confirmou os dois corpos `Dividir1[1]` e `Dividir1[2]`. |
 
 ## Execução de integração real
 

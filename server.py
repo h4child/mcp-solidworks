@@ -3928,33 +3928,48 @@ async def split_body(
         else:
             raise ValueError(f"tool_type must be 'plane' or 'face', got '{tool_type}'.")
 
-        try:
-            feat = doc.FeatureManager.InsertSplitLineFeature(
-                0, 0.0, False, False, False, True,
-            )
-        except Exception:
-            feat = None
-
-        if feat is None:
-            try:
-                feat = doc.FeatureManager.InsertSplitBody(consume_original)
-            except Exception:
-                try:
-                    feat = doc.FeatureManager.SplitBodyByPlane()
-                except Exception:
-                    feat = None
-
-        if feat is None:
+        # The split workflow is two-stage: PreSplitBody2 resolves the regions
+        # produced by the selected cutter, and PostSplitBody2 creates the
+        # feature from those regions.  InsertSplitLineFeature only creates a
+        # cosmetic face split and cannot divide solid bodies.
+        candidate_bodies = doc.FeatureManager.PreSplitBody2
+        if callable(candidate_bodies):
+            candidate_bodies = candidate_bodies()
+        candidate_bodies = tuple(candidate_bodies or ())
+        if len(candidate_bodies) < 2:
             raise RuntimeError(
                 f"Split failed. tool_type='{tool_type}'. Ensure the cutter fully "
-                "intersects the body. For plane cuts, the plane must pass through the body."
+                "intersects the body and produces at least two solid regions."
             )
+
+        bodies_to_mark = win32com.client.VARIANT(
+            pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, candidate_bodies
+        )
+        origins = win32com.client.VARIANT(
+            pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH,
+            tuple(None for _ in candidate_bodies),
+        )
+        save_paths = win32com.client.VARIANT(
+            pythoncom.VT_ARRAY | pythoncom.VT_BSTR,
+            tuple("" for _ in candidate_bodies),
+        )
+        doc.ClearSelection2(True)
+        feat = doc.FeatureManager.PostSplitBody2(
+            bodies_to_mark,
+            consume_original,
+            origins,
+            save_paths,
+            "",
+        )
+        if feat is None:
+            raise RuntimeError("SolidWorks did not create the split-body feature.")
 
         feat_dispatch = win32com.client.Dispatch(feat)
         return {
             "feature": feat_dispatch.Name if hasattr(feat_dispatch, "Name") else "Split",
             "tool_type": tool_type,
             "consume_original": consume_original,
+            "bodies_created": len(candidate_bodies),
         }
 
     return await _run(_impl)
