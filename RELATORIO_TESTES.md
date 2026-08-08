@@ -99,6 +99,11 @@ ferramentas na versão 4.2.0, consistentes com `manifest.json`.
 | `set_appearance` | Listas Python eram convertidas em `SAFEARRAY(VARIANT)` e corrompiam silenciosamente os canais RGB; o setter da extensão também recebia esse tipo incorreto. | Conversão explícita dos nove valores de aparência para `SAFEARRAY(double)` e uso de `IModelDocExtension.SetMaterialPropertyValues`/`IFace2.SetMaterialPropertyValues2`. | Corpo confirmou RGB `(10,120,200)` e face confirmou `(200,20,30)` por leitura oficial da API. |
 | `connect_solidworks` | O proxy tipado expunha `RevisionNumber` como método, mas a ferramenta o serializava como objeto método. | Execução condicional quando o membro COM é chamável. | Conectou à instância aberta e retornou a revisão real `33.4.1`, sem iniciar outra instância. |
 | `get_solidworks_info` | Mesmo defeito de serialização de `RevisionNumber`. | Normalização idêntica entre propriedade e método COM. | Retornou `33.4.1` e visibilidade `true` da instância aberta. |
+| `create_new_part` | Sem defeito. | Não aplicável. | Criou uma peça a partir do template padrão, salvou-a em `tests/output` e a fechou isoladamente. |
+| `create_new_assembly` | Sem defeito. | Não aplicável. | Criou uma montagem a partir do template padrão, salvou-a em `tests/output` e a fechou isoladamente. |
+| `create_new_drawing` | Sem defeito. | Não aplicável. | Criou um desenho a partir do template padrão, confirmou o tipo `Drawing`, salvou-o e o fechou isoladamente. |
+| `get_document_info` | Sem defeito. | Não aplicável. | Confirmou título, caminho absoluto e tipo `Part` de uma peça temporária salva. |
+| `close_document` | Sem defeito. | Não aplicável. | Fechou somente a peça temporária ativa e confirmou que ela não permaneceu na coleção de documentos abertos. |
 
 ## Execução de integração real
 
