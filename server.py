@@ -447,6 +447,15 @@ def _find_component_feature(assy, name: str):
     return None
 
 
+def _find_component(assy, name: str):
+    """Return the IComponent2 instance matching an assembly component name."""
+    for raw_component in assy.GetComponents(True) or ():
+        component = win32com.client.Dispatch(raw_component)
+        if component.Name2 == name:
+            return component
+    return None
+
+
 def _select_component(assy, name: str):
     assy.ClearSelection2(True)
     feat = _find_component_feature(assy, name)
@@ -762,7 +771,7 @@ async def list_components() -> dict:
     def _impl():
         assy = _active_assembly()
         components = []
-        for raw in assy.GetComponents(True):
+        for raw in assy.GetComponents(True) or ():
             comp = win32com.client.Dispatch(raw)
             components.append({
                 "name": comp.Name2,
@@ -821,8 +830,13 @@ async def suppress_component(name: str) -> dict:
 
     def _impl():
         assy = _active_assembly()
-        _select_component(assy, name)
-        assy.EditSuppress2()
+        component = _find_component(assy, name)
+        if component is None:
+            raise RuntimeError(f"Component '{name}' not found in the assembly.")
+        status = component.SetSuppression2(0)  # swComponentSuppressed
+        # SetSuppression2 returns swSuppressionChangeOk (2) on success.
+        if status not in (2, None):
+            raise RuntimeError(f"Failed to suppress component '{name}' (status {status}).")
         return {"name": name, "suppressed": True}
 
     return await _run(_impl)
@@ -834,8 +848,13 @@ async def unsuppress_component(name: str) -> dict:
 
     def _impl():
         assy = _active_assembly()
-        _select_component(assy, name)
-        assy.EditUnsuppress2()
+        component = _find_component(assy, name)
+        if component is None:
+            raise RuntimeError(f"Component '{name}' not found in the assembly.")
+        status = component.SetSuppression2(2)  # swComponentResolved
+        # SetSuppression2 returns swSuppressionChangeOk (2) on success.
+        if status not in (2, None):
+            raise RuntimeError(f"Failed to unsuppress component '{name}' (status {status}).")
         return {"name": name, "suppressed": False}
 
     return await _run(_impl)

@@ -35,6 +35,8 @@ ferramentas na versão 4.2.0, consistentes com `manifest.json`.
 | `switch_configuration` | `ShowConfiguration2` retorna `None` pelo COM embora a troca seja executada. | Verificação do nome em `ConfigurationManager.ActiveConfiguration` após a chamada. | Criou, ativou e salvou `MCP_TEST_CFG` com sucesso. |
 | `save_document` / `export_document` | Falhas no inventário inicial por documento ativo incorreto. | Correção de ativação em `open_document` e teste com cópia isolada. | Salvou `configuration_validation.SLDPRT` e exportou `configuration_validation.step`. |
 | `measure_body` / `set_material` | Exigiam uma peça sólida ativa. | Ambiente isolado com bloco 100 × 50 × 10 mm. | Medição e atribuição de AISI 1020 aprovadas. |
+| `suppress_component` / `unsuppress_component` | As chamadas `EditSuppress2` e `EditUnsuppress2` não são métodos invocáveis no COM desta versão. | Busca direta de `IComponent2` e uso de `SetSuppression2`; o código de sucesso `swSuppressionChangeOk` (2) passou a ser aceito. | Suprimiu e restaurou `base_part-1` em assemblies novos e isolados, verificando `IsSuppressed` após cada chamada. |
+| `delete_component` / `list_components` | Após remover o único item, `GetComponents` devolve `None` e a listagem falhava ao iterar. | Normalização de coleção vazia para uma tupla vazia. | Excluiu `base_part-1` e confirmou `{"count": 0, "components": []}` no assembly temporário. |
 
 ## Execução de integração real
 
