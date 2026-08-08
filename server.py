@@ -325,6 +325,44 @@ def _select_by_id(doc, name: str, sel_type: str, x: float = 0, y: float = 0, z: 
     return bool(doc.Extension.SelectByID2(name, sel_type, x, y, z, False, 0, empty, 0))
 
 
+def _planar_face_at_point(doc, x: float, y: float, z: float, tolerance: float = 1e-5):
+    """Return the planar face at a model-space point, or raise a useful error.
+
+    SelectByID2 is unreliable for unnamed faces in weldments, especially where
+    several member faces meet. IFace2.GetClosestPointOn lets us resolve the
+    caller's point against the actual model geometry instead.
+    """
+    requested = (x, y, z)
+    closest = None
+    for raw_body in doc.GetBodies2(0, True) or ():
+        body = win32com.client.Dispatch(raw_body)
+        for raw_face in body.GetFaces() or ():
+            face = win32com.client.Dispatch(raw_face)
+            try:
+                surface = win32com.client.Dispatch(face.GetSurface)
+                is_planar = surface.IsPlane
+                if callable(is_planar):
+                    is_planar = is_planar()
+                if not is_planar:
+                    continue
+                nearest = tuple(face.GetClosestPointOn(*requested))
+                distance = math.sqrt(sum(
+                    (nearest[index] - requested[index]) ** 2 for index in range(3)
+                ))
+            except Exception:
+                continue
+            if closest is None or distance < closest[0]:
+                closest = (distance, face)
+
+    if closest is None or closest[0] > tolerance:
+        nearest_distance = None if closest is None else closest[0]
+        raise RuntimeError(
+            f"No planar face was found at ({x}, {y}, {z}); "
+            f"nearest planar face is {nearest_distance!r} m away."
+        )
+    return closest[1]
+
+
 def _standard_plane_name(doc, which: str) -> str:
     """Standard plane names are localized (e.g. 'Front Plane' vs 'Plano frontal'),
     so we resolve them positionally from the feature tree instead of hardcoding text.
@@ -2118,8 +2156,7 @@ async def add_gusset(
     x1/y1/z1: a point on the first face.
     x2/y2/z2: a point on the second face.
     thickness: plate thickness.
-    profile: 'triangular' (straight hypotenuse), 'catenary' (curved), or
-             'flat' (rectangular infill)."""
+    profile: 'triangular' (straight hypotenuse) or 'flat' (polygonal infill)."""
 
     def _impl():
         if thickness <= 0:
@@ -2127,46 +2164,54 @@ async def add_gusset(
         doc = _active_doc()
         t_m = to_meters(thickness, unit)
 
-        # swGussetProfileTriangle=1, swGussetProfilePolygon=0
-        profiles = {"triangular": 1, "flat": 0, "catenary": 1}
-        prof_is_triangle = profiles.get(profile.lower())
-        if prof_is_triangle is None:
-            raise ValueError(f"profile must be 'triangular', 'catenary', or 'flat', got '{profile}'.")
-
-        doc.ClearSelection2(True)
-        empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+        # InsertGussetFeature2's BIsProfile flag is True for a polygon and
+        # False for a triangle. The older implementation inverted this flag
+        # and passed None instead of the required array of supporting faces.
+        polygon_profiles = {"triangular": False, "flat": True}
+        is_polygon = polygon_profiles.get(profile.lower())
+        if is_polygon is None:
+            raise ValueError(f"profile must be 'triangular' or 'flat', got '{profile}'.")
 
         f1x, f1y, f1z = to_meters(x1, unit), to_meters(y1, unit), to_meters(z1, unit)
         f2x, f2y, f2z = to_meters(x2, unit), to_meters(y2, unit), to_meters(z2, unit)
 
-        if not doc.Extension.SelectByID2("", "FACE", f1x, f1y, f1z, False, 1, empty, 0):
-            raise RuntimeError(f"No face found at ({x1}, {y1}, {z1}).")
-
-        if not doc.Extension.SelectByID2("", "FACE", f2x, f2y, f2z, True, 1, empty, 0):
-            raise RuntimeError(f"No face found at ({x2}, {y2}, {z2}).")
+        face1 = _planar_face_at_point(doc, f1x, f1y, f1z)
+        face2 = _planar_face_at_point(doc, f2x, f2y, f2z)
+        if face1._oleobj_ == face2._oleobj_:
+            raise ValueError("The two gusset points resolve to the same face; select two supporting faces.")
+        supporting_faces = win32com.client.VARIANT(
+            pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH,
+            [face1._oleobj_, face2._oleobj_],
+        )
 
         # InsertGussetFeature2(Depth, DirType, LocType, BIsProfile, ProfileD1,
         #   ProfileD2, ProfileD3, ProfileAngle, ProfileD4, BOffset, DProfileOffset,
         #   CrvIndex, BReverseDir, BReverseFace, BUseLenDim, Faces) — 16 args.
         d1 = to_meters(50, unit)  # default gusset leg 1
         d2 = to_meters(50, unit)  # default gusset leg 2
+        # A polygonal gusset needs a third distance plus either an angle or a
+        # fourth distance. Use the documented d3 + 45 degree form; setting d3
+        # to zero produces no profile in SolidWorks.
+        d3 = to_meters(25, unit) if is_polygon else 0.0
+        d4 = 0.0
+        use_length_dimension = False
         feat = doc.FeatureManager.InsertGussetFeature2(
             t_m,               # Depth (thickness)
             1,                 # DirType (swGussetThicknessBothSides=1)
             1,                 # LocType (swGussetProfileLocationCenter=1)
-            prof_is_triangle,  # BIsProfile / triangle flag
+            is_polygon,        # BIsProfile (True = polygon, False = triangle)
             d1,                # ProfileD1
             d2,                # ProfileD2
-            0.0,               # ProfileD3
+            d3,                # ProfileD3 (required for polygon profiles)
             math.radians(45),  # ProfileAngle
-            0.0,               # ProfileD4
+            d4,                # ProfileD4 (used when BUseLenDim is True)
             False,             # BOffset
             0.0,               # DProfileOffset
             0,                 # CrvIndex
             False,             # BReverseDir
             False,             # BReverseFace
-            False,             # BUseLenDim
-            None,              # Faces (None = use selection)
+            use_length_dimension,  # BUseLenDim
+            supporting_faces,  # array of the two supporting faces
         )
 
         if feat is None:

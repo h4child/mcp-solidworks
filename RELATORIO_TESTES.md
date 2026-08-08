@@ -54,6 +54,7 @@ ferramentas na versão 4.2.0, consistentes com `manifest.json`.
 | `create_weldment_profile` | Não criava o recurso-base de soldagem, passava grupos vazios e usava a opção de segmentos `0`, inválida. | Criação de `WeldmentFeature`, grupos `IStructuralMemberGroup` preenchidos por SAFEARRAY de segmentos e `swConnectedSegments_SimpleCut` (1). | Criou `WeldMemberFeat` com perfil ISO `square tube` 40 × 40 × 4, em segmentos simples e em grupo de dois segmentos. |
 | `trim_extend_structural` | — | Dois membros estruturais de teste intersectados e corpos retornados pelo modelo. | Criou o recurso `Aparar/Estender1` para aparar um membro contra o outro. |
 | `add_end_cap` | Seleção por coordenada atingia paredes laterais de perfis ocos; a implementação chamava a API obsoleta `InsertEndCapFeature` e usava direção de espessura inválida. | Localização da face planar terminal mais próxima, seleção externa por raio e uso de `InsertEndCapFeature3` com `swExtendOutward`. | Criou `Tampa de extremidade1` (`EndCap`) de 2 mm em um perfil ISO `square tube` 20 × 20 × 2. |
+| `add_gusset` | `SelectByID2` não localizava faces anônimas de membros estruturais, o array obrigatório de faces era `None` e a semântica do perfil triangular estava invertida. | Resolução por `IFace2.GetClosestPointOn`, SAFEARRAY das duas faces de suporte e parâmetros completos para perfis triangular e poligonal. | Criou `Cantoneira1` (`Gusset`) de 5 mm tanto para o perfil triangular quanto para o perfil poligonal (`flat`). |
 
 ## Execução de integração real
 
