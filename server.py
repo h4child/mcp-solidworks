@@ -5539,11 +5539,16 @@ async def create_automotive_piston_assembly(
     }
 
     radius = bore_diameter / 2
-    pin_z = piston_height * 0.48
-    crank_z = pin_z - connecting_rod_length
+    # The rod is made on the front plane, which keeps its beam in the visible
+    # silhouette below the piston rather than hiding it along the skirt axis.
+    # The small end overlaps the lower center of the piston crown, and the big
+    # end hangs one connecting-rod length below it.
+    pin_center_y = -(radius * 0.45)
+    crank_center_y = pin_center_y - connecting_rod_length
     small_end_outer = wrist_pin_diameter / 2 + 5
     big_end_outer = crank_bore_diameter / 2 + 5
     beam_half_width = max(5.0, wrist_pin_diameter * 0.30)
+    front_offset = rod_width * 2.0
 
     async def _save_colored_part(path: str, rgb: tuple[int, int, int]) -> None:
         await set_appearance(*rgb, "body")
@@ -5567,28 +5572,28 @@ async def create_automotive_piston_assembly(
         await close_document(save=False)
         completed.append(stage)
 
-        # The rod is built on the Right plane (Y/Z): its small end shares the
-        # wrist-pin centerline and its big end is one rod length below it.
+        # The rod is built on the front plane: its small end joins the piston
+        # silhouette and its big end is one rod length below it.
         stage = "connecting-rod component"
         await create_new_part()
-        await create_sketch("right")
-        await draw_circle(0, pin_z, small_end_outer, unit)
+        await create_sketch("front")
+        await draw_circle(0, pin_center_y, small_end_outer, unit)
         await close_sketch()
         await extrude_sketch(rod_width, both_directions=True, unit=unit)
-        await create_sketch("right")
-        await draw_circle(0, crank_z, big_end_outer, unit)
+        await create_sketch("front")
+        await draw_circle(0, crank_center_y, big_end_outer, unit)
         await close_sketch()
         await extrude_sketch(rod_width, both_directions=True, unit=unit)
-        await create_sketch("right")
-        await draw_rectangle(-beam_half_width, crank_z, beam_half_width, pin_z, unit)
+        await create_sketch("front")
+        await draw_rectangle(-beam_half_width, crank_center_y, beam_half_width, pin_center_y, unit)
         await close_sketch()
         await extrude_sketch(rod_width, both_directions=True, unit=unit)
-        await create_sketch("right")
-        await draw_circle(0, pin_z, wrist_pin_diameter / 2 + 0.5, unit)
+        await create_sketch("front")
+        await draw_circle(0, pin_center_y, wrist_pin_diameter / 2 + 0.5, unit)
         await close_sketch()
         await cut_extrude(through_all=True, both_directions=True, unit=unit)
-        await create_sketch("right")
-        await draw_circle(0, crank_z, crank_bore_diameter / 2, unit)
+        await create_sketch("front")
+        await draw_circle(0, crank_center_y, crank_bore_diameter / 2, unit)
         await close_sketch()
         await cut_extrude(through_all=True, both_directions=True, unit=unit)
         await _save_colored_part(part_paths["connecting_rod"], (65, 90, 125))
@@ -5596,8 +5601,8 @@ async def create_automotive_piston_assembly(
 
         stage = "wrist-pin component"
         await create_new_part()
-        await create_sketch("right")
-        await draw_circle(0, pin_z, wrist_pin_diameter / 2, unit)
+        await create_sketch("front")
+        await draw_circle(0, pin_center_y, wrist_pin_diameter / 2, unit)
         await close_sketch()
         await extrude_sketch(bore_diameter + 6, both_directions=True, unit=unit)
         await _save_colored_part(part_paths["wrist_pin"], (165, 175, 190))
@@ -5605,9 +5610,9 @@ async def create_automotive_piston_assembly(
 
         stage = "big-end bearing component"
         await create_new_part()
-        await create_sketch("right")
-        await draw_circle(0, crank_z, crank_bore_diameter / 2 - 0.8, unit)
-        await draw_circle(0, crank_z, crank_bore_diameter / 2 - 3.3, unit)
+        await create_sketch("front")
+        await draw_circle(0, crank_center_y, crank_bore_diameter / 2 - 0.8, unit)
+        await draw_circle(0, crank_center_y, crank_bore_diameter / 2 - 3.3, unit)
         await close_sketch()
         await extrude_sketch(rod_width + 2, both_directions=True, unit=unit)
         await _save_colored_part(part_paths["bearing"], (185, 140, 55))
@@ -5618,9 +5623,9 @@ async def create_automotive_piston_assembly(
         # cap visually distinct instead of being hidden inside the rod body.
         stage = "rod-cap component"
         await create_new_part()
-        await create_sketch("right")
-        await draw_circle(0, crank_z, big_end_outer + 2.5, unit)
-        await draw_circle(0, crank_z, crank_bore_diameter / 2 - 0.3, unit)
+        await create_sketch("front")
+        await draw_circle(0, crank_center_y, big_end_outer + 2.5, unit)
+        await draw_circle(0, crank_center_y, crank_bore_diameter / 2 - 0.3, unit)
         await close_sketch()
         await extrude_sketch(4, both_directions=True, unit=unit)
         await _save_colored_part(part_paths["rod_cap"], (95, 100, 110))
@@ -5629,10 +5634,14 @@ async def create_automotive_piston_assembly(
         stage = "assembly insertion"
         assembly = await create_new_assembly()
         await insert_component(part_paths["piston"], unit=unit)
-        await insert_component(part_paths["connecting_rod"], unit=unit)
-        await insert_component(part_paths["wrist_pin"], unit=unit)
-        await insert_component(part_paths["bearing"], unit=unit)
-        await insert_component(part_paths["rod_cap"], x=rod_width + 4, unit=unit)
+        # The piston itself begins at the Front plane.  Shift the rod group a
+        # controlled positive distance toward the viewing side of that plane so its
+        # beam is visible below the skirt instead of being occluded by it.
+        # The long wrist pin still spans this offset and the piston body.
+        await insert_component(part_paths["connecting_rod"], z=front_offset, unit=unit)
+        await insert_component(part_paths["wrist_pin"], z=front_offset, unit=unit)
+        await insert_component(part_paths["bearing"], z=front_offset, unit=unit)
+        await insert_component(part_paths["rod_cap"], x=rod_width + 4, z=front_offset, unit=unit)
         completed.append(stage)
 
         stage = "assembly save and view"
@@ -5666,6 +5675,135 @@ async def create_automotive_piston_assembly(
             f"Completed stages: {', '.join(completed) or '(none)'}. "
             f"Components saved in '{output_dir}'. Active document: {active}. "
             f"Root cause: {exc}"
+        ) from exc
+
+
+@mcp.tool()
+async def create_automotive_piston_with_connecting_rod(
+    bore_diameter: float = 86,
+    piston_height: float = 75,
+    connecting_rod_length: float = 135,
+    wrist_pin_diameter: float = 22,
+    crank_bore_diameter: float = 42,
+    rod_width: float = 14,
+    unit: Optional[str] = None,
+    save_path: Optional[str] = None,
+) -> dict:
+    """Create a clear single-part automotive piston and connecting-rod model.
+
+    The tool produces the complete silhouette shown in engine reference
+    drawings: a cylindrical piston with three ring grooves, a small-end pad,
+    a straight connecting-rod beam, and a circular big-end pad.  It is a
+    *single-body conceptual/reference model* intended for visual design and
+    demonstrations; use ``create_automotive_piston_assembly`` when separately
+    editable piston, pin, bearing, cap, and rod component files are required.
+    """
+
+    if min(bore_diameter, piston_height, connecting_rod_length, wrist_pin_diameter, crank_bore_diameter, rod_width) <= 0:
+        raise ValueError("All dimensions must be positive.")
+    if wrist_pin_diameter >= bore_diameter or crank_bore_diameter >= bore_diameter:
+        raise ValueError("Pin and crank-bore diameters must be smaller than bore_diameter.")
+    if connecting_rod_length < piston_height:
+        raise ValueError("connecting_rod_length must be at least piston_height.")
+
+    completed: list[str] = []
+    stage = "initialization"
+    radius = bore_diameter / 2
+    small_end_outer = wrist_pin_diameter / 2 + 5
+    big_end_outer = crank_bore_diameter / 2 + 5
+    beam_half_width = max(5.0, wrist_pin_diameter * 0.30)
+    small_end_y = -(radius * 0.45)
+    big_end_y = small_end_y - connecting_rod_length
+    ring_offsets = (piston_height - 18, piston_height - 12, piston_height - 6)
+
+    try:
+        stage = "new part"
+        part = await create_new_part()
+        completed.append(stage)
+        if save_path:
+            stage = "initial save"
+            await save_document(save_path)
+            completed.append(stage)
+
+        stage = "piston crown and skirt"
+        await create_sketch("front")
+        await draw_circle(0, 0, radius, unit)
+        await close_sketch()
+        await extrude_sketch(piston_height, unit=unit)
+        completed.append(stage)
+
+        stage = "three ring grooves"
+        for offset in ring_offsets:
+            plane = await create_reference_plane("front", offset, unit=unit)
+            await create_sketch(plane["plane"])
+            await draw_circle(0, 0, radius + 1.5, unit)
+            await draw_circle(0, 0, radius - 1.5, unit)
+            await close_sketch()
+            await cut_extrude(3, unit=unit)
+        completed.append(stage)
+
+        # The rod lives on the front silhouette so it remains visible in the
+        # isometric model view.  Each boss intersects the next feature and
+        # SolidWorks merges them into one robust conceptual body.
+        stage = "connecting rod silhouette"
+        await create_sketch("front")
+        await draw_circle(0, small_end_y, small_end_outer, unit)
+        await close_sketch()
+        await extrude_sketch(rod_width, unit=unit)
+        await create_sketch("front")
+        await draw_circle(0, big_end_y, big_end_outer, unit)
+        await close_sketch()
+        await extrude_sketch(rod_width, unit=unit)
+        await create_sketch("front")
+        await draw_rectangle(-beam_half_width, big_end_y, beam_half_width, small_end_y, unit)
+        await close_sketch()
+        await extrude_sketch(rod_width, unit=unit)
+        completed.append(stage)
+
+        stage = "presentation cleanup"
+
+        def _hide_reference_geometry():
+            doc = _active_doc()
+            doc.ClearSelection2(True)
+            feature = doc.FirstFeature
+            selected = 0
+            while feature is not None:
+                if feature.GetTypeName2 == "RefPlane":
+                    feature.Select2(True, 0)
+                    selected += 1
+                feature = feature.GetNextFeature
+            if selected:
+                doc.BlankRefGeom()
+            doc.ClearSelection2(True)
+            return selected
+
+        await _run(_hide_reference_geometry)
+        await set_appearance(75, 90, 115, "body")
+        await set_view("isometric")
+        await zoom_to_fit()
+        completed.append(stage)
+
+        if save_path:
+            stage = "final save"
+            await save_document()
+            completed.append(stage)
+
+        return {
+            "document": part["title"],
+            "save_path": os.path.abspath(save_path) if save_path else None,
+            "model_type": "single-body conceptual piston and connecting rod",
+            "features": ["piston skirt", "three ring grooves", "small-end pad", "connecting-rod beam", "big-end pad"],
+            "completed_stages": completed,
+        }
+    except Exception as exc:
+        try:
+            active = await get_document_info()
+        except Exception:
+            active = {"title": "(no active document)", "type": "Unknown"}
+        raise RuntimeError(
+            f"Integrated piston-and-rod creation stopped during '{stage}'. "
+            f"Completed stages: {', '.join(completed) or '(none)'}. "
+            f"Active document: {active}. Root cause: {exc}"
         ) from exc
 
 

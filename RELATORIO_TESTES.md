@@ -136,15 +136,19 @@ documentos já abertos pelo usuário intactos.
 
 ## Current certified result
 
-The new `create_automotive_piston_assembly` tool was live-tested in SolidWorks
-2025 revision 33.4.1. It creates five editable components: piston, wrist pin,
-connecting rod, big-end plain bearing, and rod cap; then it saves and opens the
-final assembly `automotive_piston_connecting_rod_reference_001.SLDASM`.
+`create_automotive_piston_assembly` was live-tested in SolidWorks 2025 revision
+33.4.1 and creates five editable component files: piston, wrist pin, connecting
+rod, big-end plain bearing, and rod cap.
 
-The five components were resolved in the active assembly and the full model is
-left open in isometric view. This extends the certified MCP surface to **98
-tools**. Component documents are silently loaded only as assembly references;
-the assembly is the one active visible document.
+The new `create_automotive_piston_with_connecting_rod` tool was then live-tested
+as the reliable visual-reference workflow. It generated and left open
+`automotive_piston_with_rod_final_001.SLDPRT`, a clean one-body silhouette with
+the piston crown/skirt, three ring grooves, visible connecting-rod beam, small
+end pad, and big-end pad. The exported isometric view was visually inspected.
+
+This extends the certified MCP surface to **99 tools**. The integrated tool is
+explicitly documented as a conceptual one-body model; the assembly tool remains
+available when separately editable component files are required.
 
 ## Controles aplicados durante os testes
 
