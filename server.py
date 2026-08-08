@@ -2036,7 +2036,10 @@ async def create_weldment_profile(
         sketch_feature = None
         for raw_feature in doc.FeatureManager.GetFeatures(False) or ():
             candidate = win32com.client.Dispatch(raw_feature)
-            if candidate.Name == sketch_name and candidate.GetTypeName2 == "ProfileFeature":
+            feature_type = candidate.GetTypeName2
+            if callable(feature_type):
+                feature_type = feature_type()
+            if candidate.Name == sketch_name and feature_type in ("ProfileFeature", "3DProfileFeature"):
                 sketch_feature = candidate
                 break
         if sketch_feature is None:
