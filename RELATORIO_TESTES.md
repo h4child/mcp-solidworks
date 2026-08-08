@@ -72,6 +72,8 @@ ferramentas na versão 4.2.0, consistentes com `manifest.json`.
 | `add_rib` | Enviava sete argumentos com semântica incorreta e tratava o retorno vazio de `InsertRib` como falha. | Assinatura 2025 de dez argumentos, espessura bilateral centrada, direção normal/paralela correta e confirmação pela árvore de recursos. | Em `block20.sldprt`, criou e validou `Nervura1` (`Rib`) com 2,54 mm no ambiente oficial de casca/plano/esboço. |
 | `mirror_feature` | Nenhum defeito adicional no ciclo atual. | Validação em peça isolada com ressalto lateral e plano direito. | Criou `Espelhar1` (`MirrorPattern`) a partir de `Ressalto-extrusão2`. |
 | `mirror_body` | Enviava `BMirrorBody=False` para `InsertMirrorFeature2`, pedindo espelhamento de recurso mesmo com um corpo sólido selecionado. | Uso de `BMirrorBody=True` e manutenção das marcas de seleção de plano/corpo da API. | Criou `Espelhar1` (`MirrorSolid`) e confirmou dois corpos sólidos separados na peça temporária. |
+| `move_copy_body` | Nenhum defeito adicional no ciclo atual. | Validação com cópia linear de um bloco isolado. | Criou `Corpo-Mover/Copiar1` (`MoveCopyBody`) a 40 mm e confirmou dois corpos sólidos. |
+| `combine_bodies` | Para `add`/`common`, passava um corpo principal onde a API exige nulo; também montava `ToolVar` com objetos COM brutos, produzindo incompatibilidade de tipos. | `MainBody` nulo explícito para `add`/`common` e `SAFEARRAY` de `IDispatch` dos corpos participantes. | Criou `Combinar1` a partir de dois blocos adjacentes e confirmou um único corpo sólido resultante. |
 
 ## Execução de integração real
 

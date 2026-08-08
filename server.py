@@ -3646,9 +3646,9 @@ async def combine_bodies(
     """Combine two or more solid bodies with a boolean operation.
 
     operation: 'add' (union), 'subtract' (main minus tools), or 'common' (intersection).
-    main_body: main body name (required for 'subtract'; for 'add'/'common', the
-               first body in the list is treated as main).
-    tool_bodies: list of body names to combine with. If omitted for 'add'/'common',
+    main_body: target body name, required only for 'subtract'. For 'add' and
+               'common', an optional value is included in the bodies to combine.
+    tool_bodies: list of body names to combine. If omitted for 'add'/'common',
                  combines ALL bodies in the part."""
 
     def _impl():
@@ -3680,37 +3680,55 @@ async def combine_bodies(
             raise RuntimeError("No solid bodies found in the active document.")
         all_disp = [win32com.client.Dispatch(b) for b in all_bodies]
 
-        # Resolve main body object
-        if main_body:
+        if is_subtract:
             main_obj = _find_body(main_body)
             if main_obj is None:
                 raise RuntimeError(f"Main body '{main_body}' not found.")
+            if tool_bodies:
+                tools = []
+                for name in tool_bodies:
+                    body = _find_body(name)
+                    if body is None:
+                        raise RuntimeError(f"Tool body '{name}' not found.")
+                    tools.append(body)
+            else:
+                main_name = main_obj.Name if not callable(getattr(main_obj, "Name", None)) else main_obj.Name()
+                tools = [body for body in all_disp
+                         if (body.Name if not callable(getattr(body, "Name", None)) else body.Name()) != main_name]
         else:
-            main_obj = all_disp[0]
+            # The SolidWorks API requires MainBody = Nothing for add and
+            # intersect operations.  It receives every participating body in
+            # ToolVar; passing the first body as MainBody makes the API return
+            # no feature even when the bodies touch or overlap.
+            main_obj = None
+            requested_names = ([] if main_body is None else [main_body]) + list(tool_bodies or [])
+            if requested_names:
+                tools = []
+                for name in requested_names:
+                    body = _find_body(name)
+                    if body is None:
+                        raise RuntimeError(f"Body '{name}' not found.")
+                    if all(body.Name != existing.Name for existing in tools):
+                        tools.append(body)
+            else:
+                tools = all_disp
 
-        # Resolve tool body objects
-        if tool_bodies:
-            tools = []
-            for name in tool_bodies:
-                b = _find_body(name)
-                if b is None:
-                    raise RuntimeError(f"Tool body '{name}' not found.")
-                tools.append(b)
-        else:
-            main_name = main_obj.Name if not callable(getattr(main_obj, "Name", None)) else main_obj.Name()
-            tools = [b for b in all_disp
-                     if (b.Name if not callable(getattr(b, "Name", None)) else b.Name()) != main_name]
-
-        if not tools:
+        if len(tools) < (1 if is_subtract else 2):
             raise RuntimeError("Combine requires at least 2 bodies (1 main + 1 tool).")
 
         tool_variant = win32com.client.VARIANT(
             pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH,
-            [t._oleobj_ for t in tools],
+            tuple(tools),
         )
 
-        # InsertCombineFeature(OperationType, MainBody, ToolVar)
-        feat = doc.FeatureManager.InsertCombineFeature(op, main_obj, tool_variant)
+        # InsertCombineFeature(OperationType, MainBody, ToolVar).  For add and
+        # common, MainBody is an explicit null IDispatch (see API documentation).
+        # Passing ``None`` or raw ``_oleobj_`` instances causes a type mismatch
+        # in the dynamic pywin32 binding used by the active FeatureManager.
+        main_body_arg = main_obj if main_obj is not None else win32com.client.VARIANT(
+            pythoncom.VT_DISPATCH, None
+        )
+        feat = doc.FeatureManager.InsertCombineFeature(op, main_body_arg, tool_variant)
 
         if feat is None:
             raise RuntimeError(
