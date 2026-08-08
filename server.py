@@ -2809,12 +2809,20 @@ async def flatten_sheet_metal() -> dict:
                 is_suppressed = is_suppressed()
             if is_suppressed:
                 flat_pattern.Select2(False, 0)
-                doc.EditUnsuppress2()
+                # These zero-argument ModelDoc2 commands are exposed as
+                # already-invoked Boolean properties by late-bound pywin32.
+                # Adding parentheses tries to call that Boolean and raises
+                # TypeError after SolidWorks has already changed the state.
+                changed = doc.EditUnsuppress2
+                if not changed:
+                    raise RuntimeError("SolidWorks could not unsuppress the flat pattern.")
                 doc.ClearSelection2(True)
                 return {"state": "flattened", "action": "unsuppressed flat-pattern"}
             else:
                 flat_pattern.Select2(False, 0)
-                doc.EditSuppress2()
+                changed = doc.EditSuppress2
+                if not changed:
+                    raise RuntimeError("SolidWorks could not suppress the flat pattern.")
                 doc.ClearSelection2(True)
                 return {"state": "folded", "action": "suppressed flat-pattern (back to 3D)"}
 
