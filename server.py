@@ -571,14 +571,15 @@ async def insert_drawing_view(source_filepath: str, view_type: str = "front",
             raise ValueError(f"Scale must be positive, got {scale}.")
 
         view_names = {
-            "front": "*Front", "back": "*Back",
-            "left": "*Left", "right": "*Right",
-            "top": "*Top", "bottom": "*Bottom",
-            "isometric": "*Isometric", "trimetric": "*Trimetric",
-            "dimetric": "*Dimetric",
+            "front": ("*Front", "*Frontal"), "back": ("*Back", "*Posterior"),
+            "left": ("*Left", "*Esquerda"), "right": ("*Right", "*Direita"),
+            "top": ("*Top", "*Superior"), "bottom": ("*Bottom", "*Inferior"),
+            "isometric": ("*Isometric", "*Isométrica"),
+            "trimetric": ("*Trimetric", "*Trimétrica"),
+            "dimetric": ("*Dimetric", "*Dimétrica"),
         }
-        sw_view = view_names.get(view_type.lower())
-        if sw_view is None:
+        view_candidates = view_names.get(view_type.lower())
+        if view_candidates is None:
             raise ValueError(f"Unknown view_type '{view_type}'. Use: {', '.join(view_names)}")
 
         # CreateDrawViewFromModelView3 requires the referenced model to be LOADED
@@ -591,18 +592,22 @@ async def insert_drawing_view(source_filepath: str, view_type: str = "front",
         open_errs = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
         open_warns = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
         try:
-            app.OpenDoc6(source_filepath, src_type, 0, "", open_errs, open_warns)  # 0 = normal (loaded, usable)
+            source_doc = app.OpenDoc6(source_filepath, src_type, 0, "", open_errs, open_warns)
         except Exception as e:
             log.warning("Could not pre-load source model: %s", e)
+            source_doc = app.GetOpenDocumentByName(source_filepath)
+        available_views = tuple(getattr(source_doc, "GetModelViewNames", ()) or ())
+        sw_view = next((name for name in view_candidates if name in available_views), view_candidates[0])
         react_err = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
         app.ActivateDoc3(drawing_title, False, 0, react_err)
         doc = app.ActiveDoc
 
         x_m, y_m = to_meters(x, unit), to_meters(y, unit)
-        view = doc.CreateDrawViewFromModelView3(source_filepath, sw_view, x_m, y_m, 0)
+        model_name = os.path.basename(source_filepath)
+        view = doc.CreateDrawViewFromModelView3(model_name, sw_view, x_m, y_m, 0)
         if view is None:
             raise RuntimeError(
-                f"Failed to insert {view_type} view of '{source_filepath}'. "
+                f"Failed to insert {view_type} view of '{model_name}'. "
                 "Ensure the source document exists and contains geometry."
             )
         try:
@@ -631,7 +636,14 @@ async def open_document(filepath: str) -> dict:
         doc = app.OpenDoc6(filepath, doc_type, 0, "", errors, warnings)
         if doc is None:
             raise RuntimeError(f"Failed to open '{filepath}' (error code {errors.value}).")
-        return {"title": _doc_title(doc), "path": filepath}
+        title = _doc_title(doc)
+        activate_errors = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+        active_doc = app.ActivateDoc3(title, True, 0, activate_errors)
+        if active_doc is None:
+            raise RuntimeError(
+                f"Opened '{filepath}' but could not activate it (error code {activate_errors.value})."
+            )
+        return {"title": title, "path": filepath}
 
     return await _run(_impl)
 

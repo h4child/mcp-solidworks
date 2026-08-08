@@ -4,3 +4,9 @@ __pycache__/
 *.SLDASM
 *.SLDDRW
 ~$*
+tests/
+.git/
+debug.log
+RELATORIO_TESTES.md
+RELATORIO_REPOSITORIO.md
+*.mcpb

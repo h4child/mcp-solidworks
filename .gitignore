@@ -40,3 +40,6 @@ Desktop.ini
 .mcpb-cache/
 mcpb-build/
 mcpb-dist/
+
+# Locally generated integration-test artifacts
+tests/output/
