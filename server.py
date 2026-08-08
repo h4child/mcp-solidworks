@@ -1935,19 +1935,70 @@ async def create_weldment_profile(
         # Resolve <standard>/<type>.sldlfp; the size is a configuration inside it.
         profile_path = _get_weldment_profile_path(standard, profile_type)
 
-        # Select the whole path sketch, then insert the structural member.
-        doc.ClearSelection2(True)
-        empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
-        if not doc.Extension.SelectByID2(sketch_name, "SKETCH", 0, 0, 0, False, 0, empty, 0):
-            raise RuntimeError(f"Sketch '{sketch_name}' not found or could not be selected.")
+        # Structural members require both a weldment base feature and one or
+        # more IStructuralMemberGroup objects. Selecting the sketch itself (or
+        # passing None for Groups) does not populate those groups.
+        sketch_feature = None
+        for raw_feature in doc.FeatureManager.GetFeatures(False) or ():
+            candidate = win32com.client.Dispatch(raw_feature)
+            if candidate.Name == sketch_name and candidate.GetTypeName2 == "ProfileFeature":
+                sketch_feature = candidate
+                break
+        if sketch_feature is None:
+            raise RuntimeError(f"Sketch '{sketch_name}' not found.")
+
+        sketch = win32com.client.Dispatch(sketch_feature.GetSpecificFeature2)
+        segments = tuple(sketch.GetSketchSegments or ())
+        if not segments:
+            raise RuntimeError(f"Sketch '{sketch_name}' has no segments for a structural member.")
+
+        if not any(
+            win32com.client.Dispatch(raw_feature).GetTypeName2 == "WeldmentFeature"
+            for raw_feature in doc.FeatureManager.GetFeatures(False) or ()
+        ):
+            # InsertWeldmentFeature is exposed as a zero-argument COM property.
+            doc.FeatureManager.InsertWeldmentFeature
+
+        requested_groups = groups if groups is not None else [list(range(len(segments)))]
+        if not isinstance(requested_groups, list) or not requested_groups:
+            raise ValueError("groups must be a non-empty list of segment-index lists.")
+
+        member_groups = []
+        for group_indices in requested_groups:
+            if not isinstance(group_indices, list) or not group_indices:
+                raise ValueError("Each groups entry must be a non-empty list of segment indices.")
+            if any(
+                not isinstance(index, int) or index < 0 or index >= len(segments)
+                for index in group_indices
+            ):
+                raise ValueError(
+                    f"Segment indices must be between 0 and {len(segments) - 1}; got {group_indices}."
+                )
+            group = win32com.client.Dispatch(doc.FeatureManager.CreateStructuralMemberGroup)
+            group_segments = [win32com.client.Dispatch(segments[index]) for index in group_indices]
+            # Win32 COM must receive a SAFEARRAY(VT_DISPATCH); a Python tuple is
+            # accepted silently but creates an empty IStructuralMemberGroup.
+            group.Segments = win32com.client.VARIANT(
+                pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, group_segments
+            )
+            if group.GetSegmentsCount != len(group_segments):
+                raise RuntimeError(
+                    f"Could not assign sketch segments {group_indices} to a structural-member group."
+                )
+            member_groups.append(group)
+
+        groups_variant = win32com.client.VARIANT(
+            pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, member_groups
+        )
 
         # InsertStructuralWeldment5(Path, ConnectedSegmentsOption, AllowProtrusion,
-        #   Groups, ConfigurationName) — ConfigurationName carries the size.
+        #   Groups, ConfigurationName). 1 is swConnectedSegments_SimpleCut;
+        # 0 is not a valid connected-segment option and returns no feature.
         feat = doc.FeatureManager.InsertStructuralWeldment5(
             profile_path,
-            0,       # ConnectedSegmentsOption (0 = one group from all connected segments)
+            1,       # swConnectedSegments_SimpleCut
             False,   # AllowProtrusion
-            None,    # Groups (None = auto-group from the selected sketch)
+            groups_variant,
             size,    # ConfigurationName (the profile size)
         )
 

@@ -51,6 +51,7 @@ ferramentas na versão 4.2.0, consistentes com `manifest.json`.
 | `linear_pattern` | A chamada `FeatureLinearPattern4` tinha apenas 10 dos 20 argumentos e não marcava corretamente as direções/recursos selecionados. | Assinatura completa, marcas 1/2/4 exigidas pela API e eixos de referência reutilizáveis derivados dos planos-padrão localizados. | Criou `Padrão linear1` com 3 × 2 instâncias e os eixos `MCP Pattern Axis X/Y`. |
 | `circular_pattern` | Tratava o parâmetro `FlipDirection` como `EqualSpacing` e tentava usar um plano como eixo de rotação. | Assinatura corrigida e eixo `MCP Pattern Axis Z` criado/reutilizado como referência real. | Criou `PadrãoCircular1` de quatro instâncias a 360°. |
 | `hole_wizard` | Usava tipos de furo incorretos, uma chamada incompleta de `HoleWizard4` e criava o ponto de posição somente depois de inserir o recurso. | Tipos/standards/fasteners da API 2025, assinatura completa de 26 argumentos e ponto de esboço pré-selecionado na face antes da criação. | Criou recursos `HoleWzd` reais para furo simples, rebaixo, escareado, roscado cego e roscado passante ISO M6. |
+| `create_weldment_profile` | Não criava o recurso-base de soldagem, passava grupos vazios e usava a opção de segmentos `0`, inválida. | Criação de `WeldmentFeature`, grupos `IStructuralMemberGroup` preenchidos por SAFEARRAY de segmentos e `swConnectedSegments_SimpleCut` (1). | Criou `WeldMemberFeat` com perfil ISO `square tube` 40 × 40 × 4, em segmentos simples e em grupo de dois segmentos. |
 
 ## Execução de integração real
 
