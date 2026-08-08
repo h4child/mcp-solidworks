@@ -1,0 +1,42 @@
+# Python runtime artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+secrets.json
+
+# Logs and operating-system temporary files
+*.log
+~$*
+Thumbs.db
+Desktop.ini
+
+# SolidWorks native documents and recovery/backup files.
+# Keep public examples in a dedicated directory and explicitly unignore them if needed.
+*.SLDPRT
+*.SLDASM
+*.SLDDRW
+*.SLDBLK
+*.SLDLFP
+*.SLDPRT~
+*.SLDASM~
+*.SLDDRW~
+*.swar
+*.swb
+
+# MCPB packages and packaging work directories (Claude Desktop / Codex)
+*.mcpb
+.mcpb/
+.mcpb-cache/
+mcpb-build/
+mcpb-dist/
