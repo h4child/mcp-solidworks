@@ -3988,22 +3988,27 @@ def _active_drawing():
 
 def _get_selected_view(doc):
     """Return the currently active/selected drawing view, or the first view."""
+    def _noarg_member(obj, name):
+        value = getattr(obj, name)
+        if callable(value):
+            try:
+                return value()
+            except Exception:
+                # Dynamic COM dispatch can expose an already-evaluated object
+                # as callable; in that case invoking it raises "member not
+                # found", while the original value is the desired object.
+                return value
+        return value
+
     try:
-        view = doc.ActiveDrawingView
+        view = _noarg_member(doc, "ActiveDrawingView")
         if view is not None:
             return win32com.client.Dispatch(view)
     except Exception:
         pass
     try:
-        sheet = doc.GetCurrentSheet
-        if callable(sheet):
-            sheet = sheet()
-        views = doc.GetFirstView  # sheet is first "view"
-        if callable(views):
-            views = views()
-        view = win32com.client.Dispatch(views).GetNextView
-        if callable(view):
-            view = view()
+        views = _noarg_member(doc, "GetFirstView")  # sheet is first "view"
+        view = _noarg_member(win32com.client.Dispatch(views), "GetNextView")
         if view is not None:
             return win32com.client.Dispatch(view)
     except Exception:
@@ -4160,8 +4165,8 @@ async def insert_broken_view(
     Adds two break lines to the currently selected view and removes the region
     between them, so a very long beam or tank fits on the sheet at a larger scale.
 
-    break_position1/2: positions of the two break lines (sheet coordinate along
-                       the break axis).
+    break_position1/2: sheet coordinates of the two break lines along the
+                       break axis. They must fall within the selected view.
     orientation: 'vertical' (break lines are vertical, for horizontally-long parts)
                  or 'horizontal'.
     gap: visual gap left between the two pieces."""
@@ -4172,24 +4177,76 @@ async def insert_broken_view(
         if view is None:
             raise RuntimeError("No drawing view is selected. Select a view first.")
 
-        orient = 0 if orientation.lower() == "vertical" else 1  # 0=vertical break lines
-        p1_m = to_meters(break_position1, unit)
-        p2_m = to_meters(break_position2, unit)
+        orientation_key = orientation.lower()
+        if orientation_key not in {"vertical", "horizontal"}:
+            raise ValueError("orientation must be either 'vertical' or 'horizontal'.")
+
+        # swBreakLineOrientation_e: horizontal=1, vertical=2.  A break is
+        # created in two stages in the SolidWorks API: insert the break line
+        # in the IView, then apply it through IDrawingDoc.BreakView.
+        orient = 2 if orientation_key == "vertical" else 1
+        p1_sheet_m = to_meters(break_position1, unit)
+        p2_sheet_m = to_meters(break_position2, unit)
         gap_m = to_meters(gap, unit)
+        if gap_m <= 0:
+            raise ValueError("gap must be positive.")
 
         try:
-            brk = view.BreakView3(orient, 2, gap_m, p1_m, p2_m)  # style 2 = zigzag
-        except Exception:
-            try:
-                brk = view.BreakView2(orient, gap_m, p1_m, p2_m)
-            except Exception:
-                brk = None
+            # The drawing must operate on the selected model view.  Selecting
+            # it explicitly also makes this robust when the caller did not
+            # click a view before invoking the MCP tool.
+            view_name = view.Name
+            doc.ActivateView(view_name)
+            doc.ClearSelection2(True)
+            empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+            if not doc.Extension.SelectByID2(
+                view_name, "DRAWINGVIEW", 0, 0, 0, False, 0, empty, 0
+            ):
+                raise RuntimeError(f"Could not select drawing view '{view_name}'.")
 
-        if brk is None:
+            selected = doc.SelectionManager.GetSelectedObject6(1, -1)
+            if selected is not None:
+                view = win32com.client.Dispatch(selected)
+
+            # InsertBreak positions are relative to the drawing view origin,
+            # while the MCP contract accepts sheet coordinates.  Translate
+            # them and reject positions outside this exact view before the COM
+            # call, which otherwise only returns a null break line.
+            view_position = tuple(view.Position)
+            view_outline = tuple(view.GetOutline)
+            axis_origin = view_position[0] if orient == 2 else view_position[1]
+            axis_min = view_outline[0] if orient == 2 else view_outline[1]
+            axis_max = view_outline[2] if orient == 2 else view_outline[3]
+            if not (axis_min < p1_sheet_m < axis_max and axis_min < p2_sheet_m < axis_max):
+                raise ValueError(
+                    "Break positions must both lie inside the selected view "
+                    f"({axis_min:.6f} to {axis_max:.6f} m on the break axis)."
+                )
+            if p1_sheet_m == p2_sheet_m:
+                raise ValueError("break_position1 and break_position2 must differ.")
+            p1_m = p1_sheet_m - axis_origin
+            p2_m = p2_sheet_m - axis_origin
+
+            # IView.InsertBreak expects the two break-line positions and a
+            # style. BreakLineGap controls the visible separation afterwards.
+            brk = view.InsertBreak(orient, p1_m, p2_m, 2)  # 2 = ZigZag
+            if brk is None:
+                raise RuntimeError("SolidWorks did not create a break line.")
+            brk = win32com.client.Dispatch(brk)
+            if not brk.SetPosition(p1_m, p2_m):
+                raise RuntimeError("SolidWorks could not position the break lines.")
+            view.BreakLineGap = gap_m
+            doc.BreakView()
+            is_broken = view.IsBroken
+            if callable(is_broken):
+                is_broken = is_broken()
+            if not is_broken:
+                raise RuntimeError("SolidWorks did not apply the break to the drawing view.")
+        except Exception as exc:
             raise RuntimeError(
-                "Broken view failed. Ensure a single model view is selected and the "
-                "break positions lie within it."
-            )
+                "Broken view failed. Ensure the break positions lie inside the "
+                "selected model view."
+            ) from exc
 
         try:
             doc.EditRebuild3()

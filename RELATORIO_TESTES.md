@@ -77,6 +77,9 @@ ferramentas na versão 4.2.0, consistentes com `manifest.json`.
 | `create_reference_plane` | Nenhum defeito adicional no ciclo atual. | Validação de plano paralelo deslocado a partir do plano frontal. | Criou `Plano1` (`RefPlane`) com deslocamento de 25 mm. |
 | `create_reference_axis` | Nenhum defeito adicional no ciclo atual. | Validação de eixo por interseção de dois planos padrão. | Criou `Eixo1` (`RefAxis`) pela interseção de `front` e `top`. |
 | `split_body` | Tentava criar uma divisão cosmética de face e métodos inexistentes em vez do fluxo de divisão de sólidos. | Uso de `PreSplitBody2` para obter as regiões e `PostSplitBody2` com `SAFEARRAY` de corpos, origens e caminhos vazios. | Criou `Dividir1` (`Split`) e confirmou os dois corpos `Dividir1[1]` e `Dividir1[2]`. |
+| `insert_section_view` | Nenhum defeito adicional no ciclo atual. | Ambiente isolado com peça longa, vista frontal e linha de corte horizontal. | Inseriu `Vista de seção A-A` no desenho temporário e fechou os documentos de teste. |
+| `insert_detail_view` | Nenhum defeito adicional no ciclo atual. | Ambiente isolado com vista frontal e círculo de detalhe sobre a geometria. | Inseriu uma vista de detalhe em escala 2:1 no desenho temporário e fechou os documentos de teste. |
+| `insert_broken_view` | Chamava métodos inexistentes (`BreakView2`/`BreakView3`) no objeto da vista e usava enums/posições de folha diretamente onde a API requer posições relativas à origem da vista. | Fluxo documentado `IView.InsertBreak` + `IDrawingDoc.BreakView`, enums corretos, conversão de coordenadas da folha, validação dos limites e `BreakLineGap`. | Criou uma quebra vertical zig-zag real em `Vista de desenho1`; `IView.IsBroken` confirmou a vista interrompida. |
 
 ## Execução de integração real
 
