@@ -1508,8 +1508,8 @@ async def sweep_sketch(profile_sketch: str, path_sketch: str) -> dict:
 
         feat = doc.FeatureManager.InsertProtrusionSwept4(
             False, False, 0, False, False,
-            0, 0, False, 0, 0.0, 0.0, 0,
-            True, True, True, 0, True, True, 0.0, True, True,
+            0, 0, False, 0.0, 0.0, 0,
+            0, True, True, True, 0.0, True, False, 0.0, 0,
         )
         if feat is None:
             raise RuntimeError(
