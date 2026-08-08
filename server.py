@@ -2997,18 +2997,28 @@ async def add_thread_feature(
         except Exception:
             pass
 
+        # InsertCosmeticThread3 is exposed by IFeatureManager in SolidWorks
+        # 2025. Use swStandardType_StandardNone (-2), which creates a valid
+        # diameter-based cosmetic thread without relying on localized thread
+        # library table names; retain the requested designation as its note.
+        thread_note = (
+            f"{size} ({thread_type}, {'internal' if internal else 'external'}, "
+            f"{'RH' if right_hand else 'LH'})"
+        )
         feat = None
         try:
-            feat = doc.InsertCosmeticThread3("", "", size, minor_d, 0, length_m, size)
+            feat = doc.FeatureManager.InsertCosmeticThread3(
+                -2, "", "", minor_d, 0, length_m, thread_note
+            )
         except Exception as e:
-            log.warning("Real thread unavailable; cosmetic fallback failed: %s", e)
+            log.warning("Cosmetic thread creation failed: %s", e)
             feat = None
 
         if feat is None:
             raise RuntimeError(
-                "Real 3D threads are not available through the SolidWorks API. "
-                "Use add_cosmetic_thread for drawings, or model the thread manually "
-                "with create_helix + a swept cut."
+                "Cosmetic thread creation failed. Ensure the selected edge is a circular "
+                "edge of a cylindrical face. Real modeled Thread features are not exposed "
+                "by the SolidWorks API; use a helix and swept cut for true cut geometry."
             )
 
         feat_dispatch = win32com.client.Dispatch(feat)
@@ -3016,7 +3026,7 @@ async def add_thread_feature(
 
         return {
             "feature": feat_name,
-            "note": "Created as a COSMETIC thread — real cut geometry is not API-scriptable.",
+            "note": "Created as a cosmetic thread; real cut geometry requires a manual helix and swept cut.",
             "size": size,
             "length": length,
             "internal": internal,
@@ -3059,25 +3069,32 @@ async def add_cosmetic_thread(
         if not doc.Extension.SelectByID2("", "EDGE", ex, ey, ez, False, 0, empty, 0):
             raise RuntimeError(f"No circular edge found at ({edge_x}, {edge_y}, {edge_z}).")
 
+        if length is not None and length <= 0:
+            raise ValueError(f"Length must be positive when provided, got {length}.")
+
         md_m = to_meters(minor_diameter, unit)
-        end_cond = 1 if length is None else 0  # 1=ThroughAll, 0=Blind
+        end_cond = 2 if length is None else 0  # swEndConditionThrough=2, Blind=0
         length_m = to_meters(length, unit) if length is not None else 0.0
 
         # InsertCosmeticThread3(Standard, StandardType, Size, Diameter, EndType,
-        # Depth, Note) — an IModelDoc2 method (verified against the SW 2025 typelib).
+        # Depth, Note) belongs to IFeatureManager in SolidWorks 2025. Use
+        # swStandardType_StandardNone (-2) so a plain diameter-based cosmetic
+        # thread does not depend on a localized library-table entry.
         feat = None
         try:
-            feat = doc.InsertCosmeticThread3(
-                "", "", "",   # Standard, StandardType, Size (blank = plain diameter)
+            feat = doc.FeatureManager.InsertCosmeticThread3(
+                -2, "", "",   # StandardNone, StandardType, Size
                 md_m,         # Diameter
                 end_cond,     # EndType
                 length_m,     # Depth
-                "",           # Note
+                f"{standard} cosmetic thread",  # Note
             )
         except Exception as e:
             log.warning("InsertCosmeticThread3 failed: %s", e)
             try:
-                feat = doc.InsertCosmeticThread2(end_cond, md_m, length_m, "")
+                feat = doc.FeatureManager.InsertCosmeticThread2(
+                    0, md_m, length_m, f"{standard} cosmetic thread"
+                )
             except Exception as e2:
                 log.warning("InsertCosmeticThread2 failed: %s", e2)
                 feat = None
