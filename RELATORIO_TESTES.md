@@ -80,6 +80,7 @@ ferramentas na versão 4.2.0, consistentes com `manifest.json`.
 | `insert_section_view` | Nenhum defeito adicional no ciclo atual. | Ambiente isolado com peça longa, vista frontal e linha de corte horizontal. | Inseriu `Vista de seção A-A` no desenho temporário e fechou os documentos de teste. |
 | `insert_detail_view` | Nenhum defeito adicional no ciclo atual. | Ambiente isolado com vista frontal e círculo de detalhe sobre a geometria. | Inseriu uma vista de detalhe em escala 2:1 no desenho temporário e fechou os documentos de teste. |
 | `insert_broken_view` | Chamava métodos inexistentes (`BreakView2`/`BreakView3`) no objeto da vista e usava enums/posições de folha diretamente onde a API requer posições relativas à origem da vista. | Fluxo documentado `IView.InsertBreak` + `IDrawingDoc.BreakView`, enums corretos, conversão de coordenadas da folha, validação dos limites e `BreakLineGap`. | Criou uma quebra vertical zig-zag real em `Vista de desenho1`; `IView.IsBroken` confirmou a vista interrompida. |
+| `insert_auxiliary_view` | `SelectByID2` não conseguia selecionar arestas projetadas de uma vista de desenho a partir de coordenadas da folha. | Enumeração oficial de `IView.GetVisibleEntities2`, projeção dos extremos de `IEdge` com `GetViewXform`, escolha da aresta visível mais próxima e seleção por `IView.SelectEntity`. | Inseriu `Vista de desenho2` perpendicular a uma aresta inclinada da peça triangular temporária. |
 
 ## Execução de integração real
 

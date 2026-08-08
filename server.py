@@ -4285,10 +4285,70 @@ async def insert_auxiliary_view(
         ex_m, ey_m = to_meters(edge_x, unit), to_meters(edge_y, unit)
         px_m, py_m = to_meters(place_x, unit), to_meters(place_y, unit)
 
-        doc.ClearSelection2(True)
+        source_view = _get_selected_view(doc)
+        if source_view is None:
+            raise RuntimeError("No model view is available to create an auxiliary view.")
+
+        # In drawings, SelectByID2 does not reliably hit projected model edges
+        # from sheet coordinates. Resolve the nearest visible IEdge instead,
+        # using IView.GetViewXform to project the model endpoints to the sheet,
+        # then select it through IView.SelectEntity (the documented API).
+        edge_iid = "{83A33D42-27C5-11CE-BFD4-00400513BB57}"
         empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
-        if not doc.Extension.SelectByID2("", "EDGE", ex_m, ey_m, 0, False, 0, empty, 0):
-            raise RuntimeError(f"No edge found at ({edge_x}, {edge_y}) on the sheet.")
+        try:
+            entities = source_view.GetVisibleEntities2(empty, 1) or ()  # swViewEntityType_Edge
+            xform = tuple(source_view.GetViewXform)
+            if len(xform) != 13:
+                raise RuntimeError("SolidWorks returned an invalid drawing-view transform.")
+        except Exception as exc:
+            raise RuntimeError("Could not enumerate visible edges in the selected drawing view.") from exc
+
+        def _project(point):
+            x, y, z = point
+            # IView.GetViewXform: 3x3 rotation [0:9], translation [9:12],
+            # and scale [12]. SolidWorks stores the matrix by columns.
+            scale = xform[12]
+            return (
+                (xform[0] * x + xform[3] * y + xform[6] * z) * scale + xform[9],
+                (xform[1] * x + xform[4] * y + xform[7] * z) * scale + xform[10],
+            )
+
+        def _distance_to_segment_sq(px, py, start, end):
+            sx, sy = start
+            ex, ey = end
+            dx, dy = ex - sx, ey - sy
+            length_sq = dx * dx + dy * dy
+            if length_sq == 0:
+                return (px - sx) ** 2 + (py - sy) ** 2
+            fraction = max(0.0, min(1.0, ((px - sx) * dx + (py - sy) * dy) / length_sq))
+            cx, cy = sx + fraction * dx, sy + fraction * dy
+            return (px - cx) ** 2 + (py - cy) ** 2
+
+        closest_edge = None
+        closest_distance_sq = float("inf")
+        for raw_entity in entities:
+            try:
+                edge = win32com.client.Dispatch(raw_entity, "IEdge", edge_iid)
+                params = tuple(edge.GetCurveParams())
+                if len(params) < 6:
+                    continue
+                distance_sq = _distance_to_segment_sq(
+                    ex_m, ey_m, _project(params[:3]), _project(params[3:6])
+                )
+                if distance_sq < closest_distance_sq:
+                    closest_edge = raw_entity
+                    closest_distance_sq = distance_sq
+            except Exception:
+                continue
+
+        # Permit a practical 2 mm click tolerance while preventing a request
+        # from silently selecting an unrelated edge on another part of a sheet.
+        if closest_edge is None or closest_distance_sq > to_meters(2, "mm") ** 2:
+            raise RuntimeError(f"No edge found near ({edge_x}, {edge_y}) on the sheet.")
+
+        doc.ClearSelection2(True)
+        if not source_view.SelectEntity(closest_edge, False):
+            raise RuntimeError("SolidWorks could not select the requested reference edge.")
 
         # CreateAuxiliaryViewAt2(X, Y, Z, NotAligned, Label, Showarrow, Flip) — 7 args.
         try:
