@@ -826,7 +826,10 @@ async def list_open_documents() -> dict:
         app = _connect()
         type_names = {1: "Part", 2: "Assembly", 3: "Drawing"}
         docs = []
-        for doc in app.GetDocuments:
+        open_docs = app.GetDocuments
+        if callable(open_docs):
+            open_docs = open_docs()
+        for doc in open_docs or ():
             try:
                 docs.append({"title": _doc_title(doc), "type": type_names.get(_doc_type(doc), "Unknown")})
             except Exception:
@@ -4716,24 +4719,28 @@ async def add_balloon(
 
     def _impl():
         doc = _active_drawing()
-        doc.ClearSelection2(True)
         x_m, y_m = to_meters(x, unit), to_meters(y, unit)
-        empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
-        if not doc.Extension.SelectByID2("", "EDGE", x_m, y_m, 0, False, 0, empty, 0):
-            doc.Extension.SelectByID2("", "FACE", x_m, y_m, 0, False, 0, empty, 0)
+        _select_drawing_edge_near(doc, x_m, y_m)
 
-        # InsertBOMBalloon2(Style, Size, UpperTextStyle, UpperText, LowerTextStyle,
-        #   LowerText) — 6 args, on IModelDocExtension.
+        # In SolidWorks 2025, IModelDocExtension.InsertBOMBalloon2 takes one
+        # IBalloonOptions object (the old six-argument method belongs to IModelDoc2).
         note = None
         try:
-            note = doc.Extension.InsertBOMBalloon2(
-                1,      # Style: swBalloonStyle_Circular
-                6,      # Size: swBalloonFit_5Chars
-                1,      # UpperTextStyle: item number
-                "",     # UpperText
-                0,      # LowerTextStyle
-                "",     # LowerText
+            # The dynamic proxy omits CreateBalloonOptions; cast the extension
+            # to its published interface before accessing the 2025 API.
+            extension = win32com.client.Dispatch(
+                doc.Extension,
+                "IModelDocExtension",
+                "{99F4D4AF-F268-4EE1-8C55-041F7BECF879}",
             )
+            options = extension.CreateBalloonOptions()
+            options.Style = 1              # swBS_Circular
+            options.Size = 5               # swBF_5Chars
+            options.UpperTextContent = 1   # swBalloonTextItemNumber
+            options.UpperText = ""
+            options.LowerTextContent = 0   # swBalloonTextCustom
+            options.LowerText = ""
+            note = extension.InsertBOMBalloon2(options)
         except Exception as e:
             log.warning("InsertBOMBalloon2 failed: %s", e)
             note = None
@@ -4772,7 +4779,8 @@ async def insert_bom_table(
 
         x_m, y_m = to_meters(x, unit), to_meters(y, unit)
 
-        # Resolve a BOM template if none supplied (InsertBomTable4 needs a valid one).
+        # Resolve a BOM template if none supplied. The user preference may contain
+        # either a template file or semicolon-separated template directories.
         tmpl = template
         if not tmpl:
             try:
@@ -4781,25 +4789,55 @@ async def insert_bom_table(
                 loc = app.GetUserPreferenceStringValue(92)
                 if loc:
                     for base in loc.split(";"):
-                        cand = os.path.join(base, "bom-standard.sldbomtbt")
-                        if os.path.isfile(cand):
-                            tmpl = cand
+                        base = base.strip()
+                        candidates = (
+                            (base,) if base.lower().endswith(".sldbomtbt")
+                            else (os.path.join(base, "bom-standard.sldbomtbt"),)
+                        )
+                        for candidate in candidates:
+                            if os.path.isfile(candidate):
+                                tmpl = candidate
+                                break
+                        if tmpl:
                             break
             except Exception:
                 pass
 
-        # InsertBomTable4(TemplateName, X, Y, BomType, ConfigurationName, Hidden,
-        #   IndentedNumberingType, DetailedCutList, DissolvePartLevelRows).
+        if not tmpl:
+            executable = _find_solidworks_exe()
+            if executable:
+                install_dir = os.path.dirname(executable)
+                for language in ("portuguese-brazilian", "english"):
+                    candidate = os.path.join(install_dir, "lang", language, "bom-standard.sldbomtbt")
+                    if os.path.isfile(candidate):
+                        tmpl = candidate
+                        break
+
+        if not tmpl:
+            raise RuntimeError("Could not find a SolidWorks BOM table template (.sldbomtbt).")
+
+        configuration = view.ReferencedConfiguration
+        if callable(configuration):
+            configuration = configuration()
+        if not configuration:
+            raise RuntimeError("The selected drawing view does not reference an assembly configuration.")
+
+        # InsertBomTable6(UseAnchorPoint, X, Y, AnchorType, BomType,
+        #   Configuration, TableTemplate, Hidden, IndentedNumberingType,
+        #   DetailedCutList, DissolvePartLevelRows, DisplayAsOneItem).
         try:
-            bom = view.InsertBomTable4(
-                tmpl,       # TemplateName
+            bom = view.InsertBomTable6(
+                False,      # UseAnchorPoint
                 x_m, y_m,   # X, Y
+                1,          # AnchorType: top-left
                 2,          # BomType: swBomType_PartsOnly
-                "",         # ConfigurationName
+                configuration,
+                tmpl,
                 False,      # Hidden
                 1,          # IndentedNumberingType
                 False,      # DetailedCutList
                 False,      # DissolvePartLevelRows
+                False,      # DisplayAsOneItem
             )
         except Exception as e:
             log.warning("InsertBomTable4 failed: %s", e)
