@@ -5242,7 +5242,7 @@ async def add_advanced_mate(
     constraints needed to precisely position parts on platforms and tanks.
 
     mate_type: 'distance', 'angle', 'width', 'symmetric', 'lock', 'tangent',
-               'coincident', 'concentric', 'parallel', 'perpendicular'.
+               'coincident', 'concentric', 'parallel', or 'perpendicular'.
     x1/y1/z1: a point on the first face/edge.
     x2/y2/z2: a point on the second face/edge.
     value: distance (in current unit) for 'distance', or angle in degrees for 'angle'."""
@@ -5252,10 +5252,11 @@ async def add_advanced_mate(
 
         types = {
             "coincident": 0, "concentric": 1, "perpendicular": 2, "parallel": 3,
-            "tangent": 4, "distance": 5, "angle": 6, "symmetric": 9,
-            "width": 11, "lock": 13,
+            "tangent": 4, "distance": 5, "angle": 6, "symmetric": 8,
+            "width": 11, "lock": 16,
         }
-        code = types.get(mate_type.lower())
+        mate_key = mate_type.lower().strip()
+        code = types.get(mate_key)
         if code is None:
             raise ValueError(f"Unknown mate_type '{mate_type}'. Use: {', '.join(types)}")
 
@@ -5269,7 +5270,7 @@ async def add_advanced_mate(
         if not assy.Extension.SelectByID2("", "FACE", x2_m, y2_m, z2_m, True, 1, empty, 0):
             raise RuntimeError(f"No entity found at point 2 ({x2}, {y2}, {z2}).")
 
-        if mate_type.lower() == "angle":
+        if mate_key == "angle":
             mate_value = math.radians(value)
         else:
             mate_value = to_meters(value, unit)
@@ -5288,7 +5289,7 @@ async def add_advanced_mate(
                 "Confirm both entities support this mate type."
             )
 
-        return {"mate_type": mate_type, "value": value if code in (5, 6) else None,
+        return {"mate_type": mate_key, "value": value if code in (5, 6) else None,
                 "error_code": mate_err.value, "unit": unit or _default_unit}
 
     return await _run(_impl)
@@ -5840,6 +5841,101 @@ async def apply_metal_finish(
                 "ambient": ambient, "diffuse": diffuse,
                 "specular": specular, "shininess": shininess,
             },
+        }
+
+    return await _run(_impl)
+
+
+# ===========================================================================
+# Native P2M appearance tools
+# ===========================================================================
+
+@mcp.tool()
+async def list_p2m_appearances(scope: str = "this") -> dict:
+    """List native P2M/render appearances linked to the active display state.
+
+    scope: ``this`` for the current display state or ``all`` for every display
+    state in the active configuration.
+    """
+
+    def _impl():
+        options = {"this": 1, "all": 2}
+        option = options.get(scope.strip().lower())
+        if option is None:
+            raise ValueError("scope must be 'this' or 'all'.")
+        doc = _active_doc()
+        materials = doc.Extension.GetRenderMaterials2(option, None) or ()
+        appearances = []
+        for material in materials:
+            appearances.append({
+                "path": str(getattr(material, "FileName", "")),
+                "ambient": float(getattr(material, "Ambient", 0.0)),
+                "diffuse": float(getattr(material, "Diffuse", 0.0)),
+                "specular": float(getattr(material, "Specular", 0.0)),
+            })
+        return {"scope": scope.strip().lower(), "count": len(appearances), "appearances": appearances}
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def apply_p2m_appearance(
+    appearance_path: str,
+    scope: str = "this",
+    display_state: str = "",
+) -> dict:
+    """Apply a native SolidWorks ``.p2m`` appearance to the active model.
+
+    scope: ``this`` applies to the current display state, ``all`` to all
+    display states, and ``specific`` requires ``display_state``. The applied
+    render material is native SolidWorks data, unlike a bitmap texture.
+    """
+
+    def _impl():
+        abs_path = os.path.abspath(appearance_path)
+        if not os.path.isfile(abs_path) or os.path.splitext(abs_path)[1].lower() != ".p2m":
+            raise ValueError("appearance_path must be an existing .p2m appearance file.")
+        scope_key = scope.strip().lower()
+        options = {"this": 1, "all": 2, "specific": 3}
+        option = options.get(scope_key)
+        if option is None:
+            raise ValueError("scope must be 'this', 'all', or 'specific'.")
+        if scope_key == "specific" and not display_state.strip():
+            raise ValueError("display_state is required when scope is 'specific'.")
+
+        doc = _active_doc()
+        extension = doc.Extension
+        names = None
+        if scope_key == "specific":
+            cfg = doc.ConfigurationManager.ActiveConfiguration
+            available = getattr(cfg, "GetDisplayStates", ())
+            available = available() if callable(available) else available
+            if display_state.casefold() not in {str(item).casefold() for item in (available or ())}:
+                raise ValueError(f"Display state '{display_state}' does not exist in '{cfg.Name}'.")
+            names = win32com.client.VARIANT(
+                pythoncom.VT_ARRAY | pythoncom.VT_BSTR, [display_state],
+            )
+        material = extension.CreateRenderMaterial(abs_path)
+        if material is None:
+            raise RuntimeError("SolidWorks could not create the requested P2M render material.")
+        if not bool(material.AddEntity(doc)):
+            raise RuntimeError("SolidWorks could not attach the P2M appearance to the active model.")
+        material_id_1 = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+        material_id_2 = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+        if not bool(extension.AddDisplayStateSpecificRenderMaterial(
+            material, option, names, material_id_1, material_id_2,
+        )):
+            raise RuntimeError("SolidWorks rejected the P2M appearance for the requested display-state scope.")
+        _redraw_document(doc)
+        count = int(extension.GetRenderMaterialsCount2(option, names))
+        if count < 1:
+            raise RuntimeError("SolidWorks did not retain the applied P2M appearance.")
+        return {
+            "appearance_path": abs_path,
+            "scope": scope_key,
+            "display_state": display_state if scope_key == "specific" else None,
+            "material_ids": [int(material_id_1.value), int(material_id_2.value)],
+            "appearance_count": count,
         }
 
     return await _run(_impl)

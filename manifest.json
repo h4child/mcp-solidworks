@@ -2,7 +2,7 @@
   "manifest_version": "0.2",
   "name": "solidworks-mcp",
   "display_name": "SolidWorks MCP",
-  "version": "4.9.0",
+  "version": "5.0.0",
   "description": "Servidor MCP para automacao do SolidWorks via API COM, escrito com o SDK oficial (FastMCP)",
   "long_description": "Controla o SolidWorks (criar pecas/montagens, esbocos, extrusao, corte, filete, chanfro, etc.) via COM, exposto como ferramentas MCP.",
   "author": {
@@ -113,6 +113,8 @@
     { "name": "apply_texture", "description": "Apply a local image texture to the active model or a selected face." },
     { "name": "remove_texture", "description": "Remove a texture from the active model or a selected face." },
     { "name": "apply_metal_finish", "description": "Apply a native chrome, steel, cast-iron, or aluminum visual finish to a body or face." },
+    { "name": "list_p2m_appearances", "description": "List native P2M render appearances linked to the active display state." },
+    { "name": "apply_p2m_appearance", "description": "Apply a native P2M render appearance to the active model and display state." },
     { "name": "create_automotive_piston", "description": "Create a parametric automotive piston with ring grooves, hollow underside, and wrist-pin bore." },
     { "name": "create_automotive_piston_assembly", "description": "Create a complete piston, wrist-pin, connecting-rod, bearing, and rod-cap SolidWorks assembly." },
     { "name": "create_automotive_piston_with_connecting_rod", "description": "Create a clear single-body conceptual piston with ring grooves and an integrated visible connecting rod." },

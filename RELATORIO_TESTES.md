@@ -27,6 +27,18 @@ Data: 08 de agosto de 2026
   oficial sem argumentos. A ferramenta captura essa limitação e usa um fallback
   determinístico baseado em dependências: o ZIP de teste foi criado e verificado
   contendo a peça fonte, e o retorno informa explicitamente o backend usado.
+- Foram adicionadas `list_p2m_appearances` e `apply_p2m_appearance`: uma
+  aparência P2M nativa instalada pelo SolidWorks foi criada, ligada ao modelo,
+  aplicada ao display state atual, listada de volta pela API e salva na peça de
+  contrato. O teste não depende de uma imagem bitmap externa.
+- A auditoria de mates encontrou dois códigos incorretos em
+  `add_advanced_mate`: `symmetric` e `lock` apontavam para enumerações erradas;
+  foram corrigidos para os valores 8 e 16 da API 2025. A tentativa de ampliar a
+  ferramenta para gear/cam/screw foi interrompida: uma montagem isolada aceitou
+  as seleções de face, mas `AddMate5` não criou nem mesmo o mate concêntrico
+  básico e retornou o código COM indeterminado 0. Essas opções não foram
+  expostas como suportadas até haver uma montagem de referência que permita uma
+  validação reproduzível.
 
 ## Piston reference completion
 

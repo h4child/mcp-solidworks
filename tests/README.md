@@ -17,7 +17,7 @@ python -m unittest discover -s tests -p "test_*.py" -v
 python tests/run_live_test_project.py --dry-run
 ```
 
-Os testes estáticos verificam sintaxe, as 127 funções MCP, a equivalência entre
+Os testes estáticos verificam sintaxe, as 129 funções MCP, a equivalência entre
 `server.py` e `manifest.json`, documentação de versão, regras de `.gitignore`
 e padrões comuns de credenciais.
 
