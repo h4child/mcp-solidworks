@@ -37,7 +37,15 @@ def sample_value(parameter: str, project: Path) -> Any:
         "text": "MCP integration test",
         "code": "print('solidworks-mcp integration test')",
         "unit": "mm",
-        "mate_type": "coincident",
+    "mate_type": "coincident",
+    "first_ray_origin": [0, 0, 0],
+    "first_ray_direction": [0, 0, 1],
+    "second_ray_origin": [10, 0, 0],
+    "second_ray_direction": [0, 0, 1],
+    "rack_ray_origin": [0, 0, 0],
+    "rack_ray_direction": [0, 0, 1],
+    "pinion_ray_origin": [10, 0, 0],
+    "pinion_ray_direction": [0, 0, 1],
         "point1": {"x": 0, "y": 0, "z": 0, "unit": "mm"},
         "point2": {"x": 10, "y": 0, "z": 0, "unit": "mm"},
         "feature_name": "Boss-Extrude1",
@@ -66,6 +74,10 @@ def sample_value(parameter: str, project: Path) -> Any:
         return 50
     if parameter == "radius":
         return 10
+    if parameter == "ray_radius":
+        return 1
+    if parameter in {"revolution_value", "diameter_value"}:
+        return 1
     if parameter == "value":
         return 10
     raise KeyError(f"No sample value defined for required argument '{parameter}'.")
@@ -107,6 +119,7 @@ ASSEMBLY_TOOLS = {
     "insert_component", "list_components", "fix_component", "float_component", "delete_component",
     "suppress_component", "unsuppress_component", "add_mate", "list_mates", "create_exploded_view",
     "add_advanced_mate", "interference_check", "create_assembly_pattern",
+    "add_cam_follower_mate", "add_screw_mate", "add_rack_pinion_mate",
 }
 DOCUMENT_CREATION_TOOLS = {"create_new_part", "create_new_assembly", "create_new_drawing", "connect_solidworks"}
 

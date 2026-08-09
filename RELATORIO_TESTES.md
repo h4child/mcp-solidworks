@@ -59,6 +59,17 @@ Data: 08 de agosto de 2026
   do SolidWorks 2025, ela removeu `CamMateCoincident1` do exemplo oficial,
   recriou `MateCamCoincident`, reconstruiu o assembly e retornou zero erros e
   zero avisos em `validate_model`.
+- `add_screw_mate` foi implementada com `CreateMateData(swMateSCREW)` e
+  `CreateMate`, selecionando as duas entidades cilíndricas com marca 1. Em
+  `gearbox.sldasm`, o teste isolado removeu `Screw2`, criou `Parafuso1`
+  (`MateScrew`), reconstruiu e retornou 0 erros e 0 avisos.
+- `add_rack_pinion_mate` foi implementada com
+  `CreateMateData(swMateRACKPINION)` e `CreateMate`, selecionando a aresta da
+  cremalheira com marca 64 e a face cilíndrica do pinhão com marca 128. Em
+  `rack and pinion.sldasm`, o teste isolado removeu `RackPinionMate1`, recriou
+  `RackPinionMate1` (`MateRackPinionDim`), reconstruiu e retornou 0 erros e 0
+  avisos. Os dois samples foram fechados sem salvar e a instância isolada foi
+  encerrada ao final.
 
 ## Piston reference completion
 

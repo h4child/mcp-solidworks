@@ -5437,6 +5437,177 @@ async def add_cam_follower_mate(
 
 
 @mcp.tool()
+async def add_screw_mate(
+    first_ray_origin: list[float],
+    first_ray_direction: list[float],
+    second_ray_origin: list[float],
+    second_ray_direction: list[float],
+    ray_radius: float,
+    revolution_value: float,
+    revolution_type: str = "distance_per_revolution",
+    reverse: bool = False,
+    first_selection_type: int = 2,
+    second_selection_type: int = 1,
+    unit: Optional[str] = None,
+) -> dict:
+    """Create a screw mate from two cylindrical entities selected by rays.
+
+    Uses the documented ``ScrewMateFeatureData`` path instead of ``AddMate5``.
+    The two ray origins and ``ray_radius`` use ``unit``; directions are unitless.
+    ``revolution_type`` is ``distance_per_revolution`` or
+    ``revolutions_per_unit_length``. Distance values are converted by the MCP
+    to meters; revolutions-per-unit-length is a scalar.
+    """
+
+    def _impl():
+        assy = _active_assembly()
+        ray_data = (first_ray_origin, first_ray_direction, second_ray_origin, second_ray_direction)
+        if any(len(values) != 3 for values in ray_data):
+            raise ValueError("Each screw-mate ray origin and direction must contain three values.")
+        if ray_radius <= 0 or revolution_value <= 0:
+            raise ValueError("ray_radius and revolution_value must be positive.")
+        if any(math.isclose(sum(float(value) ** 2 for value in direction), 0.0)
+               for direction in (first_ray_direction, second_ray_direction)):
+            raise ValueError("Screw-mate ray directions cannot be zero.")
+        revolution_types = {"distance_per_revolution": 0, "revolutions_per_unit_length": 1}
+        revolution_key = revolution_type.strip().lower()
+        if revolution_key not in revolution_types:
+            raise ValueError("revolution_type must be distance_per_revolution or revolutions_per_unit_length.")
+
+        first_origin = [to_meters(value, unit) for value in first_ray_origin]
+        second_origin = [to_meters(value, unit) for value in second_ray_origin]
+        radius_m = to_meters(ray_radius, unit)
+        # Distance values are stored by the API in meters; revolutions/length is unitless.
+        value = to_meters(revolution_value, unit) if revolution_key == "distance_per_revolution" else float(revolution_value)
+        before = {
+            str(feature.Name)
+            for feature in (assy.FeatureManager.GetFeatures(False) or ())
+            if str(getattr(feature, "GetTypeName2", "")) == "MateScrew"
+        }
+        assy.ClearSelection2(True)
+        selected_first = assy.Extension.SelectByRay(
+            *first_origin, *[float(value) for value in first_ray_direction], radius_m,
+            int(first_selection_type), True, 1, 0,
+        )
+        selected_second = assy.Extension.SelectByRay(
+            *second_origin, *[float(value) for value in second_ray_direction], radius_m,
+            int(second_selection_type), True, 1, 0,
+        )
+        if not selected_first or not selected_second or int(assy.SelectionManager.GetSelectedObjectCount2(-1)) != 2:
+            assy.ClearSelection2(True)
+            raise RuntimeError("Screw-mate selection failed; both rays must hit cylindrical mate entities.")
+
+        mate_data = assy.CreateMateData(17)  # swMateSCREW
+        mate_data.RevolutionType = revolution_types[revolution_key]
+        mate_data.RevolutionVal = value
+        mate_data.Reverse = bool(reverse)
+        raw_feature = assy._oleobj_.InvokeTypes(195, 0, 1, (9, 0), ((9, 1),), mate_data)
+        feature = win32com.client.Dispatch(raw_feature) if raw_feature is not None else None
+        assy.ClearSelection2(True)
+        if feature is None:
+            raise RuntimeError("SolidWorks did not create the screw mate.")
+        rebuilt = bool(assy.ForceRebuild3(False))
+        after = [
+            item for item in (assy.FeatureManager.GetFeatures(False) or ())
+            if str(getattr(item, "GetTypeName2", "")) == "MateScrew" and str(item.Name) not in before
+        ]
+        if not after:
+            raise RuntimeError("Screw API returned a feature but no MateScrew feature was added to the tree.")
+        _redraw_document(assy)
+        return {
+            "feature": str(after[-1].Name), "feature_type": str(after[-1].GetTypeName2),
+            "revolution_type": revolution_key, "revolution_value": revolution_value,
+            "reverse": bool(reverse), "rebuilt": rebuilt, "selection_marks": [1, 1],
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def add_rack_pinion_mate(
+    rack_ray_origin: list[float],
+    rack_ray_direction: list[float],
+    pinion_ray_origin: list[float],
+    pinion_ray_direction: list[float],
+    ray_radius: float,
+    diameter_value: float,
+    diameter_type: str = "pinion_pitch_diameter",
+    reverse: bool = False,
+    rack_selection_type: int = 1,
+    pinion_selection_type: int = 2,
+    unit: Optional[str] = None,
+) -> dict:
+    """Create a rack-and-pinion mate from a rack edge and a pinion cylinder.
+
+    This uses ``RackPinionMateFeatureData`` with the API-required selection
+    marks 64 (rack) and 128 (pinion), then verifies ``MateRackPinionDim``.
+    ``diameter_type`` is ``pinion_pitch_diameter`` or
+    ``rack_travel_per_revolution``.
+    """
+
+    def _impl():
+        assy = _active_assembly()
+        ray_data = (rack_ray_origin, rack_ray_direction, pinion_ray_origin, pinion_ray_direction)
+        if any(len(values) != 3 for values in ray_data):
+            raise ValueError("Each rack-pinion ray origin and direction must contain three values.")
+        if ray_radius <= 0 or diameter_value <= 0:
+            raise ValueError("ray_radius and diameter_value must be positive.")
+        if any(math.isclose(sum(float(value) ** 2 for value in direction), 0.0)
+               for direction in (rack_ray_direction, pinion_ray_direction)):
+            raise ValueError("Rack-pinion ray directions cannot be zero.")
+        diameter_types = {"pinion_pitch_diameter": 0, "rack_travel_per_revolution": 1}
+        diameter_key = diameter_type.strip().lower()
+        if diameter_key not in diameter_types:
+            raise ValueError("diameter_type must be pinion_pitch_diameter or rack_travel_per_revolution.")
+
+        rack_origin = [to_meters(value, unit) for value in rack_ray_origin]
+        pinion_origin = [to_meters(value, unit) for value in pinion_ray_origin]
+        radius_m = to_meters(ray_radius, unit)
+        before = {
+            str(feature.Name)
+            for feature in (assy.FeatureManager.GetFeatures(False) or ())
+            if str(getattr(feature, "GetTypeName2", "")) == "MateRackPinionDim"
+        }
+        assy.ClearSelection2(True)
+        selected_rack = assy.Extension.SelectByRay(
+            *rack_origin, *[float(value) for value in rack_ray_direction], radius_m,
+            int(rack_selection_type), True, 64, 0,
+        )
+        selected_pinion = assy.Extension.SelectByRay(
+            *pinion_origin, *[float(value) for value in pinion_ray_direction], radius_m,
+            int(pinion_selection_type), True, 128, 0,
+        )
+        if not selected_rack or not selected_pinion or int(assy.SelectionManager.GetSelectedObjectCount2(-1)) != 2:
+            assy.ClearSelection2(True)
+            raise RuntimeError("Rack-pinion selection failed; select a linear rack edge and a cylindrical pinion entity.")
+
+        mate_data = assy.CreateMateData(13)  # swMateRACKPINION
+        mate_data.DiameterType = diameter_types[diameter_key]
+        mate_data.DiameterVal = to_meters(diameter_value, unit)
+        mate_data.Reverse = bool(reverse)
+        raw_feature = assy._oleobj_.InvokeTypes(195, 0, 1, (9, 0), ((9, 1),), mate_data)
+        feature = win32com.client.Dispatch(raw_feature) if raw_feature is not None else None
+        assy.ClearSelection2(True)
+        if feature is None:
+            raise RuntimeError("SolidWorks did not create the rack-and-pinion mate.")
+        rebuilt = bool(assy.ForceRebuild3(False))
+        after = [
+            item for item in (assy.FeatureManager.GetFeatures(False) or ())
+            if str(getattr(item, "GetTypeName2", "")) == "MateRackPinionDim" and str(item.Name) not in before
+        ]
+        if not after:
+            raise RuntimeError("Rack-pinion API returned a feature but no MateRackPinionDim feature was added to the tree.")
+        _redraw_document(assy)
+        return {
+            "feature": str(after[-1].Name), "feature_type": str(after[-1].GetTypeName2),
+            "diameter_type": diameter_key, "diameter_value": diameter_value,
+            "reverse": bool(reverse), "rebuilt": rebuilt, "selection_marks": {"rack": 64, "pinion": 128},
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool()
 async def interference_check() -> dict:
     """Check the active assembly for interferences (parts overlapping in space).
 
