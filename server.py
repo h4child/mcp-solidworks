@@ -6104,6 +6104,129 @@ async def create_automotive_piston_with_connecting_rod(
         ) from exc
 
 
+@mcp.tool()
+async def create_pedestal_fan_propeller(
+    blade_radius: float = 190,
+    hub_radius: float = 32,
+    hub_depth: float = 28,
+    blade_thickness: float = 4,
+    pitch_angle: float = 22,
+    unit: Optional[str] = None,
+    save_path: Optional[str] = None,
+) -> dict:
+    """Create a three-blade pedestal-fan propeller with aerodynamic pitch.
+
+    The three swept blades are spaced exactly 120 degrees around the hub.  The
+    seed blade is tilted by ``pitch_angle`` about its radial root axis before
+    being copied, giving all blades a common air-moving pitch rather than a
+    flat decorative profile. Dimensions use ``unit`` (mm by default).
+    """
+
+    if min(blade_radius, hub_radius, hub_depth, blade_thickness) <= 0:
+        raise ValueError("blade_radius, hub_radius, hub_depth, and blade_thickness must be positive.")
+    if blade_radius <= hub_radius * 2:
+        raise ValueError("blade_radius must be more than twice hub_radius.")
+    if not 5 <= abs(pitch_angle) <= 45:
+        raise ValueError("pitch_angle must be between 5 and 45 degrees in magnitude.")
+
+    completed: list[str] = []
+    stage = "initialization"
+
+    async def _name_last_solid_body(name: str) -> str:
+        def _impl():
+            doc = _active_doc()
+            bodies = doc.GetBodies2(0, False) or ()  # 0 = swSolidBody
+            if not bodies:
+                raise RuntimeError("No solid body was available to name.")
+            body = win32com.client.Dispatch(bodies[-1])
+            body.Name = name
+            return name
+
+        return await _run(_impl)
+
+    try:
+        stage = "new part"
+        part = await create_new_part()
+        completed.append(stage)
+        if save_path:
+            stage = "initial save"
+            await save_document(save_path)
+            completed.append(stage)
+
+        stage = "hub"
+        await create_sketch("top")
+        await draw_circle(0, 0, hub_radius, unit)
+        await close_sketch()
+        await extrude_sketch(hub_depth, both_directions=True, unit=unit)
+        completed.append(stage)
+
+        # Swept asymmetric planform: broad toward the tip and biased toward the
+        # trailing edge. The root overlaps the hub, preserving a robust mount.
+        stage = "pitched seed blade"
+        root_inner = hub_radius * 0.62
+        root_outer = hub_radius * 0.96
+        root_half_chord = hub_radius * 0.34
+        tip_leading = blade_radius * 0.08
+        tip_trailing = blade_radius * 0.31
+        blade_points = [
+            (root_inner, -root_half_chord),
+            (root_outer, root_half_chord),
+            (blade_radius, tip_trailing),
+            (blade_radius * 0.91, tip_leading),
+        ]
+        await create_sketch("top")
+        for index, start in enumerate(blade_points):
+            end = blade_points[(index + 1) % len(blade_points)]
+            await draw_line(start[0], start[1], end[0], end[1], unit)
+        await close_sketch()
+        await extrude_sketch(blade_thickness, both_directions=True, merge=False, unit=unit)
+        await _name_last_solid_body("FanBladeSeed")
+
+        # The seed starts radially along X; rotating around X gives it pitch.
+        # Copies preserve that pitched geometry and only change its azimuth.
+        await move_copy_body("FanBladeSeed", rx=pitch_angle, unit=unit)
+        await move_copy_body("FanBladeSeed", rz=120, copy=True, unit=unit)
+        await move_copy_body("FanBladeSeed", rz=240, copy=True, unit=unit)
+        completed.append(stage)
+
+        stage = "shaft bore"
+        await create_sketch("top")
+        await draw_circle(0, 0, hub_radius * 0.22, unit)
+        await close_sketch()
+        await cut_extrude(through_all=True, both_directions=True, unit=unit)
+        completed.append(stage)
+
+        stage = "appearance and view"
+        await apply_metal_finish("chrome", "body")
+        await set_view("isometric")
+        await zoom_to_fit()
+        completed.append(stage)
+        if save_path:
+            stage = "final save"
+            await save_document()
+            completed.append(stage)
+
+        return {
+            "document": part["title"],
+            "save_path": os.path.abspath(save_path) if save_path else None,
+            "blade_count": 3,
+            "aerodynamic_pitch_degrees": pitch_angle,
+            "blade_spacing_degrees": [0, 120, 240],
+            "features": ["central hub", "shaft bore", "three swept pitched blades"],
+            "completed_stages": completed,
+        }
+    except Exception as exc:
+        try:
+            active = await get_document_info()
+        except Exception:
+            active = {"title": "(no active document)", "type": "Unknown"}
+        raise RuntimeError(
+            f"Pedestal fan propeller creation stopped during '{stage}'. "
+            f"Completed stages: {', '.join(completed) or '(none)'}. "
+            f"Active document: {active}. Root cause: {exc}"
+        ) from exc
+
+
 # ===========================================================================
 # Configuration tools
 # ===========================================================================

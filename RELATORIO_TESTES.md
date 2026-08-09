@@ -16,6 +16,14 @@ Data: 08 de agosto de 2026
 - The hollow-underside revision was verified through the bottom view: it
   preserves the crown and skirt wall while exposing the internal rod/pin region.
 
+## Three-blade pedestal-fan propeller
+
+- Added and live-tested `create_pedestal_fan_propeller` in SolidWorks 2025.
+- The generated SLDPRT contains exactly four solid bodies: one hub and three
+  swept blades spaced 120 degrees apart, each carrying the same 22-degree pitch.
+- Front, back, top, bottom, and isometric images were exported; the hub was
+  finished in chrome-gray and includes a through shaft bore.
+
 ## Acabamento metalico e correcao de encaixe
 
 - Foi adicionada a ferramenta `apply_metal_finish`, que aplica os acabamentos
