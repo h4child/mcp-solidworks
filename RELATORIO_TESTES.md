@@ -2,6 +2,15 @@
 
 Data: 08 de agosto de 2026
 
+## Piston reference completion
+
+- Validated in SolidWorks 2025: `automotive_piston_completed_reference_002.SLDPRT`.
+- The final reference model has three ring grooves, two visible crown valve
+  reliefs, a separate transverse wrist-pin body, open small- and big-end bores,
+  a narrow rod web, and a chrome-gray finish.
+- Front, back, top, bottom, and isometric views were exported and reviewed;
+  the final document remains open in SolidWorks.
+
 ## Acabamento metalico e correcao de encaixe
 
 - Foi adicionada a ferramenta `apply_metal_finish`, que aplica os acabamentos
