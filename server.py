@@ -5949,8 +5949,13 @@ async def create_automotive_piston_with_connecting_rod(
     small_end_outer = wrist_pin_diameter / 2 + 5
     big_end_outer = crank_bore_diameter / 2 + 5
     beam_half_width = max(5.0, wrist_pin_diameter * 0.30)
-    # Overlap the skirt by 3 mm so the small-end pad visibly joins the piston.
-    small_end_y = -(small_end_outer - 3.0)
+    # The wrist-pin center belongs inside the lower third of the skirt, not
+    # below it. Keeping the rod and the pin on this shared centerline makes
+    # the joint physically continuous in every generated reference model.
+    small_end_y = max(
+        small_end_outer + 1.0,
+        min(piston_height * 0.34, piston_height - small_end_outer - 8.0),
+    )
     big_end_y = small_end_y - connecting_rod_length
     ring_offsets = (piston_height - 18, piston_height - 12, piston_height - 6)
 
@@ -6066,6 +6071,12 @@ async def create_automotive_piston_with_connecting_rod(
                 "piston skirt", "three ring grooves", "two crown valve reliefs",
                 "separate wrist pin", "small-end and big-end bores", "narrow-web connecting rod",
             ],
+            "joint_centers": {
+                "wrist_pin": {"x": 0.0, "y": small_end_y, "z": 0.0},
+                "crank_pin": {"x": 0.0, "y": big_end_y, "z": 0.0},
+                "unit": unit or _default_unit,
+                "contract": "Both rod bores and the transverse wrist pin use these shared centers.",
+            },
             "completed_stages": completed,
         }
     except Exception as exc:

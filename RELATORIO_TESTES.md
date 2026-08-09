@@ -10,6 +10,9 @@ Data: 08 de agosto de 2026
   a narrow rod web, and a chrome-gray finish.
 - Front, back, top, bottom, and isometric views were exported and reviewed;
   the final document remains open in SolidWorks.
+- The fitted-joint revision places the wrist-pin center inside the lower skirt
+  and returns the wrist-pin and crank-pin centers as a coordinate contract,
+  allowing later MCP calls to preserve the same rod-to-piston fit.
 
 ## Acabamento metalico e correcao de encaixe
 
