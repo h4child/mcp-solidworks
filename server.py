@@ -5342,6 +5342,101 @@ async def add_advanced_mate(
 
 
 @mcp.tool()
+async def add_cam_follower_mate(
+    cam_ray_origin: list[float],
+    cam_ray_direction: list[float],
+    follower_ray_origin: list[float],
+    follower_ray_direction: list[float],
+    ray_radius: float,
+    cam_selection_type: int = 2,
+    follower_selection_type: int = 3,
+    alignment: str = "closest",
+    unit: Optional[str] = None,
+) -> dict:
+    """Create a stable cam-follower mate using ``CreateMateData``/``CreateMate``.
+
+    This deliberately avoids ``AddMate5`` for cam followers.  The SOLIDWORKS
+    API requires selection mark 1 for the cam and mark 8 for the follower;
+    each ray is ``[x, y, z]`` and directions are unitless vectors.
+
+    ``cam_selection_type`` and ``follower_selection_type`` use SolidWorks
+    selection-type IDs accepted by ``SelectByRay`` (the official sample uses
+    2 and 3 respectively).  ``alignment`` is ``aligned``, ``anti_aligned``,
+    or ``closest``.
+    """
+
+    def _impl():
+        assy = _active_assembly()
+        if len(cam_ray_origin) != 3 or len(cam_ray_direction) != 3:
+            raise ValueError("cam_ray_origin and cam_ray_direction must each contain three values.")
+        if len(follower_ray_origin) != 3 or len(follower_ray_direction) != 3:
+            raise ValueError("follower_ray_origin and follower_ray_direction must each contain three values.")
+        if ray_radius <= 0:
+            raise ValueError("ray_radius must be positive.")
+        if math.isclose(sum(float(value) ** 2 for value in cam_ray_direction), 0.0):
+            raise ValueError("cam_ray_direction cannot be zero.")
+        if math.isclose(sum(float(value) ** 2 for value in follower_ray_direction), 0.0):
+            raise ValueError("follower_ray_direction cannot be zero.")
+        alignments = {"aligned": 0, "anti_aligned": 1, "closest": 2}
+        alignment_key = alignment.strip().lower()
+        if alignment_key not in alignments:
+            raise ValueError("alignment must be aligned, anti_aligned, or closest.")
+
+        cam_origin = [to_meters(value, unit) for value in cam_ray_origin]
+        follower_origin = [to_meters(value, unit) for value in follower_ray_origin]
+        radius_m = to_meters(ray_radius, unit)
+        before = {
+            str(feature.Name)
+            for feature in (assy.FeatureManager.GetFeatures(False) or ())
+            if str(getattr(feature, "GetTypeName2", "")).startswith("MateCam")
+        }
+        assy.ClearSelection2(True)
+        selected_cam = assy.Extension.SelectByRay(
+            *cam_origin, *[float(value) for value in cam_ray_direction], radius_m,
+            int(cam_selection_type), True, 1, 0,
+        )
+        selected_follower = assy.Extension.SelectByRay(
+            *follower_origin, *[float(value) for value in follower_ray_direction], radius_m,
+            int(follower_selection_type), True, 8, 0,
+        )
+        selected_count = int(assy.SelectionManager.GetSelectedObjectCount2(-1))
+        if not selected_cam or not selected_follower or selected_count != 2:
+            assy.ClearSelection2(True)
+            raise RuntimeError(
+                "Cam-follower selection failed; confirm both rays intersect the intended cam and follower entities."
+            )
+
+        mate_data = assy.CreateMateData(9)  # swMateCAMFOLLOWER
+        mate_data.MateAlignment = alignments[alignment_key]
+        # Python 3.14's dynamic COM proxy exposes CreateMate as a property.
+        # Invoke the typed DISPIDs directly, matching the registered 2025 API.
+        raw_feature = assy._oleobj_.InvokeTypes(195, 0, 1, (9, 0), ((9, 1),), mate_data)
+        feature = win32com.client.Dispatch(raw_feature) if raw_feature is not None else None
+        assy.ClearSelection2(True)
+        if feature is None:
+            status = getattr(mate_data, "ErrorStatus", "unknown")
+            raise RuntimeError(f"SolidWorks did not create the cam-follower mate (status {status}).")
+        rebuilt = bool(assy.ForceRebuild3(False))
+        after = [
+            feature_item for feature_item in (assy.FeatureManager.GetFeatures(False) or ())
+            if str(getattr(feature_item, "GetTypeName2", "")).startswith("MateCam")
+            and str(feature_item.Name) not in before
+        ]
+        if not after:
+            raise RuntimeError("Cam-follower API returned a feature but no MateCam feature was added to the tree.")
+        _redraw_document(assy)
+        return {
+            "feature": str(after[-1].Name),
+            "feature_type": str(after[-1].GetTypeName2),
+            "alignment": alignment_key,
+            "rebuilt": rebuilt,
+            "selection_marks": {"cam": 1, "follower": 8},
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool()
 async def interference_check() -> dict:
     """Check the active assembly for interferences (parts overlapping in space).
 

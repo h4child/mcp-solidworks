@@ -1,7 +1,7 @@
 # SolidWorks MCP Server (novo)
 
 Servidor MCP em Python que controla o SolidWorks via COM (`win32com`), escrito
-com o SDK oficial (`mcp`, usando `FastMCP`). **130 ferramentas** (v5.1.0).
+com o SDK oficial (`mcp`, usando `FastMCP`). **131 ferramentas** (v5.2.0).
 
 ## Instalacao
 

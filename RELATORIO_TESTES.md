@@ -51,6 +51,14 @@ Data: 08 de agosto de 2026
   e os cinco documentos salvos do usuário foram reabertos. Cam-follower,
   screw e rack-and-pinion seguem propositalmente fora do catálogo até que o
   caminho COM seja isolado sem risco de encerrar a sessão do usuário.
+- A causa foi corrigida após revisar o exemplo oficial: cam-follower não deve
+  usar `AddMate5`. A ferramenta nova `add_cam_follower_mate` usa
+  `CreateMateData(swMateCAMFOLLOWER)` e `CreateMate`, com marcas 1 (cam) e 8
+  (seguidor), e invoca o DISPID tipado de `CreateMate` porque o proxy dinâmico
+  Python 3.14 o expõe incorretamente como propriedade. Em uma instância isolada
+  do SolidWorks 2025, ela removeu `CamMateCoincident1` do exemplo oficial,
+  recriou `MateCamCoincident`, reconstruiu o assembly e retornou zero erros e
+  zero avisos em `validate_model`.
 
 ## Piston reference completion
 
