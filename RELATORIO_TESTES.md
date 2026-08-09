@@ -258,7 +258,7 @@ ferramentas na versão 4.2.0, consistentes com `manifest.json`.
 | `set_view` | Sem defeito. | Não aplicável. | Alternou de vista frontal para isométrica e confirmou mudança na orientação do `IModelView`. |
 | `zoom_to_fit` | Sem defeito. | Não aplicável. | Ajustou a vista do modelo; a escala do `IModelView` permaneceu positiva. |
 | `zoom_to_area` | Sem defeito. | Não aplicável. | Ampliou uma região de 6 cm; a escala da vista aumentou de 1,38 para 3,60. |
-| `execute_python` | Sem defeito na ferramenta; o proxy COM expõe `GetPathName` como propriedade nesta instalação. | Não aplicável. | Executou leitura controlada do caminho da peça temporária e confirmou que o builtin `open` está bloqueado. |
+| `execute_python` | Ferramenta privilegiada de depuração; não deve ficar aberta por padrão em repositório público. | Bloqueada por padrão e liberada somente com `SOLIDWORKS_MCP_ENABLE_EXECUTE_PYTHON=1` em sessão local confiável. | Validação estática confirma a proteção de opt-in no código e no manifesto. |
 | `create_sketch` (plano nomeado) | Aceitava somente três planos padrão, impedindo esboços em planos deslocados. | Aceita agora o nome exato de qualquer plano de referência existente. | Criou esboços nos três planos deslocados usados para os canais do pistão. |
 | `create_automotive_piston` | O perfil revolvido e o corte revolvido tinham orientação local frágil; o corte central por extrusão também era rejeitado após os canais. | Corpo por extrusão, três cortes anulares em planos de referência, `shell_body` para a cavidade e corte transversal do pino. | Criou e salvou `automotive_piston_reference_228.SLDPRT`: um corpo sólido, três canais, casca interna e furo do pino. |
 

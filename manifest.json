@@ -2,11 +2,11 @@
   "manifest_version": "0.2",
   "name": "solidworks-mcp",
   "display_name": "SolidWorks MCP",
-  "version": "5.4.0",
-  "description": "Servidor MCP para automacao do SolidWorks via API COM, escrito com o SDK oficial (FastMCP)",
-  "long_description": "Controla o SolidWorks (criar pecas/montagens, esbocos, extrusao, corte, filete, chanfro, etc.) via COM, exposto como ferramentas MCP.",
+  "version": "5.4.1",
+  "description": "MCP server for SolidWorks automation through the Windows COM API, built with FastMCP.",
+  "long_description": "Controls SolidWorks via COM for parts, assemblies, sketches, features, drawings, appearances, validation, and selected mechanical mates. Designed for trusted local desktop automation.",
   "author": {
-    "name": "pcrod"
+    "name": "SolidWorks MCP Contributors"
   },
   "server": {
     "type": "python",
@@ -153,7 +153,7 @@
     { "name": "set_view", "description": "Set the camera view orientation (front, isometric, etc.)." },
     { "name": "zoom_to_fit", "description": "Zoom to fit the entire model in the viewport." },
     { "name": "zoom_to_area", "description": "Zoom into a rectangular area of the model." },
-    { "name": "execute_python", "description": "Run sandboxed Python with sw/doc in scope." }
+    { "name": "execute_python", "description": "Run privileged local Python with sw/doc in scope; disabled unless SOLIDWORKS_MCP_ENABLE_EXECUTE_PYTHON=1." }
   ],
   "keywords": [
     "solidworks",

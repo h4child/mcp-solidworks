@@ -67,6 +67,15 @@ class McpContractTests(unittest.TestCase):
             with self.subTest(path=path.name):
                 self.assertIsNone(credential_pattern.search(path.read_text(encoding="utf-8")))
 
+    def test_public_manifest_does_not_expose_local_author_name(self) -> None:
+        manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["author"]["name"], "SolidWorks MCP Contributors")
+
+    def test_execute_python_requires_explicit_opt_in(self) -> None:
+        source = SERVER.read_text(encoding="utf-8")
+        self.assertIn("SOLIDWORKS_MCP_ENABLE_EXECUTE_PYTHON", source)
+        self.assertIn("execute_python is disabled by default", source)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

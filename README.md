@@ -1,7 +1,7 @@
-# SolidWorks MCP Server (novo)
+# SolidWorks MCP Server
 
 Servidor MCP em Python que controla o SolidWorks via COM (`win32com`), escrito
-com o SDK oficial (`mcp`, usando `FastMCP`). **135 ferramentas** (v5.4.0).
+com o SDK oficial (`mcp`, usando `FastMCP`). **135 ferramentas** (v5.4.1).
 
 ## Instalacao
 
@@ -27,9 +27,26 @@ Instale o `.mcpb` (duplo clique) ou adicione em `claude_desktop_config.json`:
 Abra o SolidWorks (opcional -- o servidor consegue abrir sozinho) e peca para o
 Claude "conectar ao SolidWorks".
 
+## Seguranca para uso publico
+
+Este servidor foi projetado para automacao local confiavel. Ele controla uma
+sessao real do SolidWorks pelo COM do Windows, entao ferramentas como salvar,
+fechar, suprimir componentes e alterar geometrias modificam documentos abertos.
+
+A ferramenta `execute_python` fica desativada por padrao porque executa Python
+com acesso aos objetos COM `sw` e `doc`. Para usar somente em depuracao local
+confiavel, defina explicitamente:
+
+```powershell
+$env:SOLIDWORKS_MCP_ENABLE_EXECUTE_PYTHON = "1"
+```
+
+Nao publique modelos CAD privados, pacotes `.mcpb`, logs ou resultados de teste
+gerados localmente. O `.gitignore` ja exclui esses artefatos por padrao.
+
 ## Status de verificacao (testado ao vivo no SolidWorks 2025, PT-BR)
 
-Cada ferramenta foi executada contra uma sessao real do SolidWorks. Legenda:
+A matriz abaixo registra o estado validado no SolidWorks 2025 PT-BR. Legenda:
 - OK  = criou o recurso com sucesso no teste ao vivo.
 - EXP = experimental: a assinatura COM esta correta mas o recurso depende de
         selecao/estado especifico ou de uma parte da API que se comporta de
@@ -39,7 +56,11 @@ Cada ferramenta foi executada contra uma sessao real do SolidWorks. Legenda:
 `connect_solidworks`, `get_solidworks_info`, `create_new_part`,
 `create_new_assembly`, `create_new_drawing`, `open_document`, `close_document`,
 `save_document`, `get_document_info`, `list_open_documents`, `set_units`,
-`set_view`, `zoom_to_fit`, `zoom_to_area`, `execute_python`
+`set_view`, `zoom_to_fit`, `zoom_to_area`
+
+`execute_python` e uma ferramenta de depuracao privilegiada. Ela existe no
+catalogo, mas permanece bloqueada ate
+`SOLIDWORKS_MCP_ENABLE_EXECUTE_PYTHON=1` ser definido.
 
 > Correcao importante: os templates padrao sao resolvidos pelos indices
 > corretos (`swDefaultTemplatePart/Assembly/Drawing` = 8/9/10). Antes, o desenho

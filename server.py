@@ -2735,8 +2735,8 @@ async def create_3d_sketch() -> dict:
     structural members (weldments) in space — e.g. the frame of a platform
     or a tank support structure.
 
-    After calling this, use draw_line_3d (or the regular draw_line with Z
-    coordinates via execute_python) to add geometry, then close_sketch when done."""
+    After calling this, use draw_line_3d to add geometry, then close_sketch
+    when done."""
 
     def _impl():
         doc = _active_doc()
@@ -4153,7 +4153,7 @@ async def create_reference_axis(
     method:
       'two_planes'   — intersection of two planes (uses ref1, ref2 plane names).
       'cylinder'     — axis of a cylindrical face (uses face_x/y/z point on face).
-      'point_edge'   — not implemented here; use execute_python if needed.
+      'point_edge'   — not implemented here.
 
     ref1/ref2: plane names when method='two_planes'.
     face_x/y/z: point on cylindrical face when method='cylinder'."""
@@ -7966,13 +7966,24 @@ _BLOCKED_BUILTINS = frozenset({
     "exit", "quit", "input", "breakpoint",
 })
 _SAFE_BUILTINS = {k: v for k, v in vars(builtins).items() if k not in _BLOCKED_BUILTINS}
+EXECUTE_PYTHON_ENV = "SOLIDWORKS_MCP_ENABLE_EXECUTE_PYTHON"
 
 
 @mcp.tool()
 async def execute_python(code: str) -> dict:
-    """Run Python with 'sw' (SldWorks Application) and 'doc' (active document)
-    in scope. Use print() to return debug output.
-    Sandboxed: open/import/exec/eval/compile are blocked for safety."""
+    """Run privileged Python with 'sw' and 'doc' in scope when explicitly enabled.
+
+    This tool is disabled by default because the COM objects can change the
+    active SolidWorks session. Set SOLIDWORKS_MCP_ENABLE_EXECUTE_PYTHON=1 only
+    for trusted local debugging sessions.
+    """
+
+    enabled = os.environ.get(EXECUTE_PYTHON_ENV, "").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        raise PermissionError(
+            f"execute_python is disabled by default. Set {EXECUTE_PYTHON_ENV}=1 "
+            "only in trusted local development sessions."
+        )
 
     def _impl():
         app = _connect()
