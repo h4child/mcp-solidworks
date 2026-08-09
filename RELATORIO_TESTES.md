@@ -42,6 +42,9 @@ Data: 08 de agosto de 2026
   it lies on the Y shaft axis; the 0.02334 m Y value is axial position, not
   radial imbalance. Front, back, top, bottom, and isometric views were exported
   and visually reviewed.
+- The default blade pitch was subsequently reduced from 22 to 8 degrees. This
+  preserves a small air-moving incidence while keeping the blades visually
+  close to the rotor plane, as on a typical household pedestal fan.
 - Front, back, top, bottom, and isometric images were exported; the hub was
   finished in chrome-gray and includes a through shaft bore.
 

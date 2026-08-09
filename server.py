@@ -6121,7 +6121,7 @@ async def create_pedestal_fan_propeller(
     hub_radius: float = 32,
     hub_depth: float = 28,
     blade_thickness: float = 4,
-    pitch_angle: float = 22,
+    pitch_angle: float = 8,
     unit: Optional[str] = None,
     save_path: Optional[str] = None,
 ) -> dict:
@@ -6130,8 +6130,9 @@ async def create_pedestal_fan_propeller(
     The three broad, rounded-tip blades are copies of one seed body at exactly
     120-degree intervals around the hub. This makes their geometry, volume,
     and radial mass distribution identical. The seed is tilted by
-    ``pitch_angle`` about its radial root axis before copying, giving all
-    blades a common air-moving pitch rather than a flat decorative profile.
+    ``pitch_angle`` about its radial root axis before copying. The default is
+    intentionally subtle so the rotor reads like a household-fan blade rather
+    than three plates projected forward from the hub.
     Dimensions use ``unit`` (mm by default).
     """
 
