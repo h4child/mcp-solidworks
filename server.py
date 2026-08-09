@@ -98,6 +98,16 @@ async def _run(fn, *args, **kwargs):
         raise
 
 
+def _redraw_document(doc) -> None:
+    """Refresh graphics after a visual-property update without failing it."""
+    try:
+        redraw = doc.GraphicsRedraw2
+        if callable(redraw):
+            redraw()
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Units
 # ---------------------------------------------------------------------------
@@ -5556,6 +5566,193 @@ async def set_appearance(
             raise RuntimeError("Failed to set appearance/color.")
 
         return {"rgb": [red, green, blue], "target": target}
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def get_appearance_properties() -> dict:
+    """Read the active document's RGB, reflection, transparency, and emission.
+
+    The result follows the SolidWorks material-property channel order used by
+    ``IModelDocExtension.GetMaterialPropertyValues``.  It is useful to inspect
+    an existing finish before changing it.
+    """
+
+    def _impl():
+        doc = _active_doc()
+        extension = doc.Extension
+        has_values = getattr(extension, "HasMaterialPropertyValues", False)
+        has_values = bool(has_values() if callable(has_values) else has_values)
+        raw = extension.GetMaterialPropertyValues(1, None) if has_values else None
+        values = list(raw) if raw else None
+        if values is not None and len(values) != 9:
+            raise RuntimeError(
+                f"SolidWorks returned {len(values)} appearance channels; expected 9."
+            )
+        return {
+            "has_appearance": has_values,
+            "channels": None if values is None else {
+                "rgb": [round(values[0] * 255), round(values[1] * 255), round(values[2] * 255)],
+                "ambient": values[3],
+                "diffuse": values[4],
+                "specular": values[5],
+                "shininess": values[6],
+                "transparency": values[7],
+                "emission": values[8],
+            },
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def set_appearance_properties(
+    red: int = 210, green: int = 215, blue: int = 220,
+    ambient: float = 0.35, diffuse: float = 0.85,
+    specular: float = 0.70, shininess: float = 0.70,
+    transparency: float = 0.0, emission: float = 0.0,
+    target: str = "body",
+    face_x: float = 0, face_y: float = 0, face_z: float = 0,
+    unit: Optional[str] = None,
+) -> dict:
+    """Set color plus all native SolidWorks reflection/opacity channels.
+
+    ``specular`` and ``shininess`` control reflected highlights; ``diffuse``
+    controls base-light response; ``transparency`` and ``emission`` range from
+    0 to 1. Use target ``face`` with a point on a face for a local finish.
+    """
+
+    def _impl():
+        if not all(isinstance(c, int) and 0 <= c <= 255 for c in (red, green, blue)):
+            raise ValueError("RGB components must be integers between 0 and 255.")
+        channels = (ambient, diffuse, specular, shininess, transparency, emission)
+        if not all(0.0 <= float(value) <= 1.0 for value in channels):
+            raise ValueError("ambient, diffuse, specular, shininess, transparency, and emission must be 0..1.")
+        target_key = target.strip().lower()
+        if target_key not in {"body", "face"}:
+            raise ValueError("target must be 'body' or 'face'.")
+
+        doc = _active_doc()
+        values = win32com.client.VARIANT(
+            pythoncom.VT_ARRAY | pythoncom.VT_R8,
+            [red / 255.0, green / 255.0, blue / 255.0,
+             float(ambient), float(diffuse), float(specular), float(shininess),
+             float(transparency), float(emission)],
+        )
+        if target_key == "face":
+            doc.ClearSelection2(True)
+            fx, fy, fz = to_meters(face_x, unit), to_meters(face_y, unit), to_meters(face_z, unit)
+            empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+            if not doc.Extension.SelectByID2("", "FACE", fx, fy, fz, False, 0, empty, 0):
+                raise RuntimeError(f"No face found at ({face_x}, {face_y}, {face_z}).")
+            selected = doc.SelectionManager.GetSelectedObject6(1, -1)
+            face = win32com.client.Dispatch(
+                selected, "IFace2", "{4A8BA4D8-DA25-4B75-8E2D-4922B74D81ED}",
+            )
+            face.SetMaterialPropertyValues2(values, 1, None)
+        else:
+            extension = win32com.client.Dispatch(
+                doc.Extension, "IModelDocExtension", "{99F4D4AF-F268-4EE1-8C55-041F7BECF879}",
+            )
+            extension.SetMaterialPropertyValues(values, 1, None)
+        _redraw_document(doc)
+        return {
+            "target": target_key,
+            "rgb": [red, green, blue],
+            "reflection": {"ambient": ambient, "diffuse": diffuse, "specular": specular, "shininess": shininess},
+            "transparency": transparency,
+            "emission": emission,
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def apply_texture(
+    texture_path: str,
+    scale: float = 1.0,
+    angle: float = 0.0,
+    blend_with_color: bool = True,
+    target: str = "model",
+    face_x: float = 0, face_y: float = 0, face_z: float = 0,
+    unit: Optional[str] = None,
+) -> dict:
+    """Apply an image texture to the active model or a selected face.
+
+    ``texture_path`` must be a local image path supported by SolidWorks.
+    ``scale`` is the texture granularity multiplier (0.001..1000000), and
+    ``angle`` rotates it in degrees (0..360). Set target to ``face`` to apply
+    only to the face at face_x/face_y/face_z.
+    """
+
+    def _impl():
+        abs_path = os.path.abspath(texture_path)
+        if not os.path.isfile(abs_path):
+            raise FileNotFoundError(f"Texture file not found: {abs_path}")
+        if not 0.001 <= float(scale) <= 1_000_000:
+            raise ValueError("scale must be between 0.001 and 1000000.")
+        if not 0.0 <= float(angle) <= 360.0:
+            raise ValueError("angle must be between 0 and 360 degrees.")
+        target_key = target.strip().lower()
+        if target_key not in {"model", "face"}:
+            raise ValueError("target must be 'model' or 'face'.")
+
+        doc = _active_doc()
+        extension = doc.Extension
+        texture = extension.CreateTexture(abs_path, float(scale), float(angle), bool(blend_with_color))
+        if texture is None:
+            raise RuntimeError("SolidWorks could not create a texture from the supplied file.")
+        if target_key == "face":
+            doc.ClearSelection2(True)
+            fx, fy, fz = to_meters(face_x, unit), to_meters(face_y, unit), to_meters(face_z, unit)
+            empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+            if not extension.SelectByID2("", "FACE", fx, fy, fz, False, 0, empty, 0):
+                raise RuntimeError(f"No face found at ({face_x}, {face_y}, {face_z}).")
+            selected = doc.SelectionManager.GetSelectedObject6(1, -1)
+            face = win32com.client.Dispatch(
+                selected, "IFace2", "{4A8BA4D8-DA25-4B75-8E2D-4922B74D81ED}",
+            )
+            applied = bool(face.SetTexture("", texture))
+        else:
+            applied = bool(extension.SetTexture("", texture))
+        if not applied:
+            raise RuntimeError("SolidWorks rejected the texture assignment.")
+        _redraw_document(doc)
+        return {"target": target_key, "texture_path": abs_path, "scale": scale, "angle": angle, "blend_with_color": blend_with_color}
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def remove_texture(
+    target: str = "model",
+    face_x: float = 0, face_y: float = 0, face_z: float = 0,
+    unit: Optional[str] = None,
+) -> dict:
+    """Remove the native texture from the active model or a selected face."""
+
+    def _impl():
+        target_key = target.strip().lower()
+        if target_key not in {"model", "face"}:
+            raise ValueError("target must be 'model' or 'face'.")
+        doc = _active_doc()
+        extension = doc.Extension
+        if target_key == "face":
+            doc.ClearSelection2(True)
+            fx, fy, fz = to_meters(face_x, unit), to_meters(face_y, unit), to_meters(face_z, unit)
+            empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+            if not extension.SelectByID2("", "FACE", fx, fy, fz, False, 0, empty, 0):
+                raise RuntimeError(f"No face found at ({face_x}, {face_y}, {face_z}).")
+            selected = doc.SelectionManager.GetSelectedObject6(1, -1)
+            face = win32com.client.Dispatch(
+                selected, "IFace2", "{4A8BA4D8-DA25-4B75-8E2D-4922B74D81ED}",
+            )
+            removed = bool(face.RemoveTexture(""))
+        else:
+            removed = bool(extension.RemoveTexture2(""))
+        _redraw_document(doc)
+        return {"target": target_key, "removed": removed}
 
     return await _run(_impl)
 

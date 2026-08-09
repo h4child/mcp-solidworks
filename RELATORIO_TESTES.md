@@ -258,3 +258,18 @@ public MCP call successfully created a four-point spline in
 
 All five final replicas and the spline test remain ignored local artifacts; no
 SolidWorks output or MCP build artifact was added to source control.
+
+## Appearance, reflection, and texture API validation
+
+Four additional appearance tools were implemented for SolidWorks 2025:
+`get_appearance_properties`, `set_appearance_properties`, `apply_texture`, and
+`remove_texture`. They expose the native nine-channel material-property array:
+RGB, ambient, diffuse, specular, shininess, transparency, and emission.
+
+Live validation was run on the open three-blade fan. Its finish was changed to
+light silver RGB 220/225/232 with ambient 0.45, diffuse 0.90, specular 0.92,
+and shininess 0.82; the read-back API returned the same nine values. A local
+SolidWorks-installed image was then created as an `ITexture`, assigned with
+`IModelDocExtension.SetTexture`, and removed again with `RemoveTexture2`.
+Both calls returned success and the final saved model retains the light-silver
+finish without the temporary test texture.
