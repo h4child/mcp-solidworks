@@ -513,6 +513,26 @@ def _active_assembly():
     return doc
 
 
+def _motion_study_manager(doc):
+    """Return the native MotionStudy manager with a Python 3.14-safe dispatch.
+
+    The dynamic COM proxy resolves the zero-argument
+    ``IModelDocExtension.GetMotionStudyManager`` member as a property.  Its
+    registered DISPID is 140 in the SOLIDWORKS 2025 type library, so invoke it
+    with its declared return type instead.
+    """
+    raw_manager = doc.Extension._oleobj_.InvokeTypes(140, 0, 1, (9, 0), ())
+    if raw_manager is None:
+        raise RuntimeError("SolidWorks Motion Study Manager is unavailable for the active document.")
+    return win32com.client.Dispatch(raw_manager)
+
+
+def _invoke_motion_manager(manager, member: str, return_type, arguments=()):
+    """Call a MotionStudy manager method without dynamic-proxy ambiguity."""
+    dispid = manager._oleobj_.GetIDsOfNames(member)
+    return manager._oleobj_.InvokeTypes(dispid, 0, 1, return_type, arguments)
+
+
 def _preload_and_insert_component(assy, filepath: str, x: float, y: float, z: float):
     """AddComponent5 silently returns None unless the source document is already
     loaded into the SolidWorks session (via a silent OpenDoc6) and the assembly
@@ -1183,6 +1203,65 @@ async def list_mates() -> dict:
             except Exception:
                 pass
         return {"count": len(mates), "mates": mates}
+
+    return await _run(_impl)
+
+
+# ===========================================================================
+# Motion Study tools
+# ===========================================================================
+
+@mcp.tool()
+async def list_motion_studies() -> dict:
+    """List native SolidWorks Motion Studies in the active assembly or part.
+
+    This is intentionally study management only. Mechanical movement is
+    provided by assembly mates; motors, forces, timeline keyframes, and Motion
+    Analysis solve controls are not created by this tool.
+    """
+
+    def _impl():
+        doc = _active_doc()
+        manager = _motion_study_manager(doc)
+        count = int(_invoke_motion_manager(manager, "GetMotionStudyCount", (3, 0)))
+        raw_names = _invoke_motion_manager(manager, "GetMotionStudyNames", (12, 0))
+        names = [str(name) for name in (raw_names or ())]
+        return {"count": count, "names": names, "supports_timeline_motors": False}
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def create_motion_study(name: Optional[str] = None, activate: bool = True) -> dict:
+    """Create and optionally activate a native SolidWorks Animation study.
+
+    The created study is a container for MotionManager animation data. It does
+    not add a motor or solve a physical analysis; use mechanical mates to
+    constrain the assembly's movement.
+    """
+
+    def _impl():
+        doc = _active_doc()
+        manager = _motion_study_manager(doc)
+        raw_study = _invoke_motion_manager(manager, "CreateMotionStudy", (9, 0))
+        if raw_study is None:
+            raise RuntimeError("SolidWorks did not create a Motion Study.")
+        study = win32com.client.Dispatch(raw_study)
+        study_name = str(getattr(study, "Name", "") or "").strip()
+        requested_name = (name or "").strip()
+        if requested_name:
+            try:
+                study.Name = requested_name
+                study_name = requested_name
+            except Exception as exc:
+                raise RuntimeError(f"Motion Study was created but could not be renamed to '{requested_name}': {exc}") from exc
+        if activate:
+            activated = bool(manager.ActivateMotionStudy(study_name))
+            if not activated:
+                raise RuntimeError(f"Motion Study '{study_name}' was created but could not be activated.")
+        count = int(_invoke_motion_manager(manager, "GetMotionStudyCount", (3, 0)))
+        return {"name": study_name, "created": True, "activated": bool(activate), "count": count,
+                "contains_motor": False, "study_type": "Animation"}
 
     return await _run(_impl)
 

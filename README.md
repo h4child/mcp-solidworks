@@ -1,7 +1,7 @@
 # SolidWorks MCP Server (novo)
 
 Servidor MCP em Python que controla o SolidWorks via COM (`win32com`), escrito
-com o SDK oficial (`mcp`, usando `FastMCP`). **133 ferramentas** (v5.3.0).
+com o SDK oficial (`mcp`, usando `FastMCP`). **135 ferramentas** (v5.4.0).
 
 ## Instalacao
 
@@ -68,6 +68,7 @@ Cada ferramenta foi executada contra uma sessao real do SolidWorks. Legenda:
 `unsuppress_component`, `list_mates`, `interference_check` (OK),
 `add_mate` (EXP), `add_advanced_mate` (EXP), `add_cam_follower_mate` (OK),
 `add_screw_mate` (OK), `add_rack_pinion_mate` (OK),
+`list_motion_studies` (OK), `create_motion_study` (OK),
 `create_assembly_pattern` (EXP -- precisa de referencia de direcao),
 `create_exploded_view` (EXP)
 

@@ -2,7 +2,7 @@
   "manifest_version": "0.2",
   "name": "solidworks-mcp",
   "display_name": "SolidWorks MCP",
-  "version": "5.3.0",
+  "version": "5.4.0",
   "description": "Servidor MCP para automacao do SolidWorks via API COM, escrito com o SDK oficial (FastMCP)",
   "long_description": "Controla o SolidWorks (criar pecas/montagens, esbocos, extrusao, corte, filete, chanfro, etc.) via COM, exposto como ferramentas MCP.",
   "author": {
@@ -43,6 +43,8 @@
     { "name": "unsuppress_component", "description": "Unsuppress a previously suppressed component." },
     { "name": "add_mate", "description": "EXPERIMENTAL: mate two faces/planes in the assembly." },
     { "name": "list_mates", "description": "List all mates (constraints) in the assembly." },
+    { "name": "list_motion_studies", "description": "List native SolidWorks Motion Studies in the active document." },
+    { "name": "create_motion_study", "description": "Create and activate a native SolidWorks Animation study." },
     { "name": "create_sketch", "description": "Create a sketch on a standard plane (front/top/right)." },
     { "name": "create_sketch_on_face", "description": "Create a sketch on an existing body face." },
     { "name": "close_sketch", "description": "Exit the active sketch." },

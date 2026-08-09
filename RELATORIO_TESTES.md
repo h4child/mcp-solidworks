@@ -70,6 +70,16 @@ Data: 08 de agosto de 2026
   `RackPinionMate1` (`MateRackPinionDim`), reconstruiu e retornou 0 erros e 0
   avisos. Os dois samples foram fechados sem salvar e a instância isolada foi
   encerrada ao final.
+- A montagem de demonstração `MCP_Robust_Rack_Pinion_Motion.SLDASM` foi salva
+  em `tests/output/motion_demo/` (diretório ignorado pelo Git). Ela contém os
+  dois componentes `spurgear-1` e `rack-1`, sete mates — incluindo o
+  `RackPinionMate1` — e validou sem erros ou avisos. A compatibilidade Python
+  3.14 com `IModelDocExtension.GetMotionStudyManager` foi corrigida por DISPID
+  tipado 140. As novas ferramentas `list_motion_studies` e
+  `create_motion_study` confirmaram os estudos nativos e criaram/ativaram
+  `MCP Rack-Pinion Kinematic Motion`. O estudo é uma animação pronta para a
+  linha do tempo; controle de motor, keyframes e Motion Analysis ainda não são
+  expostos pelo MCP.
 
 ## Piston reference completion
 
