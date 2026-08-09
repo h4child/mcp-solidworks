@@ -5229,11 +5229,49 @@ async def create_exploded_view(
 
 
 @mcp.tool()
+async def delete_mate(name: str) -> dict:
+    """Delete a named assembly mate and verify it no longer exists."""
+
+    def _impl():
+        assy = _active_assembly()
+        mate_name = name.strip()
+        if not mate_name:
+            raise ValueError("Mate name cannot be empty.")
+        known = {
+            str(feature.Name).casefold()
+            for feature in (assy.FeatureManager.GetFeatures(False) or ())
+            if str(getattr(feature, "GetTypeName2", "")).startswith("Mate")
+        }
+        if mate_name.casefold() not in known:
+            raise ValueError(f"Mate '{mate_name}' does not exist.")
+        assy.ClearSelection2(True)
+        empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+        if not assy.Extension.SelectByID2(mate_name, "MATE", 0, 0, 0, False, 0, empty, 0):
+            raise RuntimeError(f"SolidWorks could not select mate '{mate_name}'.")
+        if not bool(assy.Extension.DeleteSelection2(0)):
+            raise RuntimeError(f"SolidWorks could not delete mate '{mate_name}'.")
+        remaining = {
+            str(feature.Name).casefold()
+            for feature in (assy.FeatureManager.GetFeatures(False) or ())
+            if str(getattr(feature, "GetTypeName2", "")).startswith("Mate")
+        }
+        if mate_name.casefold() in remaining:
+            raise RuntimeError(f"Mate '{mate_name}' remains in the feature tree after deletion.")
+        _redraw_document(assy)
+        return {"deleted": mate_name}
+
+    return await _run(_impl)
+
+
+@mcp.tool()
 async def add_advanced_mate(
     mate_type: str,
     x1: float, y1: float, z1: float,
     x2: float, y2: float, z2: float,
     value: float = 0,
+    gear_ratio_numerator: float = 1.0,
+    gear_ratio_denominator: float = 1.0,
+    reverse: bool = False,
     unit: Optional[str] = None,
 ) -> dict:
     """Add an advanced mate between two entities selected by point.
@@ -5241,11 +5279,13 @@ async def add_advanced_mate(
     Goes beyond basic mates to include distance, angle, width, and symmetry
     constraints needed to precisely position parts on platforms and tanks.
 
-    mate_type: 'distance', 'angle', 'width', 'symmetric', 'lock', 'tangent',
+    mate_type: 'distance', 'angle', 'width', 'symmetric', 'lock', 'gear', 'tangent',
                'coincident', 'concentric', 'parallel', or 'perpendicular'.
     x1/y1/z1: a point on the first face/edge.
     x2/y2/z2: a point on the second face/edge.
-    value: distance (in current unit) for 'distance', or angle in degrees for 'angle'."""
+    value: distance (in current unit) for 'distance', or angle in degrees for 'angle'.
+    gear_ratio_numerator/gear_ratio_denominator: positive gear ratio for ``gear``.
+    reverse: reverse the driven direction for a gear mate."""
 
     def _impl():
         assy = _active_assembly()
@@ -5253,12 +5293,14 @@ async def add_advanced_mate(
         types = {
             "coincident": 0, "concentric": 1, "perpendicular": 2, "parallel": 3,
             "tangent": 4, "distance": 5, "angle": 6, "symmetric": 8,
-            "width": 11, "lock": 16,
+            "gear": 10, "width": 11, "lock": 16,
         }
         mate_key = mate_type.lower().strip()
         code = types.get(mate_key)
         if code is None:
             raise ValueError(f"Unknown mate_type '{mate_type}'. Use: {', '.join(types)}")
+        if mate_key == "gear" and (gear_ratio_numerator <= 0 or gear_ratio_denominator <= 0):
+            raise ValueError("Gear ratio numerator and denominator must be positive.")
 
         x1_m, y1_m, z1_m = to_meters(x1, unit), to_meters(y1, unit), to_meters(z1, unit)
         x2_m, y2_m, z2_m = to_meters(x2, unit), to_meters(y2, unit), to_meters(z2, unit)
@@ -5277,9 +5319,11 @@ async def add_advanced_mate(
 
         mate_err = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
         mate = assy.AddMate5(
-            code, 0, False,
+            code, 0, bool(reverse) if mate_key == "gear" else False,
             mate_value, mate_value, mate_value,
-            0.0, 0.0, 0.0, 0.0, 0.0,
+            float(gear_ratio_numerator) if mate_key == "gear" else 0.0,
+            float(gear_ratio_denominator) if mate_key == "gear" else 0.0,
+            0.0, 0.0, 0.0,
             False, False, 0, mate_err,
         )
 
@@ -5290,6 +5334,8 @@ async def add_advanced_mate(
             )
 
         return {"mate_type": mate_key, "value": value if code in (5, 6) else None,
+                "gear_ratio": [gear_ratio_numerator, gear_ratio_denominator] if mate_key == "gear" else None,
+                "reverse": bool(reverse) if mate_key == "gear" else None,
                 "error_code": mate_err.value, "unit": unit or _default_unit}
 
     return await _run(_impl)

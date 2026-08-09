@@ -39,6 +39,18 @@ Data: 08 de agosto de 2026
   básico e retornou o código COM indeterminado 0. Essas opções não foram
   expostas como suportadas até haver uma montagem de referência que permita uma
   validação reproduzível.
+- A validação foi retomada com os assemblies oficiais de `MechanicalMates` da
+  instalação 2025. No `spurgear.sldasm`, as entidades do mate existente foram
+  lidas, o mate foi removido e `add_advanced_mate("gear")` recriou um
+  `MateGearDim` com razão 2:1 e direção invertida; o código de sucesso foi 1 e
+  a árvore passou a listar o novo mate. Também foi adicionada `delete_mate`,
+  que confirma a remoção da feature antes de retornar sucesso.
+- O exemplo oficial `cam-follower.sldasm` confirmou as duas faces e a marca de
+  seleção 8 exigidas pelo `swMateCAMFOLLOWER`, mas a chamada `AddMate5` gerou
+  falha RPC e encerrou a instância do SolidWorks. O MCP reiniciou o aplicativo
+  e os cinco documentos salvos do usuário foram reabertos. Cam-follower,
+  screw e rack-and-pinion seguem propositalmente fora do catálogo até que o
+  caminho COM seja isolado sem risco de encerrar a sessão do usuário.
 
 ## Piston reference completion
 

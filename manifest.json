@@ -2,7 +2,7 @@
   "manifest_version": "0.2",
   "name": "solidworks-mcp",
   "display_name": "SolidWorks MCP",
-  "version": "5.0.0",
+  "version": "5.1.0",
   "description": "Servidor MCP para automacao do SolidWorks via API COM, escrito com o SDK oficial (FastMCP)",
   "long_description": "Controla o SolidWorks (criar pecas/montagens, esbocos, extrusao, corte, filete, chanfro, etc.) via COM, exposto como ferramentas MCP.",
   "author": {
@@ -103,7 +103,8 @@
     { "name": "insert_bom_table", "description": "Insert a Bill of Materials table into an assembly drawing." },
     { "name": "insert_cut_list_table", "description": "Insert a weldment cut list table (cut lengths of structural members)." },
     { "name": "create_exploded_view", "description": "Create an exploded (blown-apart) view of the active assembly." },
-    { "name": "add_advanced_mate", "description": "Add an advanced mate (distance, angle, width, symmetric, lock) between entities." },
+    { "name": "delete_mate", "description": "Delete a named assembly mate and verify its removal from the feature tree." },
+    { "name": "add_advanced_mate", "description": "Add a validated advanced mate, including distance, angle, width, symmetric, lock, or mechanical gear ratio." },
     { "name": "interference_check", "description": "Check the active assembly for overlapping/interfering components." },
     { "name": "create_assembly_pattern", "description": "Pattern a component in the assembly (linear or circular)." },
     { "name": "set_material", "description": "Assign a material to the active part (drives mass and BOM)." },
