@@ -19,8 +19,29 @@ Data: 08 de agosto de 2026
 ## Three-blade pedestal-fan propeller
 
 - Added and live-tested `create_pedestal_fan_propeller` in SolidWorks 2025.
+- Refined the rotor into three equal, broad rounded-tip fan blades. Each blade
+  is an exact 120-degree copy of a single pitched seed body, so the rotor is
+  geometrically balanced about its shaft axis instead of relying on separate,
+  hand-positioned blade geometry.
+- Live validation exposed and fixed two implementation defects before release:
+  an arc/line contour that SolidWorks did not regard as closed, and an unsafe
+  assumption about `GetBodies2` ordering that named the hub instead of the
+  newly extruded blade. The final generator uses a closed segmented rounded
+  outline and identifies the blade by its radial extent before transforming it.
+- The live body inspection verified the final transform contract: the public
+  MCP accepts degrees and converts them to the radians required by
+  `InsertMoveCopyBody2`. Numeric global-axis rotation must be used without a
+  separately selected reference axis; selecting one switches the API to a
+  different reference-transform mode. The generator pitches one seed body and
+  creates two 120-degree increments about the Top-plane normal (global Y),
+  avoiding transforms that target an already generated copy.
 - The generated SLDPRT contains exactly four solid bodies: one hub and three
   swept blades spaced 120 degrees apart, each carrying the same 22-degree pitch.
+- Final live validation file: `pedestal_fan_three_blade_balanced_012.SLDPRT`.
+  Its measured centre of mass was X=-1.39e-17 m and Z=-1.89e-17 m, confirming
+  it lies on the Y shaft axis; the 0.02334 m Y value is axial position, not
+  radial imbalance. Front, back, top, bottom, and isometric views were exported
+  and visually reviewed.
 - Front, back, top, bottom, and isometric images were exported; the hub was
   finished in chrome-gray and includes a through shaft bore.
 

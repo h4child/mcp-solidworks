@@ -3745,8 +3745,10 @@ async def move_copy_body(
     """Move or copy a solid body by translation and/or rotation.
 
     Translates the body by (dx, dy, dz) and rotates it by (rx, ry, rz) degrees
-    about its origin. If copy=True, keeps the original and creates copies;
-    if False, just moves the original.
+    about its origin. A rotation references the matching global X, Y, or Z
+    axis in SolidWorks, rather than depending on the selected body's local
+    orientation. If copy=True, keeps the original and creates copies; if False,
+    just moves the original.
 
     body_name: name of the solid body to move/copy.
     dx/dy/dz: translation along each axis.
@@ -3758,7 +3760,16 @@ async def move_copy_body(
         if copy and num_copies < 1:
             raise ValueError(f"num_copies must be >= 1, got {num_copies}.")
 
+        rotations = {"x": rx, "y": ry, "z": rz}
+        requested_axes = [axis for axis, angle in rotations.items() if abs(angle) > 1e-9]
+        if len(requested_axes) > 1:
+            raise ValueError(
+                "Move/copy body supports one rotation axis per call. "
+                "Apply separate calls for X, Y, and Z rotations."
+            )
+
         doc = _active_doc()
+        rotation_axis = requested_axes[0] if requested_axes else None
         doc.ClearSelection2(True)
 
         empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
@@ -3768,9 +3779,8 @@ async def move_copy_body(
         dx_m = to_meters(dx, unit)
         dy_m = to_meters(dy, unit)
         dz_m = to_meters(dz, unit)
-        rx_r = math.radians(rx)
-        ry_r = math.radians(ry)
-        rz_r = math.radians(rz)
+        # The public tool accepts degrees; InsertMoveCopyBody2 consumes its
+        # numeric global-axis rotation values in radians.
 
         n = num_copies if copy else 1
 
@@ -3781,7 +3791,7 @@ async def move_copy_body(
             dx_m, dy_m, dz_m,
             0.0,             # TransDist
             0.0, 0.0, 0.0,   # rotation origin
-            rx_r, ry_r, rz_r,
+            math.radians(rx), math.radians(ry), math.radians(rz),
             copy,
             n,
         )
@@ -3795,6 +3805,7 @@ async def move_copy_body(
             "body": body_name,
             "translation": [dx, dy, dz],
             "rotation_deg": [rx, ry, rz],
+            "rotation_axis": rotation_axis,
             "copied": copy,
             "copies": n if copy else 0,
             "unit": unit or _default_unit,
@@ -6116,10 +6127,12 @@ async def create_pedestal_fan_propeller(
 ) -> dict:
     """Create a three-blade pedestal-fan propeller with aerodynamic pitch.
 
-    The three swept blades are spaced exactly 120 degrees around the hub.  The
-    seed blade is tilted by ``pitch_angle`` about its radial root axis before
-    being copied, giving all blades a common air-moving pitch rather than a
-    flat decorative profile. Dimensions use ``unit`` (mm by default).
+    The three broad, rounded-tip blades are copies of one seed body at exactly
+    120-degree intervals around the hub. This makes their geometry, volume,
+    and radial mass distribution identical. The seed is tilted by
+    ``pitch_angle`` about its radial root axis before copying, giving all
+    blades a common air-moving pitch rather than a flat decorative profile.
+    Dimensions use ``unit`` (mm by default).
     """
 
     if min(blade_radius, hub_radius, hub_depth, blade_thickness) <= 0:
@@ -6132,13 +6145,31 @@ async def create_pedestal_fan_propeller(
     completed: list[str] = []
     stage = "initialization"
 
-    async def _name_last_solid_body(name: str) -> str:
+    async def _name_outermost_solid_body(name: str) -> str:
         def _impl():
             doc = _active_doc()
             bodies = doc.GetBodies2(0, False) or ()  # 0 = swSolidBody
             if not bodies:
                 raise RuntimeError("No solid body was available to name.")
-            body = win32com.client.Dispatch(bodies[-1])
+            # GetBodies2 has no creation-order guarantee. After the hub and
+            # the separate blade are extruded, the fan blade is the body with
+            # the greatest in-plane distance from the shaft axis; naming the
+            # final item in this COM array can accidentally select the hub.
+            def _radial_extent(raw_body) -> float:
+                box = win32com.client.Dispatch(raw_body).GetBodyBox()
+                if not box:
+                    return -1.0
+                return max(
+                    math.hypot(x, y)
+                    for x in (box[0], box[3])
+                    for y in (box[1], box[4])
+                )
+
+            body = win32com.client.Dispatch(max(bodies, key=_radial_extent))
+            if _radial_extent(body) <= to_meters(hub_radius * 1.1, unit):
+                raise RuntimeError(
+                    "Could not identify the new fan blade outside the hub radius."
+                )
             body.Name = name
             return name
 
@@ -6160,33 +6191,55 @@ async def create_pedestal_fan_propeller(
         await extrude_sketch(hub_depth, both_directions=True, unit=unit)
         completed.append(stage)
 
-        # Swept asymmetric planform: broad toward the tip and biased toward the
-        # trailing edge. The root overlaps the hub, preserving a robust mount.
-        stage = "pitched seed blade"
-        root_inner = hub_radius * 0.62
-        root_outer = hub_radius * 0.96
-        root_half_chord = hub_radius * 0.34
-        tip_leading = blade_radius * 0.08
-        tip_trailing = blade_radius * 0.31
-        blade_points = [
-            (root_inner, -root_half_chord),
-            (root_outer, root_half_chord),
-            (blade_radius, tip_trailing),
-            (blade_radius * 0.91, tip_leading),
+        # A pedestal-fan blade is a broad, tapered airfoil-like paddle, not a
+        # narrow propeller wedge.  The root arc stays inside the hub for a
+        # strong visual mount; the large rounded outer arc produces the soft
+        # blade tip seen on real household-fan rotors.
+        #
+        # The outer tip is approximated with short, equal line segments. This
+        # gives the visual rounded profile of a fan blade while avoiding the
+        # fragile open-contour condition that can occur when COM creates a
+        # mixed line-and-arc profile. Copies of this one solid body guarantee
+        # identical blade volume and mass distribution.
+        stage = "balanced rounded pitched seed blade"
+        root_center_x = hub_radius * 0.58
+        root_center_y = hub_radius * 0.05
+        root_radius = hub_radius * 0.46
+        root_leading_angle = 265
+        root_trailing_angle = 95
+        tip_radius = blade_radius * 0.24
+        tip_center_x = blade_radius - tip_radius
+        tip_angle = 58
+
+        def _point_on_arc(cx: float, cy: float, radius: float, angle: float) -> tuple[float, float]:
+            radians = math.radians(angle)
+            return (
+                cx + radius * math.cos(radians),
+                cy + radius * math.sin(radians),
+            )
+
+        root_leading = _point_on_arc(root_center_x, root_center_y, root_radius, root_leading_angle)
+        root_trailing = _point_on_arc(root_center_x, root_center_y, root_radius, root_trailing_angle)
+        tip_profile = [
+            _point_on_arc(tip_center_x, 0, tip_radius, angle)
+            for angle in (-tip_angle, -tip_angle / 2, 0, tip_angle / 2, tip_angle)
         ]
+        root_inner = _point_on_arc(root_center_x, root_center_y, root_radius, 180)
+        blade_points = [root_leading, *tip_profile, root_trailing, root_inner]
         await create_sketch("top")
         for index, start in enumerate(blade_points):
             end = blade_points[(index + 1) % len(blade_points)]
-            await draw_line(start[0], start[1], end[0], end[1], unit)
+            await draw_line(*start, *end, unit=unit)
         await close_sketch()
         await extrude_sketch(blade_thickness, both_directions=True, merge=False, unit=unit)
-        await _name_last_solid_body("FanBladeSeed")
+        await _name_outermost_solid_body("FanBladeSeed")
 
-        # The seed starts radially along X; rotating around X gives it pitch.
-        # Copies preserve that pitched geometry and only change its azimuth.
+        # The Top sketch plane is normal to the model Y axis, so Y is the
+        # physical hub/shaft axis. Pitch the seed about its radial X direction,
+        # then create two equal 120-degree increments about Y. This rotates the
+        # complete pitched blade geometry into the remaining radial positions.
         await move_copy_body("FanBladeSeed", rx=pitch_angle, unit=unit)
-        await move_copy_body("FanBladeSeed", rz=120, copy=True, unit=unit)
-        await move_copy_body("FanBladeSeed", rz=240, copy=True, unit=unit)
+        await move_copy_body("FanBladeSeed", ry=120, copy=True, num_copies=2, unit=unit)
         completed.append(stage)
 
         stage = "shaft bore"
@@ -6197,6 +6250,23 @@ async def create_pedestal_fan_propeller(
         completed.append(stage)
 
         stage = "appearance and view"
+
+        def _hide_pattern_reference_axes():
+            doc = _active_doc()
+            doc.ClearSelection2(True)
+            selected = 0
+            feature = doc.FirstFeature
+            while feature is not None:
+                if feature.GetTypeName2 == "RefAxis":
+                    feature.Select2(True, 0)
+                    selected += 1
+                feature = feature.GetNextFeature
+            if selected:
+                doc.BlankRefGeom()
+            doc.ClearSelection2(True)
+            return selected
+
+        await _run(_hide_pattern_reference_axes)
         await apply_metal_finish("chrome", "body")
         await set_view("isometric")
         await zoom_to_fit()
@@ -6212,7 +6282,16 @@ async def create_pedestal_fan_propeller(
             "blade_count": 3,
             "aerodynamic_pitch_degrees": pitch_angle,
             "blade_spacing_degrees": [0, 120, 240],
-            "features": ["central hub", "shaft bore", "three swept pitched blades"],
+            "rotational_balance": {
+                "method": "one seed blade copied by 120 and 240 degrees",
+                "mass_distribution": "three identical blades at equal radius",
+                "balance_axis": "hub/shaft axis",
+            },
+            "features": [
+                "central hub",
+                "shaft bore",
+                "three identical rounded-tip pitched fan blades",
+            ],
             "completed_stages": completed,
         }
     except Exception as exc:
