@@ -14,7 +14,10 @@ import io
 import math
 import time
 import atexit
+import base64
 import asyncio
+import shutil
+import zipfile
 import builtins
 import logging
 import functools
@@ -6796,6 +6799,617 @@ async def measure_body() -> dict:
 # ===========================================================================
 # Utility tools
 # ===========================================================================
+
+@mcp.tool()
+async def rebuild_model(force: bool = True, top_only: bool = False) -> dict:
+    """Rebuild the active document and report whether SolidWorks accepted it.
+
+    Use this before saving, exporting, or measuring a model after feature,
+    equation, or configuration edits. ``force`` rebuilds all features; setting
+    it to false performs the lighter normal rebuild.
+    """
+
+    def _impl():
+        doc = _active_doc()
+        if force:
+            result = doc.ForceRebuild3(bool(top_only))
+        else:
+            result = doc.EditRebuild3
+            if callable(result):
+                result = result()
+        try:
+            doc.FeatureManager.UpdateFeatureTree()
+        except Exception:
+            pass
+        _redraw_document(doc)
+        return {"force": force, "top_only": top_only, "rebuilt": bool(result)}
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def validate_model() -> dict:
+    """Rebuild and inspect the feature tree for SolidWorks errors and warnings.
+
+    This is a production gate: it returns ``valid: false`` when a feature has a
+    non-zero ``IFeature.GetErrorCode2`` result after rebuilding.
+    """
+
+    def _impl():
+        doc = _active_doc()
+        rebuild_result = doc.ForceRebuild3(False)
+        issues = []
+        raw_features = doc.FeatureManager.GetFeatures(False) or ()
+        for raw_feature in raw_features:
+            feature = win32com.client.Dispatch(raw_feature)
+            warning = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_BOOL, False)
+            try:
+                result = feature.GetErrorCode2(warning)
+                code, outputs = _split_com_result(result)
+                if outputs:
+                    is_warning = bool(outputs[0])
+                else:
+                    is_warning = bool(warning.value)
+                code = int(code)
+                if code != 0:
+                    issues.append({
+                        "feature": feature.Name,
+                        "feature_type": feature.GetTypeName2,
+                        "error_code": code,
+                        "severity": "warning" if is_warning else "error",
+                    })
+            except Exception as exc:
+                issues.append({
+                    "feature": getattr(feature, "Name", "(unknown)"),
+                    "feature_type": "(unavailable)",
+                    "error_code": None,
+                    "severity": "inspection_error",
+                    "message": str(exc),
+                })
+        errors = [issue for issue in issues if issue["severity"] == "error"]
+        return {
+            "rebuilt": bool(rebuild_result),
+            "feature_count": len(raw_features),
+            "valid": not errors,
+            "error_count": len(errors),
+            "warning_count": len(issues) - len(errors),
+            "issues": issues,
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def get_document_dependencies(
+    traverse_all: bool = True,
+    search_paths: bool = True,
+    include_read_only: bool = True,
+    include_broken: bool = True,
+) -> dict:
+    """List referenced models and identify broken/read-only document links."""
+
+    def _impl():
+        doc = _active_doc()
+        # GetDependencies is the current API, but this installation's dynamic
+        # COM proxy raises a server exception for a saved part with no links.
+        # GetDependencies2 returns the same dependency rows for that case and
+        # is retained as a compatibility fallback.
+        try:
+            raw = doc.Extension.GetDependencies(
+                bool(traverse_all), bool(search_paths), bool(include_read_only),
+                bool(include_broken), True,
+            )
+        except Exception as extension_error:
+            try:
+                raw = doc.GetDependencies2(
+                    bool(traverse_all), bool(search_paths), bool(include_read_only),
+                )
+            except Exception as fallback_error:
+                raise RuntimeError(
+                    "SolidWorks could not inspect document dependencies through either API path: "
+                    f"{fallback_error}"
+                ) from extension_error
+        values = list(raw or ())
+        stride = 3 if include_read_only else 2
+        dependencies = []
+        for index in range(0, len(values), stride):
+            if index + 1 >= len(values):
+                break
+            path = str(values[index + 1])
+            dependencies.append({
+                "name": str(values[index]),
+                "path": path,
+                "read_only": str(values[index + 2]).lower() == "true" if include_read_only and index + 2 < len(values) else None,
+                "exists": os.path.exists(path.split("|")[0]),
+            })
+        broken = [item for item in dependencies if not item["exists"]]
+        return {"count": len(dependencies), "broken_count": len(broken), "dependencies": dependencies}
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def get_persistent_reference(
+    entity_type: str,
+    x: float, y: float, z: float,
+    unit: Optional[str] = None,
+) -> dict:
+    """Create a portable base64 persistent ID for a model face, edge, or vertex.
+
+    Unlike coordinate-only selection, this ID can be resolved after a rebuild
+    when the referenced entity remains topologically valid.
+    """
+
+    def _impl():
+        supported = {"face": "FACE", "edge": "EDGE", "vertex": "VERTEX"}
+        key = entity_type.strip().lower()
+        if key not in supported:
+            raise ValueError("entity_type must be face, edge, or vertex.")
+        doc = _active_doc()
+        doc.ClearSelection2(True)
+        empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+        if not doc.Extension.SelectByID2(
+            "", supported[key], to_meters(x, unit), to_meters(y, unit), to_meters(z, unit),
+            False, 0, empty, 0,
+        ):
+            raise RuntimeError(f"No {key} found at ({x}, {y}, {z}) {unit or _default_unit}.")
+        entity = doc.SelectionManager.GetSelectedObject6(1, -1)
+        raw_id = doc.Extension.GetPersistReference3(entity)
+        if not raw_id:
+            raise RuntimeError("SolidWorks could not create a persistent reference for the selected entity.")
+        try:
+            binary = bytes(raw_id)
+        except TypeError:
+            binary = bytes(list(raw_id))
+        doc.ClearSelection2(True)
+        return {
+            "entity_type": key,
+            "reference": base64.b64encode(binary).decode("ascii"),
+            "byte_length": len(binary),
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def resolve_persistent_reference(reference: str, select: bool = True) -> dict:
+    """Resolve a base64 persistent ID and optionally select its current entity."""
+
+    def _impl():
+        try:
+            binary = base64.b64decode(reference.encode("ascii"), validate=True)
+        except Exception as exc:
+            raise ValueError("reference must be a valid base64 persistent ID.") from exc
+        doc = _active_doc()
+        data = win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_UI1, list(binary))
+        status = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+        result = doc.Extension.GetObjectByPersistReference3(data, status)
+        entity, outputs = _split_com_result(result)
+        status_code = int(outputs[0]) if outputs else int(status.value)
+        if entity is None:
+            return {"resolved": False, "status_code": status_code, "selected": False}
+        selected = False
+        if select:
+            doc.ClearSelection2(True)
+            try:
+                # Select2 accepts the resolved entity directly. The other
+                # selection overloads require an ISelectData dispatch object
+                # and reject None in this Python COM host.
+                entity.Select2(False, 0)
+                count = doc.SelectionManager.GetSelectedObjectCount2(-1)
+                selected = int(count) > 0
+            except Exception:
+                try:
+                    selection_data = doc.SelectionManager.CreateSelectData
+                    entity.Select4(False, selection_data)
+                    count = doc.SelectionManager.GetSelectedObjectCount2(-1)
+                    selected = int(count) > 0
+                except Exception:
+                    selected = False
+        return {"resolved": True, "status_code": status_code, "selected": selected}
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def list_configurations() -> dict:
+    """List all configurations, their descriptions, and the active configuration."""
+
+    def _impl():
+        doc = _active_doc()
+        names_member = doc.GetConfigurationNames
+        names = list(names_member() if callable(names_member) else names_member or ())
+        active = doc.ConfigurationManager.ActiveConfiguration
+        active_name = active.Name() if callable(getattr(active, "Name", None)) else active.Name
+        configurations = []
+        for name in names:
+            cfg = doc.GetConfigurationByName(name)
+            comment = ""
+            try:
+                comment = cfg.Comment() if callable(getattr(cfg, "Comment", None)) else cfg.Comment
+            except Exception:
+                pass
+            configurations.append({"name": name, "comment": comment, "active": name == active_name})
+        return {"count": len(configurations), "active_configuration": active_name, "configurations": configurations}
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def delete_configuration(name: str) -> dict:
+    """Delete a non-active configuration from the active model."""
+
+    def _impl():
+        doc = _active_doc()
+        active = doc.ConfigurationManager.ActiveConfiguration
+        active_name = active.Name() if callable(getattr(active, "Name", None)) else active.Name
+        if name.lower() == active_name.lower():
+            raise RuntimeError("Cannot delete the active configuration. Switch configuration first.")
+        names_member = doc.GetConfigurationNames
+        names = list(names_member() if callable(names_member) else names_member or ())
+        target = next((item for item in names if item.lower() == name.lower()), None)
+        if target is None:
+            raise ValueError(f"Configuration '{name}' does not exist.")
+        deleted = doc.DeleteConfiguration2(target)
+        if not deleted:
+            raise RuntimeError(f"SolidWorks could not delete configuration '{target}'.")
+        return {"deleted": target, "active_configuration": active_name}
+
+    return await _run(_impl)
+
+
+def _equation_manager(doc):
+    # Dynamic pywin32 exposes the manager as a callable dispatch object; calling
+    # it invokes a non-existent default member. The property itself is the API
+    # object in both typed and dynamic hosts.
+    return doc.GetEquationMgr
+
+
+def _evaluate_equations(manager):
+    """Invoke EvaluateAll across typed and dynamic SolidWorks proxies."""
+    result = manager.EvaluateAll
+    return result() if callable(result) else result
+
+
+@mcp.tool()
+async def list_equations() -> dict:
+    """List equations and global variables in the active document."""
+
+    def _impl():
+        manager = _equation_manager(_active_doc())
+        count_member = manager.GetCount
+        count = int(count_member() if callable(count_member) else count_member)
+        items = []
+        for index in range(count):
+            equation = manager.Equation(index)
+            global_variable = manager.GlobalVariable(index)
+            disabled = manager.Disabled(index)
+            value = manager.Value(index)
+            items.append({"index": index, "equation": equation, "value": value,
+                          "global_variable": bool(global_variable), "disabled": bool(disabled)})
+        return {"count": count, "equations": items}
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def add_equation(equation: str, solve: bool = True) -> dict:
+    """Add an equation or global variable, e.g. ``\"Length\" = 25mm``."""
+
+    def _impl():
+        manager = _equation_manager(_active_doc())
+        index = int(manager.Add2(-1, equation, bool(solve)))
+        if index < 0:
+            raise RuntimeError(f"SolidWorks rejected equation: {equation}")
+        if not solve:
+            _evaluate_equations(manager)
+        return {"index": index, "equation": manager.Equation(index), "solved": solve}
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def set_equation(index: int, equation: str, solve: bool = True) -> dict:
+    """Replace an equation by index and optionally evaluate it immediately."""
+
+    def _impl():
+        manager = _equation_manager(_active_doc())
+        count_member = manager.GetCount
+        count = int(count_member() if callable(count_member) else count_member)
+        if not 0 <= index < count:
+            raise ValueError(f"index must be between 0 and {count - 1}.")
+        manager.Equation(index, equation)
+        evaluation_result = None
+        if solve:
+            evaluation_result = _evaluate_equations(manager)
+        stored_equation = manager.Equation(index)
+        if stored_equation != equation:
+            raise RuntimeError(f"SolidWorks did not retain equation at index {index}.")
+        return {"index": index, "equation": stored_equation, "value": manager.Value(index),
+                "solved": solve, "evaluation_result": evaluation_result}
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def delete_equation(index: int) -> dict:
+    """Delete an equation or global variable by zero-based index."""
+
+    def _impl():
+        manager = _equation_manager(_active_doc())
+        count_member = manager.GetCount
+        count = int(count_member() if callable(count_member) else count_member)
+        if not 0 <= index < count:
+            raise ValueError(f"index must be between 0 and {count - 1}.")
+        removed = manager.Equation(index)
+        # Dynamic dispatch reports a false/empty return for Delete even though
+        # the mutation succeeds. Verify through the post-operation count.
+        manager.Delete(index)
+        after_member = manager.GetCount
+        after_count = int(after_member() if callable(after_member) else after_member)
+        if after_count != count - 1:
+            raise RuntimeError(f"SolidWorks could not delete equation at index {index}.")
+        return {"deleted_index": index, "equation": removed}
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def export_flat_pattern_dxf(
+    filepath: str,
+    include_hidden_edges: bool = False,
+    include_bend_lines: bool = True,
+    include_sketches: bool = False,
+    include_bounding_box: bool = False,
+) -> dict:
+    """Export a sheet-metal flat pattern to DXF/DWG using ``IPartDoc.ExportToDWG2``."""
+
+    def _impl():
+        doc = _active_doc()
+        if _doc_type(doc) != 1:
+            raise RuntimeError("Flat-pattern DXF export requires an active part document.")
+        abs_path = os.path.abspath(filepath)
+        if os.path.splitext(abs_path)[1].lower() not in {".dxf", ".dwg"}:
+            raise ValueError("filepath must end in .dxf or .dwg.")
+        os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
+        options = 1
+        if include_hidden_edges:
+            options |= 2
+        if include_bend_lines:
+            options |= 4
+        if include_sketches:
+            options |= 8
+        if include_bounding_box:
+            options |= 2048
+        alignment = win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, [0.0] * 12)
+        ok = bool(doc.ExportToDWG2(abs_path, _doc_path(doc), 1, True, alignment, False, False, options, None))
+        if not ok or not os.path.exists(abs_path):
+            raise RuntimeError("SolidWorks could not export the sheet-metal flat pattern.")
+        return {"path": abs_path, "options": {"hidden_edges": include_hidden_edges,
+                "bend_lines": include_bend_lines, "sketches": include_sketches,
+                "bounding_box": include_bounding_box}}
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def pack_and_go(
+    destination: str,
+    include_drawings: bool = True,
+    include_suppressed: bool = True,
+    include_toolbox_components: bool = False,
+    flatten_to_single_folder: bool = True,
+    prefix: str = "",
+    suffix: str = "",
+) -> dict:
+    """Create a portable Pack and Go copy of the active saved SolidWorks document.
+
+    ``destination`` is a folder, or a ``.zip`` file.  Pack and Go copies the
+    model and every discovered reference without altering the active document.
+    The result is deliberately written only to a caller-selected location, so
+    automated jobs cannot overwrite the source design by accident.
+    """
+
+    def _impl():
+        doc = _active_doc()
+        source_path = _doc_path(doc)
+        if not source_path or not os.path.isfile(source_path):
+            raise RuntimeError("Save the active document before running Pack and Go.")
+        destination_path = os.path.abspath(destination)
+        is_zip = destination_path.lower().endswith(".zip")
+        if is_zip:
+            os.makedirs(os.path.dirname(destination_path) or ".", exist_ok=True)
+        else:
+            os.makedirs(destination_path, exist_ok=True)
+
+        native_error = None
+        try:
+            package = doc.Extension.GetPackAndGo()
+            if package is None:
+                raise RuntimeError("SolidWorks could not initialize a Pack and Go session.")
+            package.IncludeDrawings = bool(include_drawings)
+            package.IncludeSuppressed = bool(include_suppressed)
+            package.IncludeToolboxComponents = bool(include_toolbox_components)
+            package.FlattenToSingleFolder = bool(flatten_to_single_folder)
+            if prefix:
+                package.AddPrefix = str(prefix)
+            if suffix:
+                package.AddSuffix = str(suffix)
+
+            source_count = int(package.GetDocumentNamesCount())
+            if source_count < 1:
+                raise RuntimeError("Pack and Go did not find the active document to copy.")
+            if not bool(package.SetSaveToName2(True, destination_path)):
+                raise RuntimeError("SolidWorks rejected the Pack and Go destination.")
+            statuses = list(doc.Extension.SavePackAndGo(package) or ())
+            failures = [int(status) for status in statuses if int(status) != 0]
+            if failures:
+                raise RuntimeError(f"Pack and Go reported save status codes: {failures}.")
+            created = os.path.isfile(destination_path) if is_zip else any(os.scandir(destination_path))
+            if not created:
+                raise RuntimeError("Pack and Go returned success but did not create output files.")
+            return {
+                "destination": destination_path,
+                "format": "zip" if is_zip else "folder",
+                "source_document_count": source_count,
+                "status_codes": [int(status) for status in statuses],
+                "backend": "solidworks_pack_and_go",
+            }
+        except Exception as exc:
+            # Some dynamic pywin32 builds cannot marshal GetPackAndGo's
+            # interface return value ("Parameter not optional") even though
+            # it succeeds from VBA/.NET. Do not abandon portability in that
+            # environment: create a deterministic package from the resolved
+            # dependency graph and explicitly disclose the backend used.
+            native_error = str(exc)
+
+        try:
+            raw_dependencies = list(doc.GetDependencies2(True, True, True) or ())
+        except Exception:
+            raw_dependencies = []
+        dependency_paths = [source_path]
+        for index in range(1, len(raw_dependencies), 3):
+            candidate = str(raw_dependencies[index]).split("|")[0]
+            if candidate and os.path.isfile(candidate):
+                dependency_paths.append(candidate)
+        dependency_paths = list(dict.fromkeys(dependency_paths))
+
+        staging_dir = destination_path if not is_zip else os.path.join(
+            os.path.dirname(destination_path) or ".",
+            f".{os.path.splitext(os.path.basename(destination_path))[0]}_staging",
+        )
+        os.makedirs(staging_dir, exist_ok=True)
+        copied = []
+        for original in dependency_paths:
+            filename = os.path.basename(original)
+            target_name = f"{prefix}{os.path.splitext(filename)[0]}{suffix}{os.path.splitext(filename)[1]}"
+            relative_target = target_name if flatten_to_single_folder else os.path.join("models", target_name)
+            target = os.path.join(staging_dir, relative_target)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copy2(original, target)
+            copied.append(relative_target)
+        if is_zip:
+            with zipfile.ZipFile(destination_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for relative_target in copied:
+                    archive.write(os.path.join(staging_dir, relative_target), relative_target)
+            shutil.rmtree(staging_dir, ignore_errors=True)
+        if not copied or (is_zip and not os.path.isfile(destination_path)):
+            raise RuntimeError("The managed packaging fallback did not create output files.")
+        return {
+            "destination": destination_path,
+            "format": "zip" if is_zip else "folder",
+            "source_document_count": len(dependency_paths),
+            "copied_files": copied,
+            "backend": "managed_dependency_fallback",
+            "native_pack_and_go_error": native_error,
+        }
+
+    return await _run(_impl)
+
+
+def _configuration_by_name(doc, name: str):
+    """Return a named configuration, or the active configuration for an empty name."""
+    if not name.strip():
+        return doc.ConfigurationManager.ActiveConfiguration
+    configuration = doc.GetConfigurationByName(name)
+    if configuration is None:
+        raise ValueError(f"Configuration '{name}' does not exist.")
+    return configuration
+
+
+@mcp.tool()
+async def list_display_states(configuration: str = "") -> dict:
+    """List display states for a configuration (or the active configuration)."""
+
+    def _impl():
+        doc = _active_doc()
+        cfg = _configuration_by_name(doc, configuration)
+        states = getattr(cfg, "GetDisplayStates", ())
+        states = states() if callable(states) else states
+        return {"configuration": str(cfg.Name), "count": len(states or ()), "display_states": list(states or ())}
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def create_display_state(name: str, configuration: str = "", activate: bool = False) -> dict:
+    """Create a named display state, optionally applying it immediately."""
+
+    def _impl():
+        display_name = name.strip()
+        if not display_name:
+            raise ValueError("Display-state name cannot be empty.")
+        doc = _active_doc()
+        cfg = _configuration_by_name(doc, configuration)
+        states = getattr(cfg, "GetDisplayStates", ())
+        states = states() if callable(states) else states
+        if display_name.casefold() in {str(value).casefold() for value in (states or ())}:
+            raise ValueError(f"Display state '{display_name}' already exists.")
+        if not bool(cfg.CreateDisplayState(display_name)):
+            raise RuntimeError(f"SolidWorks failed to create display state '{display_name}'.")
+        applied = bool(cfg.ApplyDisplayState(display_name)) if activate else False
+        _redraw_document(doc)
+        return {"configuration": str(cfg.Name), "display_state": display_name, "active": applied}
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def apply_display_state(name: str, configuration: str = "") -> dict:
+    """Apply an existing display state in the requested configuration."""
+
+    def _impl():
+        display_name = name.strip()
+        doc = _active_doc()
+        cfg = _configuration_by_name(doc, configuration)
+        states = getattr(cfg, "GetDisplayStates", ())
+        states = states() if callable(states) else states
+        if display_name.casefold() not in {str(value).casefold() for value in (states or ())}:
+            raise ValueError(f"Display state '{display_name}' does not exist in '{cfg.Name}'.")
+        if not bool(cfg.ApplyDisplayState(display_name)):
+            raise RuntimeError(f"SolidWorks failed to apply display state '{display_name}'.")
+        _redraw_document(doc)
+        return {"configuration": str(cfg.Name), "display_state": display_name, "applied": True}
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def rename_display_state(old_name: str, new_name: str, configuration: str = "") -> dict:
+    """Rename one display state without changing its appearance data."""
+
+    def _impl():
+        old_value, new_value = old_name.strip(), new_name.strip()
+        if not old_value or not new_value:
+            raise ValueError("Both display-state names are required.")
+        doc = _active_doc()
+        cfg = _configuration_by_name(doc, configuration)
+        if not bool(cfg.RenameDisplayState(old_value, new_value)):
+            raise RuntimeError(f"SolidWorks could not rename display state '{old_value}'.")
+        return {"configuration": str(cfg.Name), "old_name": old_value, "new_name": new_value}
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def delete_display_state(name: str, configuration: str = "") -> dict:
+    """Delete a display state after confirming it belongs to the configuration."""
+
+    def _impl():
+        display_name = name.strip()
+        doc = _active_doc()
+        cfg = _configuration_by_name(doc, configuration)
+        states = getattr(cfg, "GetDisplayStates", ())
+        states = states() if callable(states) else states
+        if display_name.casefold() not in {str(value).casefold() for value in (states or ())}:
+            raise ValueError(f"Display state '{display_name}' does not exist in '{cfg.Name}'.")
+        if not bool(cfg.DeleteDisplayState(display_name)):
+            raise RuntimeError(f"SolidWorks could not delete display state '{display_name}'.")
+        _redraw_document(doc)
+        return {"configuration": str(cfg.Name), "deleted": display_name}
+
+    return await _run(_impl)
+
 
 @mcp.tool()
 async def set_units(unit: str) -> dict:

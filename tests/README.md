@@ -4,6 +4,10 @@ Esta pasta contém uma suíte sem dependências extras para revisar o contrato d
 servidor e um executor de integração que cria somente arquivos de teste em
 `tests/output/` (diretório ignorado pelo Git).
 
+Os arquivos CAD, pacotes MCPB, logs e temporários que estavam soltos na raiz
+foram movidos para `tests/output/legacy/`, separados em `parts/`, `packages/`,
+`logs/` e `temporary/`. Eles continuam locais e ignorados pelo Git.
+
 ## Validação sem SolidWorks
 
 Execute em qualquer máquina com Python:
@@ -13,7 +17,7 @@ python -m unittest discover -s tests -p "test_*.py" -v
 python tests/run_live_test_project.py --dry-run
 ```
 
-Os testes estáticos verificam sintaxe, as 96 funções MCP, a equivalência entre
+Os testes estáticos verificam sintaxe, as 127 funções MCP, a equivalência entre
 `server.py` e `manifest.json`, documentação de versão, regras de `.gitignore`
 e padrões comuns de credenciais.
 

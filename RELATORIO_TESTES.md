@@ -2,6 +2,32 @@
 
 Data: 08 de agosto de 2026
 
+## Confiabilidade, fabricação e organização — 09 de agosto de 2026
+
+- A raiz do repositório foi limpa: entregáveis CAD locais, pacote MCPB, log e
+  arquivo temporário foram organizados em `tests/output/legacy/`. A regra
+  `tests/output/` já os excluía do Git e a exceção foi documentada de forma
+  explícita em `.gitignore`.
+- Foram incluídas ferramentas de rebuild/validação de recurso, dependências,
+  referências persistentes de face/aresta/vértice, equações, configurações,
+  exportação de padrão plano DXF/DWG, portabilidade de projeto e ciclo de vida
+  de display states. O catálogo passou de 109 para 127 ferramentas e o
+  manifesto, README e executor de integração foram sincronizados.
+- Teste real de confiabilidade: uma peça isolada foi reconstruída e validada
+  sem avisos ou erros de recurso; uma referência persistente de face foi criada
+  e resolvida; configuração e equação global foram criadas, avaliadas, alteradas
+  e removidas com verificação do valor final.
+- Teste real de chapa: uma base flange de 100 × 60 × 2 mm foi criada, salva,
+  aberta em padrão plano e exportada para DXF. A validação posterior retornou
+  31 recursos e zero erros/avisos.
+- Teste real de display states: criação, aplicação, renomeação e remoção foram
+  concluídas na peça de chapa, preservando somente o estado padrão ao final.
+- O Pack and Go nativo foi tentado. Nesta instalação a API COM retorna
+  `Parâmetro não opcional` ao marshalar `GetPackAndGo`, apesar da assinatura
+  oficial sem argumentos. A ferramenta captura essa limitação e usa um fallback
+  determinístico baseado em dependências: o ZIP de teste foi criado e verificado
+  contendo a peça fonte, e o retorno informa explicitamente o backend usado.
+
 ## Piston reference completion
 
 - Validated in SolidWorks 2025: `automotive_piston_completed_reference_002.SLDPRT`.

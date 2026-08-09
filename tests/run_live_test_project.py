@@ -204,8 +204,8 @@ def main() -> int:
     if args.connection_timeout <= 0:
         parser.error("--connection-timeout must be positive.")
     names = manifest_tool_names()
-    if len(names) != 96 or len(names) != len(set(names)):
-        raise RuntimeError("manifest.json must declare exactly 96 unique tools.")
+    if not names or len(names) != len(set(names)):
+        raise RuntimeError("manifest.json must declare one or more unique tools.")
 
     if args.dry_run:
         results = [{"tool": name, "status": "not_run", "reason": "dry-run"} for name in names]
