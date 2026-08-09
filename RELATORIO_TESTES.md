@@ -45,12 +45,12 @@ Data: 08 de agosto de 2026
   `MateGearDim` com razão 2:1 e direção invertida; o código de sucesso foi 1 e
   a árvore passou a listar o novo mate. Também foi adicionada `delete_mate`,
   que confirma a remoção da feature antes de retornar sucesso.
-- O exemplo oficial `cam-follower.sldasm` confirmou as duas faces e a marca de
-  seleção 8 exigidas pelo `swMateCAMFOLLOWER`, mas a chamada `AddMate5` gerou
-  falha RPC e encerrou a instância do SolidWorks. O MCP reiniciou o aplicativo
-  e os cinco documentos salvos do usuário foram reabertos. Cam-follower,
-  screw e rack-and-pinion seguem propositalmente fora do catálogo até que o
-  caminho COM seja isolado sem risco de encerrar a sessão do usuário.
+- A primeira tentativa no exemplo oficial `cam-follower.sldasm` confirmou as
+  duas faces e a marca de seleção 8 exigidas pelo `swMateCAMFOLLOWER`, mas o
+  uso incorreto de `AddMate5` gerou uma falha RPC. O cam-follower foi então
+  reimplementado e validado pelo fluxo específico documentado abaixo;
+  screw e rack-and-pinion continuam fora do catálogo até haver a mesma
+  validação reproduzível.
 - A causa foi corrigida após revisar o exemplo oficial: cam-follower não deve
   usar `AddMate5`. A ferramenta nova `add_cam_follower_mate` usa
   `CreateMateData(swMateCAMFOLLOWER)` e `CreateMate`, com marcas 1 (cam) e 8
