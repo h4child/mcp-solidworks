@@ -52,6 +52,7 @@
     { "name": "draw_circle", "description": "Draw a circle in the active sketch." },
     { "name": "draw_rectangle", "description": "Draw a rectangle in the active sketch." },
     { "name": "draw_arc", "description": "Draw an arc in the active sketch." },
+    { "name": "draw_spline", "description": "Draw a 2D B-spline through control points in the active sketch." },
     { "name": "draw_polygon", "description": "Draw a regular polygon in the active sketch." },
     { "name": "add_sketch_dimension", "description": "Add a driving dimension to sketch entities." },
     { "name": "add_sketch_relation", "description": "Add a geometric relation (constraint) between sketch entities." },

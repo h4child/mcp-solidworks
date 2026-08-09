@@ -231,3 +231,30 @@ piston part was reopened after the test.
   janelas do SolidWorks.
 - Artefatos de compilação MCPB e resultados locais permanecem ignorados pelo Git.
 - A validação estática não encontrou padrões comuns de credenciais no código-fonte.
+
+## Five engineering-reference replicas — SolidWorks 2025 live run
+
+Five original, editable parametric replicas were created one at a time in the
+already-open SolidWorks 2025 session. Each final part was saved below
+`tests/output/` (intentionally Git-ignored), measured through the API, and
+captured in front, back, top, bottom, and isometric views before the next part.
+
+| # | Public engineering reference | Deliverable | Comparison and result |
+|---|---|---|---|
+| 1 | [Flanged bronze bushing technical diagram](https://www.bronzelube.com/products/flanged-bronze-bushing/) | `reference_01_flanged_bushing_v2.SLDPRT` | Preserves the coaxial bore, sleeve, and radial flange. The first separate cut failed because its profile was not robustly attached; it was redrawn as closed annular profiles and passed. Final box: 80 x 40 x 80 mm. |
+| 2 | [Pillow block mounted-bearing drawing](https://www.lily-bearing.com/resources/blog/mounted-bearings-guide-flange-pillow-block-types) | `reference_02_pillow_block.SLDPRT` | Front/isometric comparison confirms mounting base, cylindrical housing, retaining collar, and through-bore. This original simplified replica intentionally omits catalogue-specific bolt slots and seals. Final box: 140 x 48 x 88 mm. |
+| 3 | [V-belt pulley technical drawing](https://3dplife.tistory.com/entry/V-%EB%B2%A8%ED%8A%B8-%ED%92%80%EB%A6%AC%EC%9D%98-%EA%B0%9C%EC%9A%94-%EB%B0%8F-%EC%B9%98%EC%88%98%EA%B7%9C%EA%B2%A9) | `reference_03_v_belt_pulley_v2.SLDPRT` | The first comparison showed no belt channel. It was redrawn with offset rim rings around the web, giving a visible peripheral channel, hub bore, and paired flanges. Final box: 140 x 36 x 140 mm. |
+| 4 | [Parker HMI clevis-bracket drawing](https://www.traceparts.com/en/product/parker-tie-rod-cylinders-hmi-series-clevis-bracket?CatalogPath=TRACEPARTS%3ATP06002008&PartNumber=143654&Product=32-02022011-085360) | `reference_04_clevis_lug.SLDPRT` | Preserves a mounting base, upright web, circular lug, and pin bore. A sketch with overlapping profiles was rejected; it was corrected into three merge-enabled extrusions. Final box: 110 x 101 x 18 mm. |
+| 5 | [Three-blade pedestal-fan replacement reference](https://www.mercadolivre.com.br/plastic-fan-replacement-part-3-leaves-standing-pedestal-fan/p/MLB2029493807) | `reference_05_three_blade_pedestal_fan.SLDPRT` | Top/isometric comparison confirms three broad rounded paddles and a central hub. One seed blade was pitched by 8 degrees and copied at exact 120-degree intervals for balanced mass distribution. Final envelope: 184.905 x 29.602 x 77.342 mm. |
+
+### New MCP capability validated during the run
+
+`draw_spline(points, natural_ends, unit)` was added, documented, and live-tested.
+The SolidWorks 2025 `CreateSpline3` call initially failed because Python dispatch
+sent `SAFEARRAY(VARIANT)` and XYZ triples to a 2D sketch. The tool now sends XY
+coordinates in `SAFEARRAY(double)` and an empty by-reference status VARIANT. The
+public MCP call successfully created a four-point spline in
+`mcp_draw_spline_contract.SLDPRT`.
+
+All five final replicas and the spline test remain ignored local artifacts; no
+SolidWorks output or MCP build artifact was added to source control.

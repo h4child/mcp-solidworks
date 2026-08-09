@@ -1409,6 +1409,54 @@ async def draw_arc(cx: float = 0, cy: float = 0, radius: float = 25,
 
 
 @mcp.tool()
+async def draw_spline(points: list[list[float]], natural_ends: bool = True,
+                      unit: Optional[str] = None) -> dict:
+    """Draw a 2D B-spline through two or more [x, y] control points.
+
+    Use splines for smooth aerodynamic outlines, ergonomic transitions, and
+    organic industrial-design profiles. The active sketch remains in control;
+    close it normally before creating a solid feature.
+    """
+
+    def _impl():
+        if len(points) < 2:
+            raise ValueError("points must contain at least two [x, y] coordinates.")
+        flattened: list[float] = []
+        for index, point in enumerate(points):
+            if not isinstance(point, (list, tuple)) or len(point) != 2:
+                raise ValueError(f"points[{index}] must be an [x, y] pair.")
+            x, y = point
+            # CreateSpline3 expects XY pairs for a 2D sketch. Supplying Z
+            # values shifts every following point and makes the profile fail.
+            flattened.extend((to_meters(float(x), unit), to_meters(float(y), unit)))
+
+        doc = _active_doc()
+        if doc.SketchManager.ActiveSketch is None:
+            raise RuntimeError("No sketch is active. Create a sketch before drawing a spline.")
+        # CreateSpline3 is the current API path for 2D and on-surface splines.
+        # For a 2D spline, surfaces and directions are omitted and the COM
+        # method receives one contiguous XY coordinate array.
+        # Status is an output object array for on-surface splines and is empty
+        # for 2D splines. Keep it as an empty by-reference VARIANT.
+        status = win32com.client.VARIANT(pythoncom.VT_VARIANT | pythoncom.VT_BYREF, None)
+        # Dynamic dispatch otherwise converts a Python tuple into SAFEARRAY of
+        # VARIANT. SolidWorks 2025 requires SAFEARRAY(double) for PointData.
+        point_data = win32com.client.VARIANT(
+            pythoncom.VT_ARRAY | pythoncom.VT_R8, flattened
+        )
+        spline = doc.SketchManager.CreateSpline3(point_data, None, None, natural_ends, status)
+        if spline is None:
+            raise RuntimeError("SolidWorks could not create the spline in the active sketch.")
+        return {
+            "point_count": len(points),
+            "natural_ends": natural_ends,
+            "unit": unit or _default_unit,
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool()
 async def draw_polygon(cx: float = 0, cy: float = 0, radius: float = 25, sides: int = 6, unit: Optional[str] = None) -> dict:
     """Draw a regular, circumscribed polygon in the active sketch."""
 
