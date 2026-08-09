@@ -13,6 +13,8 @@ Data: 08 de agosto de 2026
 - The fitted-joint revision places the wrist-pin center inside the lower skirt
   and returns the wrist-pin and crank-pin centers as a coordinate contract,
   allowing later MCP calls to preserve the same rod-to-piston fit.
+- The hollow-underside revision was verified through the bottom view: it
+  preserves the crown and skirt wall while exposing the internal rod/pin region.
 
 ## Acabamento metalico e correcao de encaixe
 

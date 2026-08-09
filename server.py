@@ -5977,6 +5977,18 @@ async def create_automotive_piston_with_connecting_rod(
         await extrude_sketch(piston_height, unit=unit)
         completed.append(stage)
 
+        # A real piston is open underneath: retain a controlled crown and
+        # skirt wall, then let the rod occupy the internal pin-boss region.
+        stage = "hollow piston underside"
+        await shell_body(
+            max(4.0, bore_diameter * 0.045),
+            remove_face_at_x=0,
+            remove_face_at_y=0,
+            remove_face_at_z=0,
+            unit=unit,
+        )
+        completed.append(stage)
+
         stage = "three ring grooves"
         for offset in ring_offsets:
             plane = await create_reference_plane("top", offset, unit=unit)
@@ -6069,7 +6081,8 @@ async def create_automotive_piston_with_connecting_rod(
             "model_type": "multibody automotive piston-and-rod reference",
             "features": [
                 "piston skirt", "three ring grooves", "two crown valve reliefs",
-                "separate wrist pin", "small-end and big-end bores", "narrow-web connecting rod",
+                "hollow underside", "separate wrist pin", "small-end and big-end bores",
+                "narrow-web connecting rod",
             ],
             "joint_centers": {
                 "wrist_pin": {"x": 0.0, "y": small_end_y, "z": 0.0},
