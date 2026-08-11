@@ -1,5 +1,8 @@
 __pycache__/
 *.pyc
+.claude/
+.gitignore
+.mcpbignore
 *.SLDPRT
 *.SLDASM
 *.SLDDRW

@@ -1,5 +1,5 @@
 {
-  "manifest_version": "0.2",
+  "manifest_version": "0.4",
   "name": "solidworks-mcp",
   "display_name": "SolidWorks MCP",
   "version": "5.5.0",
@@ -9,13 +9,24 @@
     "name": "SolidWorks MCP Contributors"
   },
   "server": {
-    "type": "python",
+    "type": "uv",
     "entry_point": "server.py",
     "mcp_config": {
-      "command": "python",
+      "command": "uv",
       "args": [
-        "${__dirname}/server.py"
+        "--directory",
+        "${__dirname}",
+        "run",
+        "server.py"
       ]
+    }
+  },
+  "compatibility": {
+    "platforms": [
+      "win32"
+    ],
+    "runtimes": {
+      "python": ">=3.10"
     }
   },
   "tools": [

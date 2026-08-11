@@ -3,25 +3,42 @@
 Servidor MCP em Python que controla o SolidWorks via COM (`win32com`), escrito
 com o SDK oficial (`mcp`, usando `FastMCP`). **138 ferramentas** (v5.5.0).
 
-## Instalacao
+## Para quem so quer usar
+
+Instale o `.mcpb` com dois cliques. O passo a passo completo, sem jargao, esta
+em [COMO_USAR.md](COMO_USAR.md).
+
+Requisitos: Windows, SolidWorks 2022+ instalado e licenciado, e Claude Desktop.
+
+## Para quem vai desenvolver
 
 ```bash
 pip install -r requirements.txt
+python -m unittest tests.test_contract
 ```
 
-## Configuracao no Claude Desktop / Claude Code
-
-Instale o `.mcpb` (duplo clique) ou adicione em `claude_desktop_config.json`:
+Configuracao manual em `claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "solidworks": {
       "command": "python",
-      "args": ["C:\\caminho\\para\\solidworks-mcp-novo\\server.py"]
+      "args": ["C:\\caminho\\para\\mcp-solidworks\\server.py"]
     }
   }
 }
+```
+
+## Gerar o pacote distribuivel
+
+O `manifest.json` declara `server.type: "uv"`, entao o Claude Desktop resolve
+Python e dependencias sozinho a partir do `pyproject.toml` -- necessario porque
+`pywin32` e `pydantic` sao extensoes compiladas e nao podem ser empacotadas de
+forma portatil.
+
+```bash
+npx mcpb pack . solidworks-mcp-5.5.0.mcpb
 ```
 
 Abra o SolidWorks (opcional -- o servidor consegue abrir sozinho) e peca para o
