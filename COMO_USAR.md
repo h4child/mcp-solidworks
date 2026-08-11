@@ -23,16 +23,9 @@ Você precisa de **três coisas**, todas obrigatórias:
 
 ---
 
-## Passo 1 — Instalar
+## Passo 1 — Preparar o computador (uma vez só)
 
-1. Dê **dois cliques** no arquivo `solidworks-mcp-5.5.0.mcpb`
-2. O Claude Desktop vai abrir sozinho e mostrar uma tela de instalação
-3. Clique em **Instalar**
-4. Pronto
-
-### Se aparecer a mensagem "incompatível"
-
-Isso acontece em alguns computadores. A solução leva um minuto:
+Este passo é **obrigatório**. Sem ele, o programa instala mas não funciona.
 
 1. Clique no menu Iniciar, digite `PowerShell` e abra
 2. Cole o comando abaixo e aperte Enter:
@@ -41,12 +34,30 @@ Isso acontece em alguns computadores. A solução leva um minuto:
 powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
-3. **Feche o Claude Desktop completamente** e abra de novo
-4. Tente instalar o arquivo outra vez
+3. Espere terminar (uns 30 segundos) e **feche o PowerShell**
+
+Isso instala uma ferramenta chamada `uv`, que cuida sozinha de tudo que o
+programa precisa por baixo dos panos. Você não vai precisar mexer nela nunca
+mais.
+
+> **Por que isso é necessário?** O Claude Desktop não vem com essa parte
+> incluída, e o programa não consegue trazê-la dentro do arquivo. É a única
+> coisa que precisa ser instalada à parte — depois disso, tudo é automático.
+
+## Passo 2 — Instalar o programa
+
+1. Dê **dois cliques** no arquivo `solidworks-mcp-5.5.0.mcpb`
+2. O Claude Desktop vai abrir e mostrar uma tela de instalação
+3. Clique em **Instalar**
+4. **Feche o Claude Desktop completamente** e abra de novo
+
+Para fechar completamente: clique com o botão direito no ícone do Claude perto
+do relógio (canto inferior direito) e escolha **Sair**. Só fechar a janela não
+basta.
 
 ---
 
-## Passo 2 — Primeiro teste
+## Passo 3 — Primeiro teste
 
 Abra o Claude Desktop e escreva:
 
@@ -62,7 +73,7 @@ Se ele responder que conectou, está tudo funcionando.
 
 ---
 
-## Passo 3 — Usando de verdade
+## Passo 4 — Usando de verdade
 
 Escreva pedidos em português comum. Alguns exemplos que funcionam:
 
@@ -154,13 +165,17 @@ ligar de propósito.
 | "Nenhum documento ativo" | Peça: `Crie uma peça nova` ou `Abra o arquivo C:\...` |
 | Ele não achou a face que você queria | Peça: `Coloque em vista isométrica` e tente de novo. Algumas faces ficam escondidas em outras vistas |
 | Nada funciona depois de instalar | Feche o Claude Desktop **completamente** (inclusive o ícone perto do relógio) e abra de novo |
+| Instalou, mas o Claude diz que não tem as ferramentas | Você provavelmente pulou o **Passo 1**. Rode o comando do `uv`, reinicie o Claude e tente de novo |
+| "incompatível" na hora de instalar | Mesma coisa: faça o **Passo 1** primeiro |
 
 ---
 
 ## Resumindo
 
-1. Instale o arquivo `.mcpb` com dois cliques
-2. Escreva `Conecte ao SolidWorks`
-3. Peça o que quiser, em português
+1. Rode uma vez o comando do `uv` no PowerShell (Passo 1)
+2. Instale o arquivo `.mcpb` com dois cliques
+3. Reinicie o Claude Desktop
+4. Escreva `Conecte ao SolidWorks`
+5. Peça o que quiser, em português
 
-É só isso.
+Só o Passo 1 exige um comando. O resto é conversa normal.
