@@ -132,7 +132,10 @@ async def seed_base_part(server: Any, project: Path) -> Path:
     await server.create_sketch("front")
     await server.draw_rectangle(-50, -25, 50, 25, "mm")
     await server.close_sketch()
-    await server.extrude_sketch(10, False, "mm")
+    # Pass unit by keyword: the third positional parameter is ``merge``, and a
+    # string there reaches FeatureExtrusion2 as a type mismatch that aborts the
+    # whole live run before any tool is exercised.
+    await server.extrude_sketch(10, unit="mm")
     await server.save_document(str(part_path))
     return part_path
 

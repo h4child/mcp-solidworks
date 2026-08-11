@@ -20,6 +20,7 @@ import shutil
 import zipfile
 import builtins
 import logging
+import tempfile
 import functools
 import contextlib
 import concurrent.futures
@@ -28,7 +29,7 @@ from typing import Optional
 import win32com.client
 import pythoncom
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -335,6 +336,17 @@ def _save_doc3(doc, options: int = 0):
         errors = int(outputs[0]) if len(outputs) > 0 else 0
         warnings = int(outputs[1]) if len(outputs) > 1 else 0
     return bool(succeeded), errors, warnings
+
+
+def _com_member(obj, name):
+    """Read a COM member that typed and dynamic dispatch expose differently.
+
+    The same SolidWorks member arrives as a bound method under dynamic
+    IDispatch and as a plain value under the generated type library, so the
+    inspection tools normalize both shapes through here.
+    """
+    value = getattr(obj, name)
+    return value() if callable(value) else value
 
 
 def _doc_title(doc) -> str:
@@ -5406,7 +5418,9 @@ async def add_advanced_mate(
             False, False, 0, mate_err,
         )
 
-        if mate is None:
+        # swAddMateError_NoError is 1; COM can return an object even on failure,
+        # so the status code decides just as it does in add_mate.
+        if mate is None or mate_err.value != 1:
             raise RuntimeError(
                 f"Advanced mate '{mate_type}' failed (error {mate_err.value}). "
                 "Confirm both entities support this mate type."
@@ -7279,6 +7293,281 @@ async def measure_body() -> dict:
                 "and a material assigned (right-click the material in the feature tree)."
             )
         return result
+
+    return await _run(_impl)
+
+
+# ===========================================================================
+# Inspection tools
+# ===========================================================================
+# These read what SolidWorks is showing instead of driving it, so a caller can
+# look at the session and resolve real geometry before issuing a command.
+
+# swSelectType_e. Only the values the inspection tools can encounter are named;
+# anything else is reported by its raw id so nothing is silently mislabelled.
+_SELECTION_TYPE_NAMES = {
+    0: "nothing", 1: "edge", 2: "face", 3: "vertex", 4: "datum_plane",
+    5: "datum_axis", 6: "datum_point", 7: "ole_item", 8: "attribute",
+    9: "sketch", 10: "sketch_segment", 11: "sketch_point", 12: "drawing_view",
+    13: "gtol", 14: "dimension", 15: "note", 16: "section_line",
+    17: "detail_circle", 18: "section_text", 19: "sheet", 20: "component",
+    21: "mate", 22: "body_feature", 23: "ref_curve",
+    24: "external_sketch_segment", 25: "external_sketch_point", 26: "helix",
+    27: "ref_surface", 28: "center_mark", 29: "in_context_feature",
+    30: "mate_group", 31: "break_line", 34: "sketch_text",
+    35: "surface_finish_symbol", 36: "datum_tag", 37: "component_pattern",
+    38: "weld", 39: "cosmetic_thread", 40: "datum_target",
+}
+
+_SURFACE_KINDS = ("plane", "cylinder", "cone", "sphere", "torus")
+
+
+def _classify_surface(surface) -> str:
+    """Name a surface through the ISurface Is<Kind> predicates."""
+    for kind in _SURFACE_KINDS:
+        try:
+            if bool(_com_member(surface, f"Is{kind.capitalize()}")):
+                return kind
+        except Exception:
+            continue
+    return "other"
+
+
+@mcp.tool()
+async def capture_viewport(output_path: Optional[str] = None) -> Image:
+    """Return the SolidWorks viewport exactly as it currently appears on screen.
+
+    Unlike capture_standard_views, this never moves the camera: the current
+    orientation, zoom, and selection highlighting are preserved, so it shows
+    what the user is actually looking at. Use it to inspect the model visually
+    before deciding what to change.
+    """
+
+    if output_path and os.path.splitext(output_path)[1].lower() != ".png":
+        raise ValueError("output_path must end in .png.")
+
+    def _impl():
+        doc = _active_doc()
+        keep = bool(output_path)
+        if keep:
+            path = os.path.abspath(output_path)
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        else:
+            handle, path = tempfile.mkstemp(prefix="sw_viewport_", suffix=".png")
+            os.close(handle)
+        try:
+            # SaveAs3 to a .png exports the live view and leaves the camera
+            # alone. SaveBMP would also work but returns a format the caller
+            # cannot view without adding an image-conversion dependency.
+            doc.SaveAs3(path, 0, 0)
+            if not os.path.exists(path) or os.path.getsize(path) == 0:
+                raise RuntimeError(f"SolidWorks did not capture the viewport to '{path}'.")
+            # Read on the COM thread so the bytes cannot be replaced by a later
+            # capture before they are handed back.
+            with open(path, "rb") as image_file:
+                return image_file.read()
+        finally:
+            if not keep:
+                with contextlib.suppress(OSError):
+                    os.remove(path)
+
+    return Image(data=await _run(_impl), format="png")
+
+
+@mcp.tool()
+async def get_selection(unit: Optional[str] = None) -> dict:
+    """Read what is currently selected in SolidWorks.
+
+    Reports each selected entity's type, the point where it was picked, and the
+    owning component in an assembly. Use this to act on what the user selected
+    on screen instead of guessing coordinates.
+    """
+
+    active_unit = (unit or _default_unit).lower()
+    if active_unit not in UNIT_TO_METERS:
+        raise ValueError(f"Unknown unit '{unit}'. Use one of: {', '.join(UNIT_TO_METERS)}")
+
+    def _impl():
+        doc = _active_doc()
+        factor = 1.0 / UNIT_TO_METERS[active_unit]
+        manager = doc.SelectionManager
+        # Mark -1 returns every selection regardless of the mark used to make it.
+        count = int(manager.GetSelectedObjectCount2(-1))
+        selections = []
+        for index in range(1, count + 1):
+            entry = {"index": index}
+            try:
+                type_id = int(manager.GetSelectedObjectType3(index, -1))
+                entry["type_id"] = type_id
+                entry["type"] = _SELECTION_TYPE_NAMES.get(type_id, f"unnamed_type_{type_id}")
+            except Exception:
+                entry["type_id"] = None
+                entry["type"] = "(unavailable)"
+            try:
+                point = tuple(manager.GetSelectionPoint2(index, -1) or ())
+                if len(point) >= 3:
+                    entry["pick_point"] = {
+                        "x": point[0] * factor,
+                        "y": point[1] * factor,
+                        "z": point[2] * factor,
+                        "unit": active_unit,
+                    }
+            except Exception:
+                pass
+            try:
+                raw_component = manager.GetSelectedObjectsComponent4(index, -1)
+                if raw_component is not None:
+                    entry["component"] = str(win32com.client.Dispatch(raw_component).Name2)
+            except Exception:
+                pass
+            selections.append(entry)
+        return {"count": count, "unit": active_unit, "selections": selections}
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def list_faces(
+    surface_type: Optional[str] = None,
+    min_area: float = 0.0,
+    max_faces: int = 200,
+    unit: Optional[str] = None,
+) -> dict:
+    """Inventory the solid faces of the active part, each with a usable pick point.
+
+    Every entry carries a ``pick_point`` that provably lies on that face, so it
+    can be passed straight to add_mate, add_advanced_mate, or
+    create_sketch_on_face rather than guessing where a face sits. Planar faces
+    also report their normal and cylindrical faces their radius and axis.
+
+    Those coordinate-based tools resolve a point through SelectByID2, which
+    picks from the current camera and therefore cannot reach a face hidden
+    behind the model. Call set_view('isometric') first when acting on a
+    pick_point: it is the one standard orientation that leaves every face of a
+    convex part reachable. This inventory itself is view-independent and always
+    reports the full geometry.
+
+    surface_type: keep only 'plane', 'cylinder', 'cone', 'sphere', or 'torus'.
+    min_area: drop faces smaller than this area, in ``unit`` squared.
+    max_faces: stop after this many matches so large models stay readable.
+    """
+
+    def _impl():
+        if max_faces < 1:
+            raise ValueError("max_faces must be at least 1.")
+        if min_area < 0:
+            raise ValueError("min_area cannot be negative.")
+        wanted = surface_type.strip().lower() if surface_type else None
+        if wanted is not None and wanted not in _SURFACE_KINDS:
+            raise ValueError(f"surface_type must be one of: {', '.join(_SURFACE_KINDS)}")
+
+        doc = _active_doc()
+        active_unit = (unit or _default_unit).lower()
+        if active_unit not in UNIT_TO_METERS:
+            raise ValueError(f"Unknown unit '{unit}'. Use one of: {', '.join(UNIT_TO_METERS)}")
+        factor = 1.0 / UNIT_TO_METERS[active_unit]
+        area_factor = factor ** 2
+
+        try:
+            raw_bodies = doc.GetBodies2(0, True) or ()  # 0 = swSolidBody
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not read solid bodies. list_faces inspects a part document; "
+                "open the part itself to inventory its faces."
+            ) from exc
+        if not raw_bodies:
+            raise RuntimeError("The active document has no solid body to inspect.")
+
+        faces = []
+        inspected = 0
+        truncated = False
+        for body_index, raw_body in enumerate(raw_bodies):
+            if truncated:
+                break
+            body = win32com.client.Dispatch(raw_body)
+            try:
+                body_name = str(body.Name)
+            except Exception:
+                body_name = f"body_{body_index + 1}"
+            for face_index, raw_face in enumerate(body.GetFaces() or ()):
+                inspected += 1
+                face = win32com.client.Dispatch(raw_face)
+                try:
+                    surface = win32com.client.Dispatch(face.GetSurface)
+                    kind = _classify_surface(surface)
+                except Exception:
+                    surface, kind = None, "other"
+                if wanted is not None and kind != wanted:
+                    continue
+
+                try:
+                    area = float(_com_member(face, "GetArea")) * area_factor
+                except Exception:
+                    continue
+                if area < min_area:
+                    continue
+
+                try:
+                    box = tuple(_com_member(face, "GetBox"))
+                    centre = (
+                        (box[0] + box[3]) / 2.0,
+                        (box[1] + box[4]) / 2.0,
+                        (box[2] + box[5]) / 2.0,
+                    )
+                    # GetBox is approximate and its centre can sit off the face
+                    # (or outside it entirely). GetClosestPointOn projects that
+                    # centre back onto real geometry, which is what makes the
+                    # returned point safe to feed to the point-based tools.
+                    nearest = tuple(face.GetClosestPointOn(*centre))
+                except Exception:
+                    continue
+                if len(nearest) < 3:
+                    continue
+
+                entry = {
+                    "body": body_name,
+                    "face_index": face_index,
+                    "surface_type": kind,
+                    "area": area,
+                    "pick_point": {
+                        "x": nearest[0] * factor,
+                        "y": nearest[1] * factor,
+                        "z": nearest[2] * factor,
+                        "unit": active_unit,
+                    },
+                }
+                if kind == "plane":
+                    # Only planar faces have a single meaningful normal; on a
+                    # cylinder IFace2.Normal returns zeros rather than failing,
+                    # which would read as a real direction.
+                    try:
+                        normal = tuple(_com_member(face, "Normal"))
+                        if len(normal) >= 3 and any(normal[:3]):
+                            entry["normal"] = [normal[0], normal[1], normal[2]]
+                    except Exception:
+                        pass
+                if kind == "cylinder" and surface is not None:
+                    try:
+                        # ISurface.CylinderParams: origin (0-2), axis (3-5), radius (6).
+                        params = tuple(_com_member(surface, "CylinderParams"))
+                        if len(params) >= 7:
+                            entry["axis"] = [params[3], params[4], params[5]]
+                            entry["radius"] = params[6] * factor
+                    except Exception:
+                        pass
+                faces.append(entry)
+                if len(faces) >= max_faces:
+                    truncated = True
+                    break
+
+        return {
+            "count": len(faces),
+            "inspected_face_count": inspected,
+            "truncated": truncated,
+            "unit": active_unit,
+            "filter": {"surface_type": wanted, "min_area": min_area},
+            "faces": faces,
+        }
 
     return await _run(_impl)
 

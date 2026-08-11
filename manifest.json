@@ -2,7 +2,7 @@
   "manifest_version": "0.2",
   "name": "solidworks-mcp",
   "display_name": "SolidWorks MCP",
-  "version": "5.4.1",
+  "version": "5.5.0",
   "description": "MCP server for SolidWorks automation through the Windows COM API, built with FastMCP.",
   "long_description": "Controls SolidWorks via COM for parts, assemblies, sketches, features, drawings, appearances, validation, and selected mechanical mates. Designed for trusted local desktop automation.",
   "author": {
@@ -149,6 +149,9 @@
     { "name": "get_custom_properties", "description": "Read custom properties from the active document." },
     { "name": "set_custom_property", "description": "Set a custom property on the active document." },
     { "name": "measure_body", "description": "Measure mass, volume, surface area, and bounding box." },
+    { "name": "capture_viewport", "description": "Return the current viewport as an image, without moving the camera." },
+    { "name": "get_selection", "description": "Read the current selection: entity types, pick points, and owning components." },
+    { "name": "list_faces", "description": "Inventory the active part's faces with a pick point, area, normal, and surface type." },
     { "name": "set_units", "description": "Set the default unit (mm, cm, m, in, ft)." },
     { "name": "set_view", "description": "Set the camera view orientation (front, isometric, etc.)." },
     { "name": "zoom_to_fit", "description": "Zoom to fit the entire model in the viewport." },
