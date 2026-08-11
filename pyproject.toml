@@ -4,7 +4,10 @@ version = "5.5.0"
 description = "MCP server for SolidWorks automation through the Windows COM API."
 requires-python = ">=3.10"
 dependencies = [
-    "mcp>=1.0.0",
+    # Cap below 2.0: mcp 2.x drops mcp.server.fastmcp, which every tool in
+    # server.py is built on. An unbounded ">=1.0.0" resolves to 2.x on a fresh
+    # machine and the server dies on import.
+    "mcp>=1.0.0,<2",
     # pywin32 ships compiled extensions and only exists on Windows, which is
     # also the only platform the SolidWorks COM API runs on.
     "pywin32>=306; sys_platform == 'win32'",
