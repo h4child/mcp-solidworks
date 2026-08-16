@@ -17,7 +17,7 @@ python -m unittest discover -s tests -p "test_*.py" -v
 python tests/run_live_test_project.py --dry-run
 ```
 
-Os testes estáticos verificam sintaxe, as 138 funções MCP, a equivalência entre
+Os testes estáticos verificam sintaxe, as 139 funções MCP, a equivalência entre
 `server.py` e `manifest.json`, documentação de versão, regras de `.gitignore`
 e padrões comuns de credenciais.
 
@@ -33,15 +33,21 @@ O comando tenta conectar ao SolidWorks, cria um projeto de teste separado e
 invoca todas as ferramentas declaradas no manifesto, registrando sucesso,
 falha ou bloqueio em `tests/output/live-test-AAAAmmdd-HHMMSS.json`.
 
-Dois executores adicionais cobrem grupos de ferramentas com mais profundidade
-do que a matriz genérica acima consegue (eles descobrem coordenadas reais via
+Executores adicionais cobrem grupos de ferramentas com mais profundidade do
+que a matriz genérica acima consegue (eles descobrem coordenadas reais via
 `list_faces` em vez de assumir geometria fixa, e fecham o ciclo alimentando
 essas descobertas de volta nas próprias ferramentas):
 
 ```powershell
 python tests/run_inspection_live_test.py --live
 python tests/run_sheet_metal_weldment_live_test.py --live
+python tests/run_read_tools_live_test.py
 ```
+
+O terceiro valida `get_view_state`, e os campos `suppressed`/`error_code` de
+`list_features` e `visible` de `list_components` -- inclusive o caso negativo
+(gira a câmera manualmente e confirma que `closest_named_view` vira `None` em
+vez de apontar uma vista errada).
 
 O primeiro valida `capture_viewport`, `get_selection` e `list_faces`. O
 segundo valida chapa metálica (`create_base_flange`,

@@ -167,6 +167,7 @@
     { "name": "set_view", "description": "Set the camera view orientation (front, isometric, etc.)." },
     { "name": "zoom_to_fit", "description": "Zoom to fit the entire model in the viewport." },
     { "name": "zoom_to_area", "description": "Zoom into a rectangular area of the model." },
+    { "name": "get_view_state", "description": "Read the current camera zoom, orientation, and display mode as structured data instead of an image." },
     { "name": "execute_python", "description": "Run privileged local Python with sw/doc in scope; disabled unless SOLIDWORKS_MCP_ENABLE_EXECUTE_PYTHON=1." }
   ],
   "keywords": [

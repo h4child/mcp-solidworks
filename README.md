@@ -1,7 +1,7 @@
 # SolidWorks MCP Server
 
 Servidor MCP em Python que controla o SolidWorks via COM (`win32com`), escrito
-com o SDK oficial (`mcp`, usando `FastMCP`). **138 ferramentas** (v5.5.0).
+com o SDK oficial (`mcp`, usando `FastMCP`). **139 ferramentas** (v5.5.0).
 
 ## Para quem so quer usar
 
@@ -73,7 +73,7 @@ A matriz abaixo registra o estado validado no SolidWorks 2025 PT-BR. Legenda:
 `connect_solidworks`, `get_solidworks_info`, `create_new_part`,
 `create_new_assembly`, `create_new_drawing`, `open_document`, `close_document`,
 `save_document`, `get_document_info`, `list_open_documents`, `set_units`,
-`set_view`, `zoom_to_fit`, `zoom_to_area`
+`set_view`, `zoom_to_fit`, `zoom_to_area`, `get_view_state`
 
 `execute_python` e uma ferramenta de depuracao privilegiada. Ela existe no
 catalogo, mas permanece bloqueada ate
@@ -114,6 +114,19 @@ catalogo, mas permanece bloqueada ate
 `get_custom_properties`, `set_custom_property`, `measure_body`,
 `export_document`, `create_configuration`,
 `switch_configuration` (resolve nomes localizados, ex. "Valor predeterminado")
+
+### Leitura de estado (tela, arvore, montagem) -- OK
+Adicionado e validado ao vivo em 16/08/2026: `get_view_state` reporta o zoom
+(`Scale2`), o codigo bruto de modo de exibicao, a matriz de rotacao 3x3 da
+camera e -- quando ela bate exatamente com uma das 9 vistas nomeadas de
+`set_view` -- esse nome em `closest_named_view` (`None` quando o usuario girou
+o modelo livremente; testado ao vivo com uma rotacao manual para confirmar que
+nao ha falso-positivo). `list_features` passou a reportar `suppressed` e
+`error_code` por recurso, e `list_components` passou a reportar `visible`
+(independente de `suppressed`) via `IComponent2.GetVisibility`, confirmado por
+um teste de ida-e-volta ocultar/exibir. Nenhum destes numeros foi assumido: os
+valores de referencia das 9 orientacoes nomeadas e o mapeamento 0/1 de
+visibilidade foram capturados ao vivo antes de escrever o codigo.
 
 ### Perfis estruturais (weldments) -- OK, exceto add_end_cap
 Validado ao vivo (SolidWorks 2025) com um membro em L + um membro cruzando-o,

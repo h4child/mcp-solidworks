@@ -127,7 +127,7 @@ Depois disso ele acerta muito mais nos pedidos seguintes.
 
 ## O que ele sabe fazer
 
-São 138 comandos. Em resumo:
+São 139 comandos. Em resumo:
 
 - **Peças** — esboços, extrusão, corte, revolução, furos, arredondamentos, chanfros, roscas, nervuras
 - **Montagens** — inserir componentes, posicionar, criar acoplamentos (mates), engrenagens, cames, vista explodida

@@ -904,19 +904,32 @@ async def insert_component(filepath: str, x: float = 0, y: float = 0, z: float =
 
 @mcp.tool()
 async def list_components() -> dict:
-    """List every component (part/sub-assembly instance) in the active assembly."""
+    """List every component (part/sub-assembly instance) in the active assembly.
+
+    ``suppressed`` and ``visible`` are independent: a component can be shown
+    (not suppressed) but hidden from view, or vice versa. Use ``visible`` to
+    know what is actually on screen right now.
+    """
 
     def _impl():
         assy = _active_assembly()
         components = []
         for raw in assy.GetComponents(True) or ():
             comp = win32com.client.Dispatch(raw)
-            components.append({
+            entry = {
                 "name": comp.Name2,
                 "path": comp.GetPathName,
                 "suppressed": bool(comp.IsSuppressed),
                 "fixed": bool(comp.IsFixed),
-            })
+            }
+            try:
+                # 1 = swThisConfiguration: visibility as shown right now.
+                visibility = comp.GetVisibility(1, None)
+                state = visibility[0] if isinstance(visibility, (tuple, list)) else visibility
+                entry["visible"] = bool(state)
+            except Exception:
+                entry["visible"] = None
+            components.append(entry)
         return {"count": len(components), "components": components}
 
     return await _run(_impl)
@@ -7125,7 +7138,13 @@ async def switch_configuration(name: str) -> dict:
 
 @mcp.tool()
 async def list_features() -> dict:
-    """List every feature in the active document's feature tree."""
+    """List every feature in the active document's feature tree.
+
+    Each entry also reports whether the feature is suppressed and its raw
+    SolidWorks error code (0 = healthy), so a caller can tell which features
+    a configuration has turned off, or which one is broken, without opening
+    the FeatureManager tree in the UI.
+    """
 
     def _impl():
         doc = _active_doc()
@@ -7133,9 +7152,20 @@ async def list_features() -> dict:
         for raw_feature in doc.FeatureManager.GetFeatures(False) or ():
             feat = win32com.client.Dispatch(raw_feature)
             try:
-                features.append({"name": feat.Name, "type": feat.GetTypeName2})
+                entry = {"name": feat.Name, "type": feat.GetTypeName2}
             except Exception:
-                pass
+                continue
+            try:
+                suppressed = feat.IsSuppressed
+                entry["suppressed"] = bool(suppressed() if callable(suppressed) else suppressed)
+            except Exception:
+                entry["suppressed"] = None
+            try:
+                error_code = feat.GetErrorCode
+                entry["error_code"] = int(error_code() if callable(error_code) else error_code)
+            except Exception:
+                entry["error_code"] = None
+            features.append(entry)
         return {"count": len(features), "features": features}
 
     return await _run(_impl)
@@ -8231,6 +8261,81 @@ async def zoom_to_area(x1: float, y1: float, x2: float, y2: float, unit: Optiona
             to_meters(x2, unit), to_meters(y2, unit), 0,
         )
         return {"area": [[x1, y1], [x2, y2]], "unit": unit or _default_unit}
+
+    return await _run(_impl)
+
+
+# 3x3 rotation matrices (row-major, flattened) for each named view, captured
+# live from IModelView.Orientation via set_view so get_view_state can match a
+# live camera back to a human-readable name instead of only raw numbers.
+_NAMED_VIEW_ORIENTATIONS = {
+    "front": (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
+    "back": (-1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0),
+    "left": (0.0, 0.0, -1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0),
+    "right": (0.0, 0.0, 1.0, 0.0, 1.0, 0.0, -1.0, 0.0, 0.0),
+    "top": (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -1.0, 0.0),
+    "bottom": (1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 1.0, 0.0),
+    "isometric": (0.707107, -0.408204, 0.577382, 0.0, 0.816541, 0.577288, -0.707107, -0.408204, 0.577382),
+    "trimetric": (0.884418, -0.240366, 0.400036, 0.0, 0.857167, 0.515038, -0.466695, -0.455509, 0.758094),
+    "dimetric": (0.935414, -0.117851, 0.333333, 0.0, 0.942809, 0.333333, -0.353553, -0.311805, 0.881917),
+}
+# Sum-of-squared-differences below this counts as "the same view"; a model
+# tumbled even slightly by the user will exceed it and correctly report None.
+_NAMED_VIEW_MATCH_TOLERANCE = 1e-4
+
+
+def _closest_named_view(matrix: list) -> Optional[str]:
+    if len(matrix) != 9:
+        return None
+    best_name, best_distance = None, None
+    for name, reference in _NAMED_VIEW_ORIENTATIONS.items():
+        distance = sum((a - b) ** 2 for a, b in zip(matrix, reference))
+        if best_distance is None or distance < best_distance:
+            best_name, best_distance = name, distance
+    return best_name if best_distance is not None and best_distance <= _NAMED_VIEW_MATCH_TOLERANCE else None
+
+
+@mcp.tool()
+async def get_view_state() -> dict:
+    """Read the camera state the user is actually looking at right now.
+
+    Reports the zoom scale, the raw SolidWorks display-mode code (wireframe /
+    shaded / etc. -- shown as-is since SolidWorks does not expose a name for
+    it through this API), the 3x3 camera rotation matrix, and -- when the
+    camera exactly matches one of set_view's named orientations -- that name
+    under closest_named_view (None if the user has freely rotated the model).
+    Also reports the active configuration, since that changes what geometry
+    is visible without changing the camera at all.
+
+    Unlike capture_viewport, this returns structured numbers instead of an
+    image, so a caller can reason about "is this still isometric?" or
+    "did the zoom change?" without decoding pixels.
+    """
+
+    def _impl():
+        doc = _active_doc()
+        view = doc.ActiveView
+
+        scale = view.Scale2
+        scale = scale() if callable(scale) else scale
+
+        display_mode = view.DisplayMode
+        display_mode = display_mode() if callable(display_mode) else display_mode
+
+        orientation = view.Orientation
+        orientation = orientation() if callable(orientation) else orientation
+        matrix = [round(float(v), 6) for v in (orientation or ())]
+
+        active = doc.ConfigurationManager.ActiveConfiguration
+        active_name = active.Name() if callable(getattr(active, "Name", None)) else active.Name
+
+        return {
+            "zoom_scale": float(scale),
+            "display_mode_code": int(display_mode),
+            "orientation_matrix": matrix,
+            "closest_named_view": _closest_named_view(matrix),
+            "active_configuration": active_name,
+        }
 
     return await _run(_impl)
 
