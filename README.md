@@ -115,21 +115,38 @@ catalogo, mas permanece bloqueada ate
 `export_document`, `create_configuration`,
 `switch_configuration` (resolve nomes localizados, ex. "Valor predeterminado")
 
-### Perfis estruturais (weldments) -- parcial
-`create_3d_sketch` (OK), `draw_line_3d` (OK). O caminho da biblioteca de perfis
-agora e resolvido corretamente em
+### Perfis estruturais (weldments) -- OK, exceto add_end_cap
+Validado ao vivo (SolidWorks 2025) com um membro em L + um membro cruzando-o,
+ambos em tubo quadrado ISO: `create_3d_sketch`, `draw_line_3d`,
+`create_weldment_profile`, `add_gusset`, `trim_extend_structural`. O caminho da
+biblioteca de perfis e resolvido em
 `C:\ProgramData\SOLIDWORKS\...\weldment profiles\<padrao>\<tipo>.sldlfp`
-(o tamanho e uma *configuracao* dentro do arquivo).
-`create_weldment_profile` (EXP), `trim_extend_structural` (EXP),
-`add_gusset` (EXP), `add_end_cap` (EXP) -- a API de membro estrutural
-(`InsertStructuralWeldment5`) e sensivel via COM; a geometria pode precisar ser
-inserida pela interface (Weldments > Structural Member).
+(o tamanho e uma *configuracao* dentro do arquivo, descoberta automaticamente
+por `create_weldment_profile` a partir do nome pedido).
 
-### Chapa metalica -- parcial
-`create_base_flange` (EXP -- erro de tipo de argumento corrigido; o parametro
-PCBA exige um VARIANT de dispatch, nao bool), `add_sheet_metal_bend`
-(EXP -- usa Insert Bends), `add_sheet_metal_edge_flange` (EXP -- requer objetos
-de aresta), `flatten_sheet_metal` (OK quando ha corpo de chapa).
+`add_gusset` funciona de forma confiavel no caso classico (uma face de viga +
+uma face de chapa/outra viga que se encontram numa aresta real); um canto
+chanfrado (miter) de uma unica peca em L e um caso mais ambiguo e pode
+precisar de um par de faces escolhido com mais cuidado.
+
+`add_end_cap` (EXP -- **defeito confirmado do SolidWorks 2025**): apos corrigir
+um bug real do lado do MCP (a face certa era identificada mas depois
+descartada e re-selecionada por ray-casting a partir do ponto original, que
+cai exatamente na borda do vazio interno de um perfil oco -- agora a face
+identificada e selecionada diretamente), `InsertEndCapFeature3` ainda retorna
+`None` em toda uma matriz de tentativas: os tres valores do enum de direcao,
+com/sem tratamento de canto, com uma ou duas faces selecionadas, com o
+documento salvo, e ate com os valores exatos do exemplo oficial da API da
+SolidWorks copiados literalmente. Mesmo padrao ja documentado abaixo para
+`create_helix` (`InsertHelix`).
+
+### Chapa metalica -- OK
+Validado ao vivo (SolidWorks 2025): `create_base_flange` (o parametro PCBA
+exige um VARIANT de dispatch, nao bool -- corrigido), `add_sheet_metal_bend`
+(usa Insert Bends num corpo previamente casqueado com `shell_body`),
+`add_sheet_metal_edge_flange` (requer objetos de aresta, resolvidos a partir
+de um ponto conhecido na aresta), `flatten_sheet_metal` (alterna
+flat/folded).
 
 ### Roscas / usinagem -- parcial
 `add_cosmetic_thread` (EXP), `add_thread_feature` (delega para rosca cosmetica --
@@ -138,12 +155,14 @@ roscas 3D reais NAO sao expostas pela API do SolidWorks),
 `create_knurl` (EXP -- Wrap+Deboss).
 
 ### Desenho tecnico detalhado -- parcial
-`add_drawing_annotation` (OK). As demais sao EXP e dependem de uma vista de
-modelo existente e/ou do gerenciador de propriedades:
-`insert_drawing_view` (`CreateDrawViewFromModelView3` retorna None mesmo com o
-modelo carregado -- em investigacao), `insert_section_view`,
-`insert_detail_view`, `insert_broken_view`, `insert_auxiliary_view`,
-`add_drawing_dimension`, `add_centerline`, `add_weld_symbol`,
+`add_drawing_annotation` (OK), `insert_drawing_view` (OK -- validado ao vivo
+inserindo uma vista isometrica de uma peca de weldment; a nota anterior sobre
+`CreateDrawViewFromModelView3` retornar `None` estava desatualizada),
+`add_weld_symbol` (OK -- validado ao vivo colocando um simbolo de solda de
+filete numa aresta da vista inserida). As demais sao EXP e dependem do
+gerenciador de propriedades ou de uma vista de modelo com estado especifico:
+`insert_section_view`, `insert_detail_view`, `insert_broken_view`,
+`insert_auxiliary_view`, `add_drawing_dimension`, `add_centerline`,
 `add_surface_finish`, `add_gdt_symbol`, `add_balloon`, `insert_bom_table`,
 `insert_cut_list_table`.
 

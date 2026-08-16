@@ -2618,6 +2618,13 @@ async def add_end_cap(
     or other hollow profile. Select the open face at the end of the structural
     member.
 
+    KNOWN ISSUE (SolidWorks 2025): InsertEndCapFeature3 has been observed to
+    return None regardless of arguments -- including the exact values from
+    SolidWorks' own API-help example, every value of its direction enum, and
+    both one- and two-face selections. This tool correctly identifies and
+    selects the target face; if it still fails, that is very likely this
+    SolidWorks-side limitation rather than a bad face_x/y/z.
+
     face_x/y/z: a point on the open face at the end of the profile.
     thickness: cap plate thickness.
     offset: inward offset from the face (0 = flush with the end)."""
@@ -2635,7 +2642,16 @@ async def add_end_cap(
         # A hollow member's end face shares its edges with the side faces.
         # SelectByID2 at a coordinate can therefore select a side face even
         # when the coordinate is on the end. Locate the closest planar end
-        # face and ray-select it from outside the member instead.
+        # face by its bounding box instead.
+        #
+        # A hollow profile's end is an annular (picture-frame) face: its
+        # centre has no material, so a caller relaying a pick_point from
+        # list_faces (which projects away from that void) naturally lands
+        # right on the inner boundary. Re-deriving the face via a ray cast
+        # from that boundary point is degenerate -- the ray grazes the
+        # material/void edge instead of crossing it. The bounding-box match
+        # below already identifies the correct IFace2 object, so select it
+        # directly instead of discarding it and re-finding it by ray.
         end_face_candidates = []
         for raw_body in doc.GetBodies2(0, True) or ():
             body = win32com.client.Dispatch(raw_body)
@@ -2658,47 +2674,16 @@ async def add_end_cap(
                     ) ** 2
                     for index in range(3)
                 )
-                end_face_candidates.append((distance_sq, axis, mins[axis]))
+                end_face_candidates.append((distance_sq, face))
 
         if not end_face_candidates:
             raise RuntimeError(
                 f"No planar structural-member end face was found near ({face_x}, {face_y}, {face_z})."
             )
 
-        _, axis, face_coordinate = min(end_face_candidates, key=lambda item: item[0])
-        ray_radius = 1e-4
-        selected_end_face = False
-        for outward_sign in (1.0, -1.0):
-            ray_start = list(requested_point)
-            ray_start[axis] = face_coordinate + outward_sign * 0.01
-            ray_vector = [0.0, 0.0, 0.0]
-            ray_vector[axis] = -outward_sign
-            doc.ClearSelection2(True)
-            if not doc.Extension.SelectByRay(
-                *ray_start,
-                *ray_vector,
-                ray_radius,
-                2,      # swSelFACES
-                False,
-                0,
-                0,
-            ):
-                continue
-            selected_face = doc.SelectionManager.GetSelectedObject6(1, 0)
-            if selected_face is None:
-                continue
-            selected_box = tuple(win32com.client.Dispatch(selected_face).GetBox)
-            selected_spans = [
-                selected_box[index + 3] - selected_box[index] for index in range(3)
-            ]
-            if (
-                selected_spans[axis] <= 1e-7
-                and abs(selected_box[axis] - face_coordinate) <= 1e-6
-            ):
-                selected_end_face = True
-                break
-
-        if not selected_end_face:
+        _, end_face = min(end_face_candidates, key=lambda item: item[0])
+        doc.ClearSelection2(True)
+        if not end_face.Select4(False, pythoncom.Nothing):
             raise RuntimeError(
                 f"Could not select the structural-member end face near ({face_x}, {face_y}, {face_z})."
             )
