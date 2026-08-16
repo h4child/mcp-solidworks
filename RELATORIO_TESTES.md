@@ -197,7 +197,7 @@ ferramentas na versão 4.2.0, consistentes com `manifest.json`.
 | `hole_wizard` | Usava tipos de furo incorretos, uma chamada incompleta de `HoleWizard4` e criava o ponto de posição somente depois de inserir o recurso. | Tipos/standards/fasteners da API 2025, assinatura completa de 26 argumentos e ponto de esboço pré-selecionado na face antes da criação. | Criou recursos `HoleWzd` reais para furo simples, rebaixo, escareado, roscado cego e roscado passante ISO M6. |
 | `create_weldment_profile` | Não criava o recurso-base de soldagem, passava grupos vazios e usava a opção de segmentos `0`, inválida. | Criação de `WeldmentFeature`, grupos `IStructuralMemberGroup` preenchidos por SAFEARRAY de segmentos e `swConnectedSegments_SimpleCut` (1). | Criou `WeldMemberFeat` com perfil ISO `square tube` 40 × 40 × 4, em segmentos simples e em grupo de dois segmentos. |
 | `trim_extend_structural` | — | Dois membros estruturais de teste intersectados e corpos retornados pelo modelo. | Criou o recurso `Aparar/Estender1` para aparar um membro contra o outro. |
-| `add_end_cap` | Seleção por coordenada atingia paredes laterais de perfis ocos; a implementação chamava a API obsoleta `InsertEndCapFeature` e usava direção de espessura inválida. | Localização da face planar terminal mais próxima, seleção externa por raio e uso de `InsertEndCapFeature3` com `swExtendOutward`. | Criou `Tampa de extremidade1` (`EndCap`) de 2 mm em um perfil ISO `square tube` 20 × 20 × 2. |
+| `add_end_cap` | ⚠️ **Registro corrigido em 16/08/2026** — a linha original abaixo afirmava sucesso, mas isso não se sustentou em uma nova validação ao vivo; ver seção "Chapa metálica e soldagem" mais abaixo. | Localização da face planar terminal mais próxima, seleção externa por raio e uso de `InsertEndCapFeature3` com `swExtendOutward`. | ~~Criou `Tampa de extremidade1` (`EndCap`) de 2 mm em um perfil ISO `square tube` 20 × 20 × 2.~~ Não reproduzido em 16/08/2026: `InsertEndCapFeature3` retornou `None` em toda uma matriz de tentativas nesta mesma instalação do SolidWorks 2025. |
 | `add_gusset` | `SelectByID2` não localizava faces anônimas de membros estruturais, o array obrigatório de faces era `None` e a semântica do perfil triangular estava invertida. | Resolução por `IFace2.GetClosestPointOn`, SAFEARRAY das duas faces de suporte e parâmetros completos para perfis triangular e poligonal. | Criou `Cantoneira1` (`Gusset`) de 5 mm tanto para o perfil triangular quanto para o perfil poligonal (`flat`). |
 | `create_3d_sketch` | — | Peça temporária vazia; verificação pelo status do esboço ativo. | Abriu `3DSketch1` e reportou corretamente o tipo `3D`. |
 | `draw_line_3d` | — | Novo esboço 3D temporário com uma linha espacial. | O esboço 3D fechado continha um segmento de `(0, 0, 0)` até `(100, 50, 25)` mm. |
@@ -337,6 +337,26 @@ public MCP call successfully created a four-point spline in
 
 All five final replicas and the spline test remain ignored local artifacts; no
 SolidWorks output or MCP build artifact was added to source control.
+
+## Chapa metálica e soldagem — validação ao vivo, 16 de agosto de 2026
+
+Todas as ferramentas de chapa metálica e de weldment/solda que estavam
+marcadas como experimentais foram testadas ao vivo contra o SolidWorks 2025
+(`tests/run_sheet_metal_weldment_live_test.py`, novo). Resultado: 32 de 33
+verificações aprovadas.
+
+| Ferramenta | Resultado |
+| --- | --- |
+| `create_base_flange` | OK. Chapa plana 100 × 60 × 2 mm criada a partir de esboço fechado. |
+| `add_sheet_metal_edge_flange` | OK. Flange de 90° e 20 mm adicionada a uma aresta descoberta via `list_faces`. |
+| `flatten_sheet_metal` | OK. Alterna corretamente entre `flattened` e `folded`. |
+| `add_sheet_metal_bend` | OK. Converteu uma bandeja casqueada (`shell_body`) em chapa metálica via Insert Bends. |
+| `create_weldment_profile` | OK. Criou um membro em L (dois segmentos conectados) e um membro cruzando-o, ambos em tubo quadrado ISO 20 × 20 × 2, com o tamanho/configuração descoberto automaticamente a partir do arquivo `.sldlfp`. |
+| `add_gusset` | OK no caso clássico (uma face de viga + uma face de placa/outra viga que se encontram numa aresta real, validado numa fixture placa+poste dedicada). Um canto chanfrado (miter) de uma peça em L única é um caso mais ambíguo. |
+| `trim_extend_structural` | OK. Aparou o membro cruzando o feixe principal contra o corpo do membro em L. |
+| `insert_drawing_view` | OK. A nota anterior deste relatório e do README, dizendo que `CreateDrawViewFromModelView3` retornava `None`, estava desatualizada — inseriu uma vista isométrica sem problemas. |
+| `add_weld_symbol` | OK. Colocou um símbolo de solda de filete numa aresta da vista recém-inserida. |
+| `add_end_cap` | **Falhou — defeito confirmado do SolidWorks 2025, não do MCP.** Um bug real foi corrigido no lado do MCP: a face terminal certa era identificada pela caixa delimitadora, mas depois descartada e re-selecionada por ray-casting a partir do ponto original — que, num perfil oco, cai exatamente na borda do vazio interno (o mesmo ponto que `list_faces` reporta, pois projeta para longe do vazio). A correção seleciona a face já identificada diretamente. Mesmo assim, `InsertEndCapFeature3` retorna `None` numa matriz exaustiva de tentativas: os três valores do enum de direção, com/sem tratamento de canto, uma ou duas faces selecionadas, documento salvo, e até os valores exatos do exemplo oficial da API da SolidWorks copiados literalmente. Mesmo padrão já documentado nesta tabela para `create_helix`/`InsertHelix`. |
 
 ## Appearance, reflection, and texture API validation
 
