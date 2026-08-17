@@ -8391,6 +8391,21 @@ def _macro_methods(app, macro_path: str, method_filter: int) -> list:
     return [str(entry) for entry in (methods or ())]
 
 
+# swRunMacroError_e, from the generated type library -- names the codes
+# RunMacro2 hands back so a failure says *why* instead of just a bare number.
+_RUN_MACRO_ERROR_NAMES = {
+    1: "InvalidArg", 2: "MacrosAreDisabled", 3: "NotInDesignMode",
+    4: "OnlyCodeModules", 5: "OutOfMemory", 6: "InvalidProcname",
+    7: "InvalidPropertyType", 8: "SuborfuncExpected", 9: "BadParmCount",
+    10: "BadVarType", 11: "UserInterrupt", 12: "Exception", 13: "Overflow",
+    14: "TypeMismatch", 15: "ParmNotOptional", 16: "UnknownLcid", 17: "Busy",
+    18: "ConnectionTerminated", 19: "CallRejected", 20: "CallFailed",
+    21: "Zombied", 22: "Invalidindex", 23: "NoPermission", 24: "Reverted",
+    25: "TooManyOpenFiles", 26: "DiskError", 27: "CantSave",
+    28: "OpenFileFailed",
+}
+
+
 @mcp.tool()
 async def list_macro_methods(path: str) -> dict:
     """List the entry points inside a SolidWorks macro WITHOUT executing it.
@@ -8445,8 +8460,8 @@ async def run_macro(
         macro_path = _resolve_macro_path(path)
 
         target_module, target_procedure = module.strip(), procedure.strip()
-        runnable = _macro_methods(app, macro_path, _MACRO_METHODS_WITHOUT_ARGS)
         if not target_module or not target_procedure:
+            runnable = _macro_methods(app, macro_path, _MACRO_METHODS_WITHOUT_ARGS)
             if len(runnable) != 1:
                 raise ValueError(
                     "Specify module and procedure. "
@@ -8468,10 +8483,11 @@ async def run_macro(
             succeeded, error_code = bool(result), 0
 
         if not succeeded:
+            error_name = _RUN_MACRO_ERROR_NAMES.get(error_code, "Unknown")
             raise RuntimeError(
                 f"SolidWorks refused to run '{target_module}.{target_procedure}' from "
-                f"{macro_path} (error code {error_code}). Confirm the module and "
-                "procedure names with list_macro_methods."
+                f"{macro_path}: {error_name} (error code {error_code}). Confirm the "
+                "module and procedure names with list_macro_methods."
             )
         return {
             "path": macro_path,
