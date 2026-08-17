@@ -17,7 +17,7 @@ python -m unittest discover -s tests -p "test_*.py" -v
 python tests/run_live_test_project.py --dry-run
 ```
 
-Os testes estáticos verificam sintaxe, as 139 funções MCP, a equivalência entre
+Os testes estáticos verificam sintaxe, as 141 funções MCP, a equivalência entre
 `server.py` e `manifest.json`, documentação de versão, regras de `.gitignore`
 e padrões comuns de credenciais.
 
@@ -42,12 +42,21 @@ essas descobertas de volta nas próprias ferramentas):
 python tests/run_inspection_live_test.py --live
 python tests/run_sheet_metal_weldment_live_test.py --live
 python tests/run_read_tools_live_test.py
+python tests/run_macro_live_test.py
 ```
 
 O terceiro valida `get_view_state`, e os campos `suppressed`/`error_code` de
 `list_features` e `visible` de `list_components` -- inclusive o caso negativo
 (gira a câmera manualmente e confirma que `closest_named_view` vira `None` em
 vez de apontar uma vista errada).
+
+O quarto cobre `list_macro_methods`/`run_macro` e a detecção de conexão COM
+órfã. Ele **nunca executa o corpo de uma macro de terceiros**: as `.swp` que
+acompanham o SolidWorks têm efeitos colaterais desconhecidos, então a cobertura
+usa a inspeção (que não executa nada), a resolução automática de ponto de
+entrada e os caminhos de erro -- incluindo um `RunMacro2` real contra um
+procedimento inexistente, que exercita o COM de verdade sem rodar VBA de
+terceiros.
 
 O primeiro valida `capture_viewport`, `get_selection` e `list_faces`. O
 segundo valida chapa metálica (`create_base_flange`,

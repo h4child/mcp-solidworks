@@ -1,7 +1,7 @@
 # SolidWorks MCP Server
 
 Servidor MCP em Python que controla o SolidWorks via COM (`win32com`), escrito
-com o SDK oficial (`mcp`, usando `FastMCP`). **139 ferramentas** (v5.5.0).
+com o SDK oficial (`mcp`, usando `FastMCP`). **141 ferramentas** (v5.5.0).
 
 ## Para quem so quer usar
 
@@ -128,6 +128,24 @@ um teste de ida-e-volta ocultar/exibir. Nenhum destes numeros foi assumido: os
 valores de referencia das 9 orientacoes nomeadas e o mapeamento 0/1 de
 visibilidade foram capturados ao vivo antes de escrever o codigo.
 
+### Macros VBA -- OK
+Adicionado em 16/08/2026 apos comparar este servidor com outros MCPs de
+SolidWorks publicos (todos expoem execucao de macro; este nao expunha).
+`list_macro_methods` inspeciona um `.swp`/`.swb`/`.dll` e lista os pontos de
+entrada **sem executar nada**, separando os procedimentos sem argumentos (os
+unicos que `RunMacro2` consegue chamar) dos que exigem parametros.
+`run_macro` executa um procedimento; com `module`/`procedure` vazios ele
+resolve sozinho quando existe exatamente um ponto de entrada, e caso contrario
+lista as opcoes em vez de adivinhar.
+
+Os filtros do `swMacroMethods_e` foram descobertos ao vivo, nao deduzidos dos
+nomes do enum: `1` = sem argumentos, `2` = com argumentos, e `0` -- que parece
+significar "todos" -- retorna `None`.
+
+> **Seguranca:** `run_macro` executa o VBA que estiver dentro do arquivo, com
+> os privilegios da sessao do SolidWorks, sem sandbox. Use apenas macros
+> confiaveis, e prefira `list_macro_methods` antes para ver o conteudo.
+
 ### Perfis estruturais (weldments) -- OK, exceto add_end_cap
 Validado ao vivo (SolidWorks 2025) com um membro em L + um membro cruzando-o,
 ambos em tubo quadrado ISO: `create_3d_sketch`, `draw_line_3d`,
@@ -180,6 +198,17 @@ gerenciador de propriedades ou de uma vista de modelo com estado especifico:
 `insert_cut_list_table`.
 
 ## Notas de implementacao
+
+### Reconexao apos o SolidWorks reiniciar (corrigido em 16/08/2026)
+A checagem de conexao viva era `_ = app.RevisionNumber`. Com a typelib
+*gerada* (o caso do Python 3.14 aqui), `RevisionNumber` e um **metodo**, entao
+esse acesso so montava o objeto de metodo do lado do Python e nunca chegava a
+cruzar a fronteira COM -- um proxy de uma instancia do SolidWorks ja encerrada
+passava na checagem como se estivesse saudavel. O resultado era que, depois de
+fechar e reabrir o SolidWorks, *todas* as chamadas falhavam com "O servidor RPC
+nao esta disponivel", inclusive `connect_solidworks`, porque o caminho de
+reconexao nunca era alcancado. Agora `_com_is_alive()` invoca a chamada de
+fato, e o mesmo padrao de no-op foi corrigido no rebuild de `shell_body`.
 
 ### Arquitetura
 - Todas as chamadas COM rodam em uma unica thread dedicada (COM/STA).

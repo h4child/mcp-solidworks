@@ -218,6 +218,26 @@ def _find_solidworks_exe() -> Optional[str]:
     return None
 
 
+def _com_is_alive(app) -> bool:
+    """Round-trip a real COM call to prove the proxy still reaches SolidWorks.
+
+    Bare attribute access is NOT a liveness check here. Under the generated
+    SolidWorks type library, ``RevisionNumber`` is a method, so
+    ``app.RevisionNumber`` only builds a bound-method wrapper on the Python
+    side and never crosses the COM boundary -- a proxy left over from a
+    SolidWorks instance that has since been closed looks perfectly healthy.
+    Actually invoking it is what surfaces the "RPC server unavailable" error
+    that tells us to reconnect.
+    """
+    try:
+        revision = app.RevisionNumber
+        if callable(revision):
+            revision = revision()
+        return revision is not None
+    except Exception:
+        return False
+
+
 def _connect_running_instance():
     for method in (
         lambda: win32com.client.GetActiveObject("SldWorks.Application"),
@@ -225,8 +245,9 @@ def _connect_running_instance():
     ):
         try:
             app = method()
+            if not _com_is_alive(app):
+                continue
             app.Visible = True
-            _ = app.RevisionNumber
             return app
         except Exception:
             continue
@@ -242,12 +263,10 @@ def _connect():
     _last_launch_happened = False
 
     if _app is not None:
-        try:
-            _ = _app.RevisionNumber
+        if _com_is_alive(_app):
             return _app
-        except Exception:
-            log.warning("Cached COM connection is stale, reconnecting")
-            _app = None
+        log.warning("Cached COM connection is stale, reconnecting")
+        _app = None
 
     app = _connect_running_instance()
     if app is not None:
@@ -1956,7 +1975,9 @@ async def shell_body(thickness: float = 2, remove_face_at_x: Optional[float] = N
         )
         # InsertFeatureShell belongs to IModelDoc2 and returns void over COM.
         doc.InsertFeatureShell(t_m, False)
-        _ = doc.EditRebuild3
+        rebuild = doc.EditRebuild3
+        if callable(rebuild):
+            rebuild()
         shell_count_after = sum(
             1
             for raw_feature in doc.FeatureManager.GetFeatures(False) or ()
@@ -8335,6 +8356,130 @@ async def get_view_state() -> dict:
             "orientation_matrix": matrix,
             "closest_named_view": _closest_named_view(matrix),
             "active_configuration": active_name,
+        }
+
+    return await _run(_impl)
+
+
+# swMacroMethods_e filters, confirmed live against real .swp files rather than
+# taken from the enum names: 1 lists the no-argument procedures -- the only
+# ones RunMacro2 can actually call -- and 2 lists procedures that take
+# arguments. 0 reads like an "all" flag but returns nothing at all.
+_MACRO_METHODS_WITHOUT_ARGS = 1
+_MACRO_METHODS_WITH_ARGS = 2
+_MACRO_SUFFIXES = {".swp", ".swb", ".dll"}
+
+
+def _resolve_macro_path(path: str):
+    macro_path = os.path.abspath(os.path.expanduser(path.strip()))
+    if not os.path.isfile(macro_path):
+        raise FileNotFoundError(f"Macro file not found: {macro_path}")
+    suffix = os.path.splitext(macro_path)[1].lower()
+    if suffix not in _MACRO_SUFFIXES:
+        raise ValueError(
+            f"'{suffix or macro_path}' is not a SolidWorks macro. "
+            f"Expected one of: {', '.join(sorted(_MACRO_SUFFIXES))}"
+        )
+    return macro_path
+
+
+def _macro_methods(app, macro_path: str, method_filter: int) -> list:
+    try:
+        methods = app.GetMacroMethods(macro_path, method_filter)
+    except Exception:
+        return []
+    return [str(entry) for entry in (methods or ())]
+
+
+@mcp.tool()
+async def list_macro_methods(path: str) -> dict:
+    """List the entry points inside a SolidWorks macro WITHOUT executing it.
+
+    Returns ``runnable`` (procedures taking no arguments, which is what
+    run_macro can invoke) and ``needs_arguments`` (procedures that take
+    parameters and therefore cannot be launched directly). Both are reported
+    as "Module.Procedure" strings, ready to be split into run_macro's
+    ``module`` and ``procedure``.
+
+    This only inspects the file, so it is safe to point at a macro whose
+    contents you have not reviewed yet.
+    """
+
+    def _impl():
+        app = _connect()
+        macro_path = _resolve_macro_path(path)
+        runnable = _macro_methods(app, macro_path, _MACRO_METHODS_WITHOUT_ARGS)
+        with_args = _macro_methods(app, macro_path, _MACRO_METHODS_WITH_ARGS)
+        return {
+            "path": macro_path,
+            "runnable": runnable,
+            "needs_arguments": with_args,
+            "runnable_count": len(runnable),
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def run_macro(
+    path: str,
+    module: str = "",
+    procedure: str = "",
+    unload_after: bool = True,
+) -> dict:
+    """Run a procedure from an existing SolidWorks macro file (.swp/.swb/.dll).
+
+    SECURITY: this executes whatever VBA the macro contains, with the same
+    privileges as the SolidWorks session -- it is not sandboxed, and a macro
+    can touch the file system and the rest of the machine. Only run macro
+    files you trust. Use list_macro_methods first to see what is inside one.
+
+    Leave ``module`` and ``procedure`` empty to auto-select when the macro
+    exposes exactly one runnable entry point; if there are several, the error
+    lists them so you can pick one. ``unload_after`` unloads the VBA project
+    when the run finishes, which avoids the macro holding state between calls.
+    """
+
+    def _impl():
+        app = _connect()
+        macro_path = _resolve_macro_path(path)
+
+        target_module, target_procedure = module.strip(), procedure.strip()
+        runnable = _macro_methods(app, macro_path, _MACRO_METHODS_WITHOUT_ARGS)
+        if not target_module or not target_procedure:
+            if len(runnable) != 1:
+                raise ValueError(
+                    "Specify module and procedure. "
+                    f"This macro exposes {len(runnable)} runnable entry points: "
+                    f"{', '.join(runnable) if runnable else '(none found)'}"
+                )
+            target_module, _, target_procedure = runnable[0].partition(".")
+
+        # swRunMacroOption_e: 0 keeps the VBA project loaded, 1 unloads it
+        # once the procedure returns.
+        options = 1 if unload_after else 0
+        result = app.RunMacro2(macro_path, target_module, target_procedure, options)
+        # RunMacro2 has a by-ref error out-parameter, so the generated proxy
+        # hands back (succeeded, error_code) while dynamic dispatch returns
+        # just the boolean.
+        if isinstance(result, tuple):
+            succeeded, error_code = bool(result[0]), int(result[1])
+        else:
+            succeeded, error_code = bool(result), 0
+
+        if not succeeded:
+            raise RuntimeError(
+                f"SolidWorks refused to run '{target_module}.{target_procedure}' from "
+                f"{macro_path} (error code {error_code}). Confirm the module and "
+                "procedure names with list_macro_methods."
+            )
+        return {
+            "path": macro_path,
+            "module": target_module,
+            "procedure": target_procedure,
+            "unloaded_after": unload_after,
+            "error_code": error_code,
+            "ran": True,
         }
 
     return await _run(_impl)

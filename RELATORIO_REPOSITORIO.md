@@ -9,7 +9,7 @@ pela API COM do Windows. O ponto de entrada e `server.py`; o catalogo publico
 das ferramentas fica em `manifest.json`; e a documentacao principal fica em
 `README.md`.
 
-A versao revisada declara 139 ferramentas no manifesto e no servidor (versao
+A versao revisada declara 141 ferramentas no manifesto e no servidor (versao
 5.5.0), distribuida como pacote `.mcpb` com `server.type: "uv"`.
 
 ## Estrutura publica recomendada
