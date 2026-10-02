@@ -990,6 +990,128 @@ async def list_components() -> dict:
 
 
 @mcp.tool()
+async def extract_assembly_data(config: str = "") -> dict:
+    """Walk every top-level component of the active assembly and return name,
+    material/custom properties, and mass/dimensions for each one in a single call.
+
+    Built for BOM-style extraction (e.g. an AI pipeline that needs quantity,
+    material, weight, and dimensions per part): without this, a caller needs
+    list_components plus one get_custom_properties and one measure_body call
+    PER component. This collapses that into one round trip and also returns
+    ``bom``: the same data grouped by source file with a computed ``quantity``,
+    ready to hand to a backend that builds the actual BOM/cut-list document.
+
+    config: configuration name to read custom properties from for every
+    component, same meaning as in get_custom_properties; empty string (the
+    default) reads document-level properties, not the component's assembly
+    configuration. Mass/dimensions are unaffected by this -- they always
+    measure the component's current geometry.
+
+    A component that fails to measure or read properties (suppressed, no
+    material, lightweight) does not fail the whole call -- its failure is
+    recorded in that component's own ``errors`` list instead, so a BOM
+    checklist can report exactly which parts are incomplete.
+    """
+
+    def _impl():
+        assy = _active_assembly()
+        factor = 1.0 / UNIT_TO_METERS.get(_default_unit, 0.001)
+        components = []
+        for raw in assy.GetComponents(True) or ():
+            comp = win32com.client.Dispatch(raw)
+            entry = {
+                "name": comp.Name2,
+                "path": comp.GetPathName,
+                "suppressed": bool(comp.IsSuppressed),
+                "properties": None,
+                "measurement": None,
+                "errors": [],
+            }
+
+            model_doc = None
+            try:
+                # Dynamic IDispatch auto-invokes zero-arg methods on attribute
+                # access, so comp.GetModelDoc2 (no parens) is ALREADY the
+                # resolved IModelDoc2 here -- and since pywin32 wraps every
+                # dispatched COM object with a generic __call__, _com_member's
+                # callable() check can't tell "unresolved bound method" apart
+                # from "already-resolved object that merely supports being
+                # called". Try the call (correct under the generated type
+                # library, where GetModelDoc2 is a real method); if it raises
+                # DISP_E_MEMBERNOTFOUND, the pre-call value was the real
+                # object all along, so fall back to it instead of failing.
+                raw_doc = comp.GetModelDoc2
+                if callable(raw_doc):
+                    try:
+                        raw_doc = raw_doc()
+                    except Exception:
+                        pass
+                if raw_doc is not None:
+                    model_doc = win32com.client.Dispatch(raw_doc)
+            except Exception as exc:
+                entry["errors"].append(f"could not open component document: {exc}")
+
+            if model_doc is None:
+                if not entry["suppressed"]:
+                    entry["errors"].append(
+                        "component document is not loaded (suppressed or lightweight)"
+                    )
+                components.append(entry)
+                continue
+
+            try:
+                # Match get_custom_properties' own default exactly: empty
+                # config reads document-level properties, not the component's
+                # referenced configuration. A part set up with set_custom_property
+                # (document-level, same as this tool's own default) would
+                # otherwise come back empty here even though the data exists --
+                # confirmed by testing against a live part built that way.
+                cpm = model_doc.Extension.CustomPropertyManager(config)
+                entry["properties"] = _read_custom_properties(cpm)
+            except Exception as exc:
+                entry["errors"].append(f"could not read custom properties: {exc}")
+
+            try:
+                entry["measurement"] = _measure_model_doc(model_doc, factor)
+            except Exception as exc:
+                entry["errors"].append(f"could not measure body: {exc}")
+
+            components.append(entry)
+
+        bom: dict = {}
+        order = []
+        for entry in components:
+            key = entry["path"] or entry["name"]
+            if key not in bom:
+                bom[key] = {
+                    "path": entry["path"],
+                    "representative_name": entry["name"],
+                    "quantity": 0,
+                    "properties": entry["properties"],
+                    "measurement": entry["measurement"],
+                    "instance_names": [],
+                }
+                order.append(key)
+            row = bom[key]
+            row["quantity"] += 1
+            row["instance_names"].append(entry["name"])
+            if row["properties"] is None and entry["properties"]:
+                row["properties"] = entry["properties"]
+            if row["measurement"] is None and entry["measurement"]:
+                row["measurement"] = entry["measurement"]
+
+        return {
+            "assembly": _doc_title(_active_doc()),
+            "component_count": len(components),
+            "unique_part_count": len(order),
+            "components": components,
+            "bom": [bom[k] for k in order],
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool()
 async def get_component_transform(name: str, unit: Optional[str] = None) -> dict:
     """Read an assembly component's exact position and orientation.
 
@@ -7284,6 +7406,34 @@ async def delete_feature(name: str, delete_children: bool = True) -> dict:
 # Custom properties tools
 # ===========================================================================
 
+def _read_custom_properties(cpm) -> dict:
+    """Read every property off a CustomPropertyManager into {name: {value, resolved}}.
+
+    Shared by get_custom_properties (active document) and extract_assembly_data
+    (one CustomPropertyManager per assembly component) so both read properties
+    the same way instead of drifting apart.
+    """
+    names = cpm.GetNames
+    if not names:
+        return {}
+
+    props = {}
+    for name in names:
+        val_out = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_BSTR, "")
+        resolved_out = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_BSTR, "")
+        was_resolved = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_BOOL, False)
+        try:
+            cpm.Get5(name, False, val_out, resolved_out, was_resolved)
+            props[name] = {"value": val_out.value, "resolved": resolved_out.value}
+        except Exception:
+            try:
+                cpm.Get6(name, False, val_out, resolved_out, was_resolved, False)
+                props[name] = {"value": val_out.value, "resolved": resolved_out.value}
+            except Exception:
+                props[name] = {"value": "(could not read)", "resolved": ""}
+    return props
+
+
 @mcp.tool()
 async def get_custom_properties(config: str = "") -> dict:
     """Read all custom properties from the active document.
@@ -7292,24 +7442,7 @@ async def get_custom_properties(config: str = "") -> dict:
     def _impl():
         doc = _active_doc()
         cpm = doc.Extension.CustomPropertyManager(config)
-        names = cpm.GetNames
-        if not names:
-            return {"config": config or "(document)", "count": 0, "properties": {}}
-
-        props = {}
-        for name in names:
-            val_out = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_BSTR, "")
-            resolved_out = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_BSTR, "")
-            was_resolved = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_BOOL, False)
-            try:
-                cpm.Get5(name, False, val_out, resolved_out, was_resolved)
-                props[name] = {"value": val_out.value, "resolved": resolved_out.value}
-            except Exception:
-                try:
-                    cpm.Get6(name, False, val_out, resolved_out, was_resolved, False)
-                    props[name] = {"value": val_out.value, "resolved": resolved_out.value}
-                except Exception:
-                    props[name] = {"value": "(could not read)", "resolved": ""}
+        props = _read_custom_properties(cpm)
         return {"config": config or "(document)", "count": len(props), "properties": props}
 
     return await _run(_impl)
@@ -7346,6 +7479,78 @@ async def set_custom_property(name: str, value: str, config: str = "") -> dict:
 # Measurement tools
 # ===========================================================================
 
+def _measure_model_doc(doc, factor: float) -> dict:
+    """Mass/volume/surface/bounding-box of any IModelDoc2, in SI + ``factor``-scaled size.
+
+    Shared by measure_body (active document) and extract_assembly_data (one
+    component's model document at a time). Raises if nothing could be measured
+    at all, same as measure_body always did -- callers that want a per-item
+    soft failure (extract_assembly_data) catch that around each component.
+    """
+    result = {}
+
+    try:
+        mp = doc.Extension.CreateMassProperty()
+        if mp is not None:
+            mp = win32com.client.Dispatch(mp)
+            try:
+                result["mass_kg"] = mp.Mass
+            except Exception:
+                pass
+            try:
+                result["volume_m3"] = mp.Volume
+            except Exception:
+                pass
+            try:
+                result["surface_area_m2"] = mp.SurfaceArea
+            except Exception:
+                pass
+            try:
+                com = mp.CenterOfMass
+                if com:
+                    result["center_of_mass_m"] = list(com)
+            except Exception:
+                pass
+    except Exception:
+        log.debug("CreateMassProperty failed, trying GetMassProperties")
+        try:
+            status = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+            props = doc.Extension.GetMassProperties2(1, status, False)
+            if props:
+                result["center_of_mass_m"] = [props[0], props[1], props[2]]
+                result["volume_m3"] = props[3]
+                result["surface_area_m2"] = props[4]
+                result["mass_kg"] = props[5]
+        except Exception:
+            pass
+
+    bodies = doc.GetBodies2(0, True)
+    if bodies:
+        try:
+            body = win32com.client.Dispatch(bodies[0])
+            box = body.GetBodyBox()
+            if box:
+                result["bounding_box"] = {
+                    "min_m": [box[0], box[1], box[2]],
+                    "max_m": [box[3], box[4], box[5]],
+                    "size": {
+                        "x": round(abs(box[3] - box[0]) * factor, 4),
+                        "y": round(abs(box[4] - box[1]) * factor, 4),
+                        "z": round(abs(box[5] - box[2]) * factor, 4),
+                        "unit": _default_unit,
+                    },
+                }
+        except Exception:
+            pass
+
+    if not result:
+        raise RuntimeError(
+            "Could not measure the body. Ensure the document has a solid body "
+            "and a material assigned (right-click the material in the feature tree)."
+        )
+    return result
+
+
 @mcp.tool()
 async def measure_body() -> dict:
     """Measure the active document's solid body: mass, volume, surface area,
@@ -7354,69 +7559,8 @@ async def measure_body() -> dict:
 
     def _impl():
         doc = _active_doc()
-        result = {}
-
-        try:
-            mp = doc.Extension.CreateMassProperty()
-            if mp is not None:
-                mp = win32com.client.Dispatch(mp)
-                try:
-                    result["mass_kg"] = mp.Mass
-                except Exception:
-                    pass
-                try:
-                    result["volume_m3"] = mp.Volume
-                except Exception:
-                    pass
-                try:
-                    result["surface_area_m2"] = mp.SurfaceArea
-                except Exception:
-                    pass
-                try:
-                    com = mp.CenterOfMass
-                    if com:
-                        result["center_of_mass_m"] = list(com)
-                except Exception:
-                    pass
-        except Exception:
-            log.debug("CreateMassProperty failed, trying GetMassProperties")
-            try:
-                status = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-                props = doc.Extension.GetMassProperties2(1, status, False)
-                if props:
-                    result["center_of_mass_m"] = [props[0], props[1], props[2]]
-                    result["volume_m3"] = props[3]
-                    result["surface_area_m2"] = props[4]
-                    result["mass_kg"] = props[5]
-            except Exception:
-                pass
-
-        bodies = doc.GetBodies2(0, True)
-        if bodies:
-            try:
-                body = win32com.client.Dispatch(bodies[0])
-                box = body.GetBodyBox()
-                if box:
-                    factor = 1.0 / UNIT_TO_METERS.get(_default_unit, 0.001)
-                    result["bounding_box"] = {
-                        "min_m": [box[0], box[1], box[2]],
-                        "max_m": [box[3], box[4], box[5]],
-                        "size": {
-                            "x": round(abs(box[3] - box[0]) * factor, 4),
-                            "y": round(abs(box[4] - box[1]) * factor, 4),
-                            "z": round(abs(box[5] - box[2]) * factor, 4),
-                            "unit": _default_unit,
-                        },
-                    }
-            except Exception:
-                pass
-
-        if not result:
-            raise RuntimeError(
-                "Could not measure the body. Ensure the document has a solid body "
-                "and a material assigned (right-click the material in the feature tree)."
-            )
-        return result
+        factor = 1.0 / UNIT_TO_METERS.get(_default_unit, 0.001)
+        return _measure_model_doc(doc, factor)
 
     return await _run(_impl)
 

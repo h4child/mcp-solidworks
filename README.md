@@ -1,7 +1,7 @@
 # SolidWorks MCP Server
 
 Servidor MCP em Python que controla o SolidWorks via COM (`win32com`), escrito
-com o SDK oficial (`mcp`, usando `FastMCP`). **142 ferramentas** (v5.6.0).
+com o SDK oficial (`mcp`, usando `FastMCP`). **143 ferramentas** (v5.7.0).
 
 ## Para quem so quer usar
 
@@ -116,7 +116,26 @@ dialogo de confirmacao do SolidWorks, que travaria a chamada COM.
 `add_screw_mate` (OK), `add_rack_pinion_mate` (OK),
 `list_motion_studies` (OK), `create_motion_study` (OK),
 `create_assembly_pattern` (EXP -- precisa de referencia de direcao),
-`create_exploded_view` (EXP)
+`create_exploded_view` (EXP), `extract_assembly_data` (OK)
+
+Adicionada em 02/10/2026 para fluxos de extracao tipo BOM (ex.: pipelines de IA
+que precisam de quantidade, material, peso e dimensoes por peca): sem ela, um
+cliente precisa de `list_components` mais um `get_custom_properties` e um
+`measure_body` **por componente**. `extract_assembly_data` percorre os
+componentes de topo da montagem ativa, abre o `IModelDoc2` de cada um
+(`IComponent2.GetModelDoc2` -- chega como metodo ligado sob dynamic IDispatch
+e ja resolvido sob a typelib gerada; o valor pre-chamada e usado como
+fallback se a chamada em si falhar com membro-nao-encontrado) e le
+propriedades/massa no mesmo nivel padrao de `get_custom_properties`
+(config vazio = nivel do documento, nao a configuracao do componente na
+montagem), numa unica chamada. Tambem devolve `bom`: os mesmos dados
+agrupados por arquivo de origem com `quantity` computada, pronto para um
+backend montar a BOM/lista de corte de verdade. Falha por componente (sem
+material, suprimido, sem corpo) fica no `errors` daquele item em vez de
+derrubar a chamada inteira -- a logica interna de leitura de propriedades e
+medicao e a mesma de `get_custom_properties`/`measure_body` (extraida para
+`_read_custom_properties`/`_measure_model_doc` para as duas ferramentas nao
+divergirem com o tempo).
 
 ### Propriedades / Medicao / Exportacao / Configuracoes -- OK
 `get_custom_properties`, `set_custom_property`, `measure_body`,
