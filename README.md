@@ -1,7 +1,7 @@
 # SolidWorks MCP Server
 
 Servidor MCP em Python que controla o SolidWorks via COM (`win32com`), escrito
-com o SDK oficial (`mcp`, usando `FastMCP`). **143 ferramentas** (v5.7.0).
+com o SDK oficial (`mcp`, usando `FastMCP`). **143 ferramentas** (v5.7.1).
 
 ## Para quem so quer usar
 
@@ -225,6 +225,21 @@ gerenciador de propriedades ou de uma vista de modelo com estado especifico:
 `insert_cut_list_table`.
 
 ## Notas de implementacao
+
+### OpenDoc6/ActivateDoc3 com erro de tipo COM (corrigido em 02/10/2026)
+`open_document` e, por consequencia, `insert_component` (que reabre o
+componente e reativa a montagem internamente antes de inserir) passaram a
+falhar com `Tipo nao correspondente` (DISP_E_TYPEMISMATCH) nesta instalacao.
+Causa: `_open_doc6`/`_activate_doc3` passavam inteiros simples (`0, 0`) para
+os parametros de saida (`Errors`/`Warnings`) de `OpenDoc6`/`ActivateDoc3`. Sob
+o binding COM atual desta maquina isso nao e aceito -- precisa de VARIANTs
+reais por referencia (`VT_BYREF | VT_I4`), exatamente o padrao que
+`_save_doc3` ja usava para `Save3`. `AddComponent5` (usado por
+`insert_component`) nunca teve bug proprio: o erro aparecia por causa da
+chamada anterior a `_open_doc6`/`_activate_doc3` dentro do mesmo fluxo,
+nao da propria insercao. As duas funcoes agora tentam o VARIANT primeiro e
+caem para inteiros simples (`except TypeError`) se o binding ativo rejeitar
+o VARIANT, cobrindo os dois modos de binding como `_save_doc3` ja fazia.
 
 ### Reconexao apos o SolidWorks reiniciar (corrigido em 16/08/2026)
 A checagem de conexao viva era `_ = app.RevisionNumber`. Com a typelib

@@ -355,19 +355,44 @@ def _split_com_result(result):
 
 
 def _open_doc6(app, filepath: str, doc_type: int, options: int = 0):
-    """Open a document through OpenDoc6 and return ``(document, errors, warnings)``."""
-    result = app.OpenDoc6(filepath, doc_type, options, "", 0, 0)
-    doc, outputs = _split_com_result(result)
-    errors = int(outputs[0]) if len(outputs) > 0 else 0
-    warnings = int(outputs[1]) if len(outputs) > 1 else 0
+    """Open a document through OpenDoc6 and return ``(document, errors, warnings)``.
+
+    Same dual-mode handling as _save_doc3: try real by-reference VARIANTs for
+    the Errors/Warnings out-params first (required when the Application
+    object is dynamic IDispatch -- plain ints raise DISP_E_TYPEMISMATCH
+    there), and fall back to plain ints for whichever binding rejects a
+    VARIANT in that position instead.
+    """
+    errors_out = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+    warnings_out = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+    try:
+        result = app.OpenDoc6(filepath, doc_type, options, "", errors_out, warnings_out)
+        doc, outputs = _split_com_result(result)
+        errors = int(outputs[0]) if len(outputs) > 0 else int(errors_out.value)
+        warnings = int(outputs[1]) if len(outputs) > 1 else int(warnings_out.value)
+    except TypeError:
+        result = app.OpenDoc6(filepath, doc_type, options, "", 0, 0)
+        doc, outputs = _split_com_result(result)
+        errors = int(outputs[0]) if len(outputs) > 0 else 0
+        warnings = int(outputs[1]) if len(outputs) > 1 else 0
     return doc, errors, warnings
 
 
 def _activate_doc3(app, title: str, make_visible: bool = True):
-    """Activate a document while tolerating typed and dynamic COM dispatch."""
-    result = app.ActivateDoc3(title, make_visible, 0, 0)
-    doc, outputs = _split_com_result(result)
-    errors = int(outputs[0]) if outputs else 0
+    """Activate a document while tolerating typed and dynamic COM dispatch.
+
+    Same VARIANT-first, plain-int-fallback handling as _open_doc6/_save_doc3
+    for the Errors out-param.
+    """
+    errors_out = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+    try:
+        result = app.ActivateDoc3(title, make_visible, 0, errors_out)
+        doc, outputs = _split_com_result(result)
+        errors = int(outputs[0]) if outputs else int(errors_out.value)
+    except TypeError:
+        result = app.ActivateDoc3(title, make_visible, 0, 0)
+        doc, outputs = _split_com_result(result)
+        errors = int(outputs[0]) if outputs else 0
     return doc, errors
 
 
