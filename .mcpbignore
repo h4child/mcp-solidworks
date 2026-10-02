@@ -13,3 +13,5 @@ debug.log
 RELATORIO_TESTES.md
 RELATORIO_REPOSITORIO.md
 *.mcpb
+.venv/
+backup_extensao/
