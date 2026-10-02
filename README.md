@@ -1,7 +1,7 @@
 # SolidWorks MCP Server
 
 Servidor MCP em Python que controla o SolidWorks via COM (`win32com`), escrito
-com o SDK oficial (`mcp`, usando `FastMCP`). **143 ferramentas** (v5.7.1).
+com o SDK oficial (`mcp`, usando `FastMCP`). **143 ferramentas** (v5.7.2).
 
 ## Para quem so quer usar
 
@@ -225,6 +225,22 @@ gerenciador de propriedades ou de uma vista de modelo com estado especifico:
 `insert_cut_list_table`.
 
 ## Notas de implementacao
+
+### extract_assembly_data nao via o material nativo (corrigido em 02/10/2026)
+Num teste de ponta a ponta com o backend do Alfa Detail (POST real do
+resultado de `extract_assembly_data` contra a API rodando), toda peca que
+tinha material atribuido via `set_material` chegava como "sem material" do
+outro lado. Causa: `set_material` grava no slot nativo de material do
+SolidWorks (`SetMaterialPropertyName2`), que e **separado** do
+`CustomPropertyManager` -- `extract_assembly_data` so lia propriedades
+customizadas, entao nunca via esse material. `extract_assembly_data` agora
+le tambem o material nativo via `GetMaterialPropertyName2` (o parametro de
+saida `Database` precisa de um VARIANT real por referencia, mesma familia de
+quirk ja documentada para `OpenDoc6`/`ActivateDoc3`/`Save3` abaixo) e injeta
+como propriedade `"Material"` -- mas **so como fallback**, se o modelo ja
+tiver uma propriedade customizada `Material` explicita, essa continua
+valendo. Cobre os dois casos que o proprio PDF do Alfa Detail preve:
+"Material: get_custom_properties OU set_material".
 
 ### OpenDoc6/ActivateDoc3 com erro de tipo COM (corrigido em 02/10/2026)
 `open_document` e, por consequencia, `insert_component` (que reabre o

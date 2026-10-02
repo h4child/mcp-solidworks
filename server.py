@@ -1036,6 +1036,11 @@ async def extract_assembly_data(config: str = "") -> dict:
     material, lightweight) does not fail the whole call -- its failure is
     recorded in that component's own ``errors`` list instead, so a BOM
     checklist can report exactly which parts are incomplete.
+
+    ``properties["Material"]`` is filled in from the native SolidWorks
+    material assignment (set_material) when no custom property named
+    "Material" already exists -- the two live in separate places in
+    SolidWorks, and a custom property always takes precedence if present.
     """
 
     def _impl():
@@ -1095,6 +1100,19 @@ async def extract_assembly_data(config: str = "") -> dict:
                 entry["properties"] = _read_custom_properties(cpm)
             except Exception as exc:
                 entry["errors"].append(f"could not read custom properties: {exc}")
+
+            # Material commonly lives in the native SolidWorks material slot
+            # (set_material), not as a custom property -- only use it as a
+            # fallback so an explicit "Material" custom property always wins.
+            if entry["properties"] is not None and not any(
+                k.lower() == "material" for k in entry["properties"]
+            ):
+                native_material = _native_material_name(model_doc, config)
+                if native_material:
+                    entry["properties"]["Material"] = {
+                        "value": native_material,
+                        "resolved": native_material,
+                    }
 
             try:
                 entry["measurement"] = _measure_model_doc(model_doc, factor)
@@ -7430,6 +7448,24 @@ async def delete_feature(name: str, delete_children: bool = True) -> dict:
 # ===========================================================================
 # Custom properties tools
 # ===========================================================================
+
+def _native_material_name(doc, config: str = "") -> Optional[str]:
+    """Read the material assigned via set_material (IPartDoc.SetMaterialPropertyName2),
+    which does NOT show up in CustomPropertyManager -- it's a separate native
+    slot. The Database out-param needs a real by-reference VARIANT (confirmed
+    live: a plain "" raises DISP_E_TYPEMISMATCH here, same family of binding
+    quirk as _open_doc6/_activate_doc3/_save_doc3 above). Returns None for a
+    document with no material assigned, or a non-part document.
+    """
+    if _doc_type(doc) != 1:  # only IPartDoc exposes a single material
+        return None
+    try:
+        database_out = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_BSTR, "")
+        name = doc.GetMaterialPropertyName2(config, database_out)
+        return name or None
+    except Exception:
+        return None
+
 
 def _read_custom_properties(cpm) -> dict:
     """Read every property off a CustomPropertyManager into {name: {value, resolved}}.
