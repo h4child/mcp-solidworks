@@ -1,7 +1,7 @@
 # SolidWorks MCP Server
 
 Servidor MCP em Python que controla o SolidWorks via COM (`win32com`), escrito
-com o SDK oficial (`mcp`, usando `FastMCP`). **141 ferramentas** (v5.5.0).
+com o SDK oficial (`mcp`, usando `FastMCP`). **142 ferramentas** (v5.6.0).
 
 ## Para quem so quer usar
 
@@ -91,7 +91,15 @@ catalogo, mas permanece bloqueada ate
 ### Features 3D -- OK
 `extrude_sketch`, `cut_extrude`, `revolve_sketch`, `sweep_sketch`,
 `loft_sketches`, `fillet_edges`, `chamfer_edges`, `shell_body`,
-`linear_pattern`, `circular_pattern`, `hole_wizard`, `list_features`
+`linear_pattern`, `circular_pattern`, `hole_wizard`, `list_features`,
+`delete_feature`
+
+Adicionada em 17/08/2026: ate esta versao nao havia forma de apagar uma
+feature de peca por nome (so existia `delete_component` para assembly).
+`delete_feature` seleciona por `SelectByID2(nome, "BODYFEATURE", ...)` e
+chama `DeleteSelection2`; por padrao tambem remove features dependentes
+(ex.: um weld member construido sobre um esboco 3D) para nao esbarrar no
+dialogo de confirmacao do SolidWorks, que travaria a chamada COM.
 
 ### Operacoes de corpo / referencia
 `mirror_feature` (OK), `mirror_body` (OK), `move_copy_body` (OK),
@@ -214,6 +222,25 @@ fato, e o mesmo padrao de no-op foi corrigido no rebuild de `shell_body`.
 - Todas as chamadas COM rodam em uma unica thread dedicada (COM/STA).
 - Timeout de 120s por operacao COM; limpeza automatica no shutdown.
 - Late binding (dispatch dinamico) -- igual ao ambiente do Claude Desktop.
+
+### Camada de metodologia (design-sandbox): instructions, resource e prompt
+As 141 ferramentas sao primitivas; sozinhas nao ensinam a IA a projetar bem.
+O servidor expoe as outras duas primitivas do protocolo MCP para cobrir essa
+lacuna, codificando o metodo ja validado nas replicas de engenharia deste
+projeto (ver `RELATORIO_TESTES.md`) em vez de depender de disciplina manual
+a cada conversa:
+- `instructions` do `FastMCP(...)`: injetado automaticamente pelo cliente MCP
+  ao conectar. Resume o loop planejar -> isolar -> construir incremental ->
+  validar (`measure_body`/`validate_model`) -> inspecionar visualmente
+  (`capture_standard_views`) antes de avancar.
+- Resource `solidworks://tool-status`: reexpoe a secao "Status de
+  verificacao" deste README (fonte unica, lida em tempo real -- sem
+  duplicar o conteudo) para a IA saber quais ferramentas sao OK vs. EXP
+  antes de depender de uma delas.
+- Prompt `design_from_reference(part_description, key_dimensions,
+  reference_source)`: roteiro passo a passo para projetar uma peca nova a
+  partir de uma referencia real, formalizando o processo usado nas 5
+  replicas de engenharia (bucha, rolamento, polia, clevis, helice).
 
 ### Descoberta do SolidWorks
 - `_find_solidworks_exe` le `HKLM\SOFTWARE\SolidWorks\SOLIDWORKS <ano>\Setup\

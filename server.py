@@ -11,6 +11,7 @@ out must be used from the thread that first connected to it.
 
 import os
 import io
+import re
 import math
 import time
 import atexit
@@ -38,7 +39,41 @@ logging.basicConfig(
 )
 log = logging.getLogger("solidworks-mcp")
 
-mcp = FastMCP("solidworks-mcp")
+SERVER_INSTRUCTIONS = """\
+Este servidor controla uma sessao REAL e ja aberta do SolidWorks via COM: \
+cada chamada tem efeito imediato e pode alterar, salvar ou fechar \
+documentos de verdade. Antes de modelar algo nao trivial, siga este \
+metodo (validado nas replicas de engenharia deste projeto -- ver \
+RELATORIO_TESTES.md):
+
+1. ISOLAR -- trabalhe num documento novo e descartavel (create_new_part / \
+   create_new_assembly). Nao reaproveite nem edite um documento que o \
+   usuario ja tinha aberto, a menos que ele peca isso explicitamente.
+2. PLANEJAR -- antes de chamar qualquer tool, escreva em texto a arvore de \
+   features pretendida e as dimensoes criticas que precisam bater com o \
+   objetivo. Nao improvise feature a feature sem plano.
+3. CONSTRUIR INCREMENTAL -- execute o plano em pequenos grupos de \
+   features. Prefira ferramentas confirmadas OK no resource \
+   solidworks://tool-status; para uma ferramenta marcada EXP, releia as \
+   ressalvas la descritas antes de depender dela.
+4. VALIDAR A CADA PASSO -- depois de cada feature estrutural (extrude, \
+   corte, padrao, chanfro, casca...), chame measure_body e/ou \
+   validate_model. O SolidWorks as vezes retorna sucesso mesmo com o \
+   recurso em erro suprimido; nao acumule features sem validar.
+5. INSPECIONAR VISUALMENTE -- chame capture_standard_views (ou \
+   zoom_to_fit + set_view) periodicamente e observe a imagem retornada \
+   antes de seguir para a proxima etapa, comparando proporcao e \
+   silhueta com a referencia ou descricao pedida.
+6. Use o prompt design_from_reference como roteiro completo quando a \
+   tarefa for replicar uma peca a partir de uma referencia real (foto, \
+   catalogo, desenho tecnico).
+
+execute_python fica desligado por padrao e so deve ser usado se o \
+usuario pedir execucao de script explicitamente com \
+SOLIDWORKS_MCP_ENABLE_EXECUTE_PYTHON=1 ja configurado.
+"""
+
+mcp = FastMCP("solidworks-mcp", instructions=SERVER_INSTRUCTIONS)
 
 # ---------------------------------------------------------------------------
 # Single-threaded COM executor
@@ -7192,6 +7227,59 @@ async def list_features() -> dict:
     return await _run(_impl)
 
 
+@mcp.tool()
+async def delete_feature(name: str, delete_children: bool = True) -> dict:
+    """Delete a named feature from the active part/assembly's FeatureManager tree.
+
+    Works for sketches (2D/3D), weldment members, reference geometry, and any
+    other tree-level feature -- unlike components in an assembly
+    (delete_component), SolidWorks exposes no separate part-feature-delete API,
+    so this is the only way to remove a feature that isn't a mate,
+    configuration, or equation.
+
+    delete_children: also delete features that depend on this one (e.g. a weld
+    member built from a 3D sketch) instead of leaving SolidWorks to prompt its
+    confirm-delete dialog, which would otherwise block the COM call.
+    """
+
+    def _impl():
+        doc = _active_doc()
+        feature_name = name.strip()
+        if not feature_name:
+            raise ValueError("Feature name cannot be empty.")
+
+        def _feature_names():
+            return {str(feat.Name) for feat in (doc.FeatureManager.GetFeatures(False) or ())}
+
+        before = _feature_names()
+        if feature_name not in before:
+            raise ValueError(f"Feature '{feature_name}' does not exist.")
+
+        doc.ClearSelection2(True)
+        empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+        if not doc.Extension.SelectByID2(
+            feature_name, "BODYFEATURE", 0, 0, 0, False, 0, empty, 0
+        ):
+            raise RuntimeError(f"SolidWorks could not select feature '{feature_name}'.")
+
+        options = 2 if delete_children else 0  # swDeleteSelectionOptions_Children
+        if not bool(doc.Extension.DeleteSelection2(options)):
+            raise RuntimeError(f"SolidWorks could not delete feature '{feature_name}'.")
+
+        after = _feature_names()
+        if feature_name in after:
+            raise RuntimeError(f"Feature '{feature_name}' remains in the feature tree after deletion.")
+        also_removed = sorted(before - after - {feature_name})
+        _redraw_document(doc)
+        return {
+            "deleted": feature_name,
+            "also_removed": also_removed,
+            "remaining_feature_count": len(after),
+        }
+
+    return await _run(_impl)
+
+
 # ===========================================================================
 # Custom properties tools
 # ===========================================================================
@@ -8542,6 +8630,105 @@ async def execute_python(code: str) -> dict:
         return {"stdout": buf.getvalue()}
 
     return await _run(_impl)
+
+
+# ---------------------------------------------------------------------------
+# Design-sandbox guidance: resource + prompt
+# ---------------------------------------------------------------------------
+# These do not touch SolidWorks. They exist so the calling AI has a
+# methodology layer on top of the raw tool catalog: which tools are actually
+# reliable in this installation, and how to sequence plan/build/verify steps
+# instead of improvising feature-by-feature. See RELATORIO_TESTES.md for the
+# live-tested workflow this codifies.
+
+README_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "README.md")
+
+
+@mcp.resource(
+    "solidworks://tool-status",
+    name="tool-reliability-status",
+    description=(
+        "Quais ferramentas estao confirmadas OK vs. experimentais (EXP) "
+        "nesta versao/instalacao do SolidWorks, com as ressalvas conhecidas "
+        "de cada uma. Consulte antes de depender de uma ferramenta EXP."
+    ),
+    mime_type="text/markdown",
+)
+def tool_reliability_status() -> str:
+    """Return the live-verification status table straight from README.md."""
+    text = _read_readme_or_fallback()
+    heading = re.search(r"^## Status de verifica.*$", text, re.MULTILINE)
+    if not heading:
+        return text
+    body_start = heading.end()
+    next_heading = re.search(r"^## ", text[body_start:], re.MULTILINE)
+    body_end = body_start + next_heading.start() if next_heading else len(text)
+    return text[heading.start():body_end].strip()
+
+
+def _read_readme_or_fallback() -> str:
+    try:
+        with open(README_PATH, "r", encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return "README.md nao encontrado ao lado de server.py."
+
+
+@mcp.prompt(
+    name="design_from_reference",
+    description=(
+        "Roteiro passo a passo para projetar uma peca nova a partir de uma "
+        "referencia real (foto, desenho tecnico, catalogo), seguindo o "
+        "metodo validado nas replicas de engenharia deste projeto."
+    ),
+)
+def design_from_reference(
+    part_description: str,
+    key_dimensions: str = "",
+    reference_source: str = "",
+) -> str:
+    """Scaffold the plan/build/verify/inspect loop for a new part."""
+    dims_line = (
+        f"Dimensoes criticas conhecidas: {key_dimensions}"
+        if key_dimensions
+        else "Dimensoes criticas: ainda nao levantadas -- extraia-as da "
+        "referencia antes de modelar."
+    )
+    source_line = f"\nReferencia: {reference_source}" if reference_source else ""
+
+    return f"""Projete a seguinte peca usando o metodo de design-sandbox deste servidor:
+
+Peca: {part_description}
+{dims_line}{source_line}
+
+Siga esta sequencia, sem pular etapas:
+
+1. PLANEJAR -- antes de chamar qualquer tool, escreva em texto a arvore de
+   features pretendida (ex.: sketch base -> extrude 40mm -> corte circular
+   passante 10mm -> arredondamento 2mm nas arestas X) e as dimensoes
+   criticas que precisam bater com a referencia.
+2. ISOLAR -- crie a peca com create_new_part num documento novo e
+   descartavel. Nao reaproveite nem edite um documento que o usuario ja
+   tinha aberto.
+3. CONSTRUIR INCREMENTAL -- execute o plano feature por feature. Prefira
+   ferramentas marcadas OK no resource solidworks://tool-status; para
+   ferramentas EXP, releia as ressalvas la descritas antes de tentar, e
+   tenha um fallback manual pronto.
+4. VALIDAR A CADA PASSO -- depois de cada feature estrutural (extrude,
+   corte, padrao, chanfro, casca...), chame measure_body e/ou
+   validate_model. Nao acumule mais de 2-3 features sem validar; erros
+   silenciosos se acumulam e ficam mais dificeis de rastrear depois.
+5. INSPECIONAR VISUALMENTE -- chame capture_standard_views (ou
+   zoom_to_fit + set_view) e observe a imagem retornada. Compare
+   proporcao e silhueta com a referencia/descricao antes de seguir para a
+   proxima etapa do plano.
+6. COMPARAR E ITERAR -- se a geometria nao bater com a referencia
+   (proporcao, posicao de furos, simetria), corrija a feature responsavel
+   antes de avancar; nao tente compensar num passo posterior.
+7. FINALIZAR -- so depois de validado sem erros/avisos e com a inspecao
+   visual aprovada, salve o resultado e reporte ao usuario as dimensoes
+   finais medidas (measure_body) comparadas com as dimensoes-alvo.
+"""
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "solidworks-mcp",
   "display_name": "SolidWorks MCP",
-  "version": "5.5.0",
+  "version": "5.6.0",
   "description": "MCP server for SolidWorks automation through the Windows COM API, built with FastMCP.",
   "long_description": "Controls SolidWorks via COM for parts, assemblies, sketches, features, drawings, appearances, validation, and selected mechanical mates. Designed for trusted local desktop automation.",
   "author": {
@@ -157,6 +157,7 @@
     { "name": "rename_display_state", "description": "Rename an existing display state." },
     { "name": "delete_display_state", "description": "Delete an existing display state." },
     { "name": "list_features", "description": "List the feature tree of the active document." },
+    { "name": "delete_feature", "description": "Delete a named feature (sketch, weldment member, reference geometry, etc.) from the active document's tree." },
     { "name": "get_custom_properties", "description": "Read custom properties from the active document." },
     { "name": "set_custom_property", "description": "Set a custom property on the active document." },
     { "name": "measure_body", "description": "Measure mass, volume, surface area, and bounding box." },
