@@ -1,6 +1,6 @@
 __pycache__/
 *.pyc
-.claude/
+.claude/settings.local.json
 .gitignore
 .mcpbignore
 *.SLDPRT

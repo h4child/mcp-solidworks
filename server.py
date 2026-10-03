@@ -67,6 +67,14 @@ RELATORIO_TESTES.md):
 6. Use o prompt design_from_reference como roteiro completo quando a \
    tarefa for replicar uma peca a partir de uma referencia real (foto, \
    catalogo, desenho tecnico).
+7. CONHECIMENTO DE ENGENHARIA -- antes de escolher material, tolerancia, \
+   ajuste, elemento padronizado (parafuso/rolamento/chaveta) ou raio de \
+   dobra/canto, consulte os resources solidworks://knowledge/* (materiais, \
+   tolerancias-e-ajustes, gdt, elementos-de-maquina, chapa-metalica, \
+   soldas-e-perfis-estruturais, processos-de-fabricacao, verificacao-e-qa; \
+   solidworks://knowledge/roteiro-projetista amarra todos eles no fluxo \
+   completo). Nao invente numero de catalogo nem propriedade de material --  \
+   esses resources tem a tabela certa.
 
 execute_python fica desligado por padrao e so deve ser usado se o \
 usuario pedir execucao de script explicitamente com \
@@ -8877,6 +8885,97 @@ def _read_readme_or_fallback() -> str:
             return f.read()
     except OSError:
         return "README.md nao encontrado ao lado de server.py."
+
+
+# ---------------------------------------------------------------------------
+# Engineering knowledge base (.claude/) exposed as MCP resources
+# ---------------------------------------------------------------------------
+# .claude/CLAUDE.md and .claude/knowledge/*.md are Claude Code's own
+# auto-load convention -- invisible to a client that only talks MCP (Claude
+# Desktop with this server as an extension, which is how this project is
+# actually used day to day). Resources are the MCP-native way to make the
+# same files readable on demand there too, so both clients read the exact
+# same source of truth instead of two copies drifting apart.
+
+CLAUDE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".claude")
+KNOWLEDGE_DIR = os.path.join(CLAUDE_DIR, "knowledge")
+
+
+def _read_claude_file(relative_path: str) -> str:
+    path = os.path.join(CLAUDE_DIR, relative_path)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return f"{relative_path} nao encontrado em .claude/ ao lado de server.py."
+
+
+@mcp.resource(
+    "solidworks://knowledge/index",
+    name="indice-de-conhecimento-de-engenharia",
+    description=(
+        "Papel esperado (projetista/engenheiro mecanico), fluxo obrigatorio, "
+        "e qual resource solidworks://knowledge/* ler para cada tipo de "
+        "pedido. Leia isto primeiro, antes de qualquer resource especifico."
+    ),
+    mime_type="text/markdown",
+)
+def knowledge_index() -> str:
+    return _read_claude_file("CLAUDE.md")
+
+
+_KNOWLEDGE_RESOURCES = [
+    ("roteiro-projetista", "roteiro_projetista.md", "roteiro-projetista-mecanico",
+     "Fluxo completo de ponta a ponta para projetar qualquer peca a partir de "
+     "um pedido ou referencia -- amarra todos os outros resources de "
+     "conhecimento em ordem de decisao."),
+    ("materiais", "materiais.md", "materiais-de-engenharia",
+     "Acos, inox, aluminios e plasticos de engenharia: densidade, "
+     "escoamento, ruptura, e regra pratica de selecao por "
+     "exposicao/peso/carga. Consulte antes de qualquer set_material."),
+    ("tolerancias-e-ajustes", "tolerancias_e_ajustes.md", "tolerancias-e-ajustes-iso",
+     "Tolerancia geral ISO 2768, sistema de ajustes ISO (H7/g6 ... H7/s6), "
+     "furos de folga padrao para parafuso, acabamento superficial tipico "
+     "por processo."),
+    ("gdt", "gdt.md", "gdt-tolerancia-geometrica",
+     "As 14 caracteristicas de GD&T, quando cada uma se aplica de verdade, "
+     "e como montar o datum reference frame."),
+    ("elementos-de-maquina", "elementos_de_maquina.md", "elementos-de-maquina-padronizados",
+     "Parafusos metricos ISO (furo/broca/chave), rolamentos rigidos de "
+     "esferas (serie 6000/6200/6300), chavetas DIN 6885, molas -- nunca "
+     "invente essas dimensoes."),
+    ("chapa-metalica", "chapa_metalica.md", "chapa-metalica-regras-de-projeto",
+     "Raio minimo de dobra por espessura, K-factor, flange minimo, "
+     "distancia furo-dobra, sequencia pratica de ferramentas para chapa "
+     "dobrada."),
+    ("soldas-e-perfis-estruturais", "soldas_e_perfis_estruturais.md", "weldments-e-estruturas-soldadas",
+     "Escolha de perfil estrutural por tipo de carga, dimensionamento "
+     "rapido de tubo, simbolos de solda, sequencia pratica para weldments."),
+    ("processos-de-fabricacao", "processos_de_fabricacao.md", "dfm-por-processo-de-fabricacao",
+     "Design for manufacturing por processo: usinagem CNC, corte a laser + "
+     "dobra, solda, injecao plastica, fundicao."),
+    ("verificacao-e-qa", "verificacao_e_qa.md", "verificacao-e-qa-antes-de-entregar",
+     "Checklist real antes de dizer que uma peca esta pronta: reconstrucao "
+     "sem erro, massa bate, inspecao visual, interferencia, fabricabilidade, "
+     "e o que fazer quando pedem confirmacao de resistencia sem FEA "
+     "disponivel."),
+]
+
+
+def _register_knowledge_resource(uri_slug: str, filename: str, name: str, description: str) -> None:
+    def _reader() -> str:
+        return _read_claude_file(os.path.join("knowledge", filename))
+
+    mcp.resource(
+        f"solidworks://knowledge/{uri_slug}",
+        name=name,
+        description=description,
+        mime_type="text/markdown",
+    )(_reader)
+
+
+for _uri_slug, _filename, _name, _description in _KNOWLEDGE_RESOURCES:
+    _register_knowledge_resource(_uri_slug, _filename, _name, _description)
 
 
 @mcp.prompt(

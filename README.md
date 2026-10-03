@@ -1,7 +1,7 @@
 # SolidWorks MCP Server
 
 Servidor MCP em Python que controla o SolidWorks via COM (`win32com`), escrito
-com o SDK oficial (`mcp`, usando `FastMCP`). **143 ferramentas** (v5.7.2).
+com o SDK oficial (`mcp`, usando `FastMCP`). **143 ferramentas** (v5.8.0).
 
 ## Para quem so quer usar
 
@@ -291,6 +291,23 @@ a cada conversa:
   reference_source)`: roteiro passo a passo para projetar uma peca nova a
   partir de uma referencia real, formalizando o processo usado nas 5
   replicas de engenharia (bucha, rolamento, polia, clevis, helice).
+
+### Base de conhecimento de engenharia (`.claude/`) -- adicionada em 03/10/2026
+`.claude/CLAUDE.md` + `.claude/knowledge/*.md` sao a convencao de projeto do
+Claude Code -- invisiveis para um cliente que so fala MCP (o caso normal de
+uso deste servidor: Claude Desktop com a extensao instalada). Os mesmos
+arquivos agora sao expostos tambem como resources
+`solidworks://knowledge/index` + `solidworks://knowledge/<topico>` (materiais,
+tolerancias-e-ajustes, gdt, elementos-de-maquina, chapa-metalica,
+soldas-e-perfis-estruturais, processos-de-fabricacao, verificacao-e-qa,
+roteiro-projetista) -- mesma fonte, lida ao vivo, para os dois clientes
+nunca divergirem. Cobrem o que a IA precisa saber pra projetar como um
+projetista/engenheiro de verdade (nao so "como chamar a ferramenta"):
+material certo por aplicacao, ajuste ISO entre furo e eixo, GD&T, dimensao
+de parafuso/rolamento/chaveta padronizado, regras de chapa dobrada e de
+weldment, DFM por processo de fabricacao, e um checklist de verificacao
+antes de entregar a peca -- incluindo o que fazer quando pedem confirmacao
+de resistencia (nao ha FEA neste MCP; ver `verificacao-e-qa`).
 
 ### Descoberta do SolidWorks
 - `_find_solidworks_exe` le `HKLM\SOFTWARE\SolidWorks\SOLIDWORKS <ano>\Setup\
