@@ -6270,7 +6270,16 @@ async def interference_check() -> dict:
                 "{EAE282BD-588A-4C1B-AD99-5FE6081C4585}",
             )
             manager.TreatCoincidenceAsInterference = False
-            count = int(manager.GetInterferenceCount())
+            # GetInterferenceCount is a zero-argument COM member; the dynamic
+            # IDispatch proxy sometimes exposes it as an already-evaluated int
+            # property rather than a callable method (same quirk documented
+            # elsewhere in this file for GetModelViewNames, RevisionNumber,
+            # etc.) -- confirmed live, 2026-10-05: calling it unconditionally
+            # raised "'int' object is not callable". Evaluate conditionally.
+            raw_count = manager.GetInterferenceCount
+            if callable(raw_count):
+                raw_count = raw_count()
+            count = int(raw_count)
         except Exception as e:
             raise RuntimeError(
                 f"Interference check is not available through this SolidWorks API build ({e})."
@@ -6423,25 +6432,14 @@ async def set_material(
 
         resolved_database = _resolve_material_database_path(database)
 
-        try:
-            part = doc  # IPartDoc
-            part.SetMaterialPropertyName2("", resolved_database, material)
-        except Exception:
-            try:
-                part.SetMaterialPropertyName(resolved_database, material)
-            except Exception:
-                raise RuntimeError(
-                    f"Failed to set material '{material}'. Check that the name matches "
-                    "the SolidWorks material library exactly (case-sensitive)."
-                )
-
         # SetMaterialPropertyName2 accepts an unresolved database name (e.g. the
         # "SOLIDWORKS Materials" default) without raising, but silently skips
         # applying real density data when it can't find a matching .sldmat file
         # -- confirmed live, 2026-10-04: mass stayed at water density (1000
         # kg/m3) regardless of which material/density was requested, with no
         # error at any step. _resolve_material_database_path's job is exactly
-        # to prevent that; verify it actually found a real file.
+        # to prevent that; verify it actually found a real file BEFORE calling,
+        # since the call itself won't complain either way.
         if not os.path.isfile(resolved_database):
             raise RuntimeError(
                 f"Could not resolve material database '{database}' to an actual "
@@ -6451,6 +6449,73 @@ async def set_material(
                 f"kg/m3) -- measure_body's mass_kg would be wrong without "
                 f"raising its own error. Pass the full path to the .sldmat file "
                 f"explicitly as 'database' instead."
+            )
+
+        # Re-confirmed live, 2026-10-05, on a fresh box part: even with a
+        # correctly resolved .sldmat path, mass stayed at exactly water
+        # density for BOTH "6061 Alloy" and "Cast Alloy Steel" -- the path
+        # fix above was not the whole story. Root cause: the material name
+        # and database path were swapped. The real signature is
+        # SetMaterialPropertyName2(ConfigurationName, SName /* material */,
+        # SDatabase /* path */) -- symmetric with the already-working reader
+        # _native_material_name's GetMaterialPropertyName2(ConfigurationName,
+        # ByRef SDatabase) -> material name as the return value, database as
+        # the out-param. The old code passed (resolved_database, material),
+        # i.e. asked SolidWorks for a material literally named the .sldmat
+        # file path inside a "database" named e.g. "6061 Alloy" -- neither
+        # resolves, so the call is a silent no-op with no exception raised.
+        # The documented contract for ConfigurationName="" is "apply to every
+        # configuration that uses the document material" -- in principle that
+        # should cover the active configuration too. Confirmed live,
+        # 2026-10-05: it does not. After fixing the argument-order bug above,
+        # SetMaterialPropertyName2("", material, resolved_database) still
+        # left mass_kg exactly at water density (1000 kg/m3, verified by
+        # mass/volume, independent of any read-back call) on a freshly built
+        # part. Passing the ACTIVE configuration's real name instead of ""
+        # is the next-most-specific thing the API accepts; used by both the
+        # write and (where _native_material_name is called with no config
+        # override) the read, so they stay symmetric.
+        #
+        # STILL UNRESOLVED, re-confirmed live 2026-10-05 immediately after
+        # this change: using the real active configuration name instead of
+        # "" made no difference -- mass_kg stayed at exactly water density
+        # for both "Alloy Steel" and "6061 Alloy", on a freshly built part,
+        # argument order already correct. The call raises no COM error in
+        # either case; whatever is actually wrong is silent on both ends.
+        # Do NOT re-try more argument-order or config-name permutations
+        # blind -- two independent hypotheses have now been tested and
+        # falsified by density math, not just by the read-back check. Next
+        # debugging step needs either execute_python (gated off by default)
+        # to inspect doc.GetMaterialPropertyName2's actual return value and
+        # type directly, or a live SolidWorks UI comparison (apply a material
+        # by hand via Edit Material, then read it back through this same
+        # reader) to tell whether the WRITE or the READ side is at fault.
+        active_config = doc.ConfigurationManager.ActiveConfiguration
+        config_name = active_config.Name if active_config is not None else ""
+
+        try:
+            part = doc  # IPartDoc
+            part.SetMaterialPropertyName2(config_name, material, resolved_database)
+        except Exception:
+            try:
+                part.SetMaterialPropertyName(material, resolved_database)
+            except Exception:
+                raise RuntimeError(
+                    f"Failed to set material '{material}'. Check that the name matches "
+                    "the SolidWorks material library exactly (case-sensitive)."
+                )
+
+        # Belt-and-braces: read the material back and confirm it actually
+        # stuck, instead of trusting an API that is proven to accept wrong
+        # arguments without complaint. Density-based mass is the ultimate
+        # proof, but reading the name back is cheap and catches this class
+        # of bug immediately rather than only when someone cross-checks mass.
+        applied = _native_material_name(doc, config_name)
+        if applied != material:
+            raise RuntimeError(
+                f"SetMaterialPropertyName2 reported no error, but the document's "
+                f"material reads back as {applied!r}, not {material!r}. The "
+                f"assignment did not actually take effect."
             )
 
         return {"material": material, "database": resolved_database}
@@ -6528,14 +6593,30 @@ async def set_appearance(
         # The first three values are normalized RGB.  The remaining values
         # describe ambient, diffuse, specular, shininess, transparency, and
         # emission respectively (IModelDocExtension/IFace2 contract).
+        #
+        # ambient=0.2/specular=0.5/shininess=0.3 (the values this used to
+        # hardcode) render near-achromatic colors (gray, light silver --
+        # R/G/B close to each other) as solid black in the viewport: confirmed
+        # live, 2026-10-05, on create_automotive_piston's default body color
+        # (185, 190, 200) and again with plain (128, 128, 128) and
+        # (220, 225, 232). A saturated color like (255, 0, 0) or (210, 190,
+        # 150) rendered correctly with the SAME low reflection values, and the
+        # richer set_appearance_properties tool's proven-good preset (ambient
+        # 0.45, specular 0.92, shininess 0.82 -- see RELATORIO_TESTES.md's
+        # "light silver RGB 220/225/232" entry) fixed the identical color
+        # instantly. Low ambient/specular starves a desaturated surface of
+        # enough light response to stay visible; a saturated hue has enough
+        # perceptual contrast to survive the same dim values, which is why
+        # only grayish colors looked broken. Raised to match what is already
+        # proven to work.
         material_values = [
             red / 255.0,
             green / 255.0,
             blue / 255.0,
-            0.2,
-            0.8,
-            0.5,
-            0.3,
+            0.45,
+            0.9,
+            0.85,
+            0.7,
             0.0,
             0.0,
         ]
@@ -9371,6 +9452,15 @@ _KNOWLEDGE_RESOURCES = [
      "sem erro, massa bate, inspecao visual, interferencia, fabricabilidade, "
      "e o que fazer quando pedem confirmacao de resistencia sem FEA "
      "disponivel."),
+    ("montagens-mecanicas-reais", "montagens_mecanicas_reais.md", "montagens-mecanicas-encaixe-real",
+     "Encaixe real entre pecas numa montagem: por que validate_model e uma "
+     "isometrica solta nao bastam, mate concentric so trava 2 graus de "
+     "liberdade, boss so funde com a parede acima de um raio minimo, "
+     "convencao linha-vs-coluna da rotation_matrix, e bugs confirmados "
+     "(create_reference_plane flip/offset negativo no plano right, "
+     "create_sketch falhando em silencio, close_document no documento "
+     "ativo errado). Leia antes de montar qualquer par de pecas que se "
+     "encaixam (pino, eixo, rosca, mancal)."),
 ]
 
 

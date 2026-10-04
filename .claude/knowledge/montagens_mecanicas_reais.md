@@ -1,0 +1,145 @@
+# Montagens mecânicas — encaixe real, não só "parece certo"
+
+Casos reais encontrados ao montar um pistão + biela (2026-10-05) onde o
+modelo validava (`validate_model` 0 erros) e parecia correto numa vista
+isométrica solta, mas a peça não encaixava como a referência mecânica real
+exige. Nenhum desses erros gera uma mensagem de erro do SolidWorks — todos
+exigem verificação ativa, não só "rodou sem exceção".
+
+## 1. Pesquise a referência mecânica ANTES de modelar uma montagem
+
+Antes de desenhar peças que se encaixam (pino+biela, eixo+rolamento,
+parafuso+rosca), busque como a montagem real funciona — patente, diagrama
+técnico, manual. Um pistão automotivo real tem **dois mancais internos
+separados** (pin bosses) com um vão entre eles exatamente para receber o
+olhal menor da biela; não é um furo único contínuo atravessando a peça. Um
+furo único passante (mais simples de modelar) parece plausível à primeira
+vista mas não é como a peça real se monta — a biela fica apoiada por fora,
+não encaixada por dentro. Ver `roteiro_projetista.md` para o fluxo geral;
+isto é especificamente sobre a etapa "a peça se encaixa com outra peça".
+
+## 2. Mate `concentric` trava só 2 graus de liberdade — não a posição ao longo do eixo
+
+Uma mate concêntrica alinha o eixo de dois cilindros (remove 2 translações +
+fixa a direção), mas **deixa livre o deslizamento ao longo do eixo
+compartilhado** e a rotação em torno dele. Se você faz
+`add_advanced_mate(concentric)` e depois `fix_component` sem conferir a
+posição final ao longo desse eixo, a peça trava onde o solver a deixou —
+não necessariamente onde você queria. Isso só aparece calculando a posição
+global real (ver item 4) ou inspecionando de um ângulo que mostre esse eixo
+de frente (ver item 3); uma isométrica genérica esconde o problema.
+
+Depois de uma mate `concentric`, sempre:
+1. `get_component_transform` na peça recém-mateada — leia a posição real
+   resultante, não assuma que ficou onde você mandou antes da mate.
+2. Verifique essa posição contra a geometria real que deveria limitá-la
+   (ex.: o vão entre dois mancais) antes de `fix_component`.
+
+## 3. Vistas ortográficas por eixo, não só isométrica
+
+Uma vista isométrica "parece encaixada" com muita facilidade mesmo quando
+duas peças estão a 20mm de distância no eixo errado — a perspectiva
+disfarça gaps ao longo do eixo que aponta quase na direção da câmera. Para
+confirmar encaixe de verdade:
+
+- Vista alinhada ao eixo da mate (ex.: `set_view("top")` ou `"right")`,
+  dependendo de qual eixo global é o eixo da mate) — isso mostra projeção
+  2D limpa onde um gap ou sobreposição errada salta aos olhos.
+- Depois, `zoom_to_area` na região exata da junção, não `zoom_to_fit` da
+  peça inteira — detalhe de 5-20mm se perde numa peça de 80mm de vista geral.
+
+## 4. Verificação dimensional por cálculo, não só visual
+
+Quando a vista não deixa claro (ou antes de confiar nela), calcule a
+posição GLOBAL esperada a partir da transformação real do componente
+(`get_component_transform` devolve `translation` + `rotation_matrix`) e
+compare contra a geometria conhecida da peça parceira (ex.: centro e raio
+de um furo, de um `list_faces` feito na peça sozinha antes de montá-la).
+
+**A convenção da matriz de rotação devolvida é por LINHA, não por coluna**:
+para `rotation_matrix = [[r00,r01,r02],[r10,r11,r12],[r20,r21,r22]]`, um
+ponto local `(lx,ly,lz)` vira global via:
+```
+global.x = r00*lx + r01*ly + r02*lz
+global.y = r10*lx + r11*ly + r12*lz
+global.z = r20*lx + r21*ly + r22*lz
+```
+(mais a translação). Confirmado ao vivo 2026-10-05: uma suposição por
+coluna (trocando o papel de linha/coluna) produz um ponto plausível mas
+errado, que falha ao selecionar a face certa — e se você ajustar o ponto
+até a seleção "funcionar", está validando a convenção errada, não a certa.
+Teste a convenção com um ponto de verificação simples (ex. uma face plana
+larga e inconfundível) antes de confiar nela para algo com tolerância
+apertada como o eixo de um furo.
+
+## 5. Mancal/boss só "encaixa" de verdade se a geometria se FUNDE com a parede
+
+Um boss cilíndrico deslocado do eixo central só vira parte sólida da peça
+se seu raio alcançar a parede existente. Se `offset` é a distância do
+centro do boss até o eixo da peça e `parede_interna` é o raio da cavidade
+oca mais próxima, o boss só se funde quando:
+```
+raio_do_boss ≥ parede_interna − offset
+```
+Com raio menor que isso, o boss fica como um corpo **flutuante,
+desconectado**, dentro do oco — `validate_model` não acusa erro (SolidWorks
+aceita multi-corpos dentro de uma peça), mas visualmente aparece como um
+círculo solto, sem fusão suave com a parede, em vez de um relevo contínuo.
+Confirmado ao vivo: boss raio 15mm a 17mm do eixo, parede interna a
+37,25mm, não tocava a parede (37,25−17=20,25 > 15) — corrigido para
+raio 22mm (dentro do intervalo 20,25–23,75mm que funde sem furar a parede
+externa).
+
+## 6. `create_reference_plane`: `flip=True` e offset negativo não funcionam para o plano "right"
+
+Confirmado ao vivo, 2026-10-05: `create_reference_plane(reference="right",
+offset=X, flip=True)` e `create_reference_plane(reference="right",
+offset=-X, flip=False)` **ambos ignoram silenciosamente a direção** e
+criam o plano em X=0 (na própria origem), não no deslocamento negativo
+esperado — sem erro, sem aviso. Testado isoladamente com offset=20mm,
+reproduzido duas vezes. O mesmo padrão (`flip=True`) funciona normalmente
+para o plano "front". Até isso ser corrigido no servidor: para um
+deslocamento no sentido negativo do eixo X a partir do plano "right", **não
+use `flip` nem offset negativo** — construa a feature do lado positivo
+(que funciona) e use `mirror_feature` para espelhar para o lado negativo.
+
+## 7. Depois de QUALQUER falha de `create_sketch`, pare — não continue a sequência
+
+Se `create_sketch(plane=X)` falhar (ex. nome de plano errado/desatualizado),
+as chamadas seguintes (`draw_circle`, `close_sketch`, `extrude_sketch`) **não
+necessariamente falham também** — elas podem prosseguir usando algum
+contexto de esboço remanescente, produzindo geometria real, "bem-sucedida",
+na peça inteiramente errada. Confirmado ao vivo duas vezes: um
+`create_sketch` com nome de plano desatualizado falhou, mas o
+`draw_circle`+`extrude_sketch` seguintes ainda criaram um disco real — só
+que na orientação do plano frontal padrão, não no plano pretendido. Sempre
+confira o retorno de `create_reference_plane` e use o nome EXATO devolvido
+(nunca reuse um nome de plano assumido de uma tentativa anterior — a
+numeração `PlanoN` não é estável entre criar/deletar). Se `create_sketch`
+falhar, pare a sequência e corrija antes de continuar.
+
+## 8. `close_document` fecha o documento ATIVO — confirme qual é antes de chamar
+
+Depois de um erro (ex. `save_document` falhou), o documento "ativo" pode
+não ser o que você espera. Confirmado ao vivo: um `save_document` que
+falhou foi seguido de `close_document(save=False)` pretendendo fechar um
+documento ANTIGO e indesejado — mas o documento ativo no momento era na
+verdade a peça nova, ainda não salva, que foi descartada por engano,
+perdendo um trabalho de reconstrução inteiro. **Sempre `get_document_info`
+logo antes de um `close_document(save=False)`** quando não há certeza
+absoluta de qual documento está ativo — o custo de checar é uma chamada
+barata; o custo de errar é perder trabalho não salvo sem aviso.
+
+## 9. Montagem com componente referenciando um arquivo que você quer sobrescrever
+
+`save_document` falha silenciosamente (sem detalhe útil) se outro documento
+aberto (ex. uma montagem) mantém o mesmo arquivo carregado como componente
+referenciado — mesmo que a janela "standalone" dessa peça pareça fechada.
+Feche a MONTAGEM que referencia o arquivo primeiro, depois feche/salve a
+peça standalone. Depois de sobrescrever o arquivo no disco, reabra a
+montagem — ela recarrega o componente do disco automaticamente, mas as
+mates antigas que referenciavam a topologia antiga provavelmente ficam
+inválidas e o componente aparece **suprimido**. Se `unsuppress_component`
+falhar (confirmado: status 3, causa não diagnosticada), o caminho robusto é
+`delete_component` + `insert_component` de novo na mesma posição, e refazer
+as mates do zero contra a geometria nova.

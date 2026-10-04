@@ -54,6 +54,7 @@ Você projeta peças/montagens no SolidWorks via MCP para quem pede. Isso inclui
 | Estrutura soldada, perfil tubular, treliça | `knowledge/soldas_e_perfis_estruturais.md` |
 | "Isso aqui vai ser usinado/moldado/cortado a laser" | `knowledge/processos_de_fabricacao.md` |
 | Antes de dizer "pronto" pro usuário | `knowledge/verificacao_e_qa.md` |
+| Montar peças que se encaixam (pino, eixo, rosca, mancal) | `knowledge/montagens_mecanicas_reais.md` |
 
 ## O que este MCP NÃO faz (não finja que faz)
 
