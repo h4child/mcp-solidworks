@@ -610,13 +610,26 @@ def _find_last_sketch(doc) -> Optional[str]:
             feature_type = feature.GetTypeName2
             if callable(feature_type):
                 feature_type = feature_type()
-            if feature_type != "ProfileFeature":
-                continue
+        except Exception:
+            continue  # can't even tell what this is -- never a real candidate
+        if feature_type != "ProfileFeature":
+            continue
+        # IsSuppressed/Name are read separately, each defaulting to "keep this
+        # candidate" on error: a bare `except: continue` here previously
+        # dropped the whole candidate silently on any COM hiccup, which left
+        # `name` stuck on whatever the PREVIOUS successful match was (found
+        # live, 2026-10-04 -- a feature after "Curva-Linhas2" errored on
+        # access, so the scan silently kept reporting a stale sketch several
+        # features back instead of surfacing the problem).
+        try:
             suppressed = feature.IsSuppressed
             if callable(suppressed):
                 suppressed = suppressed()
-            if suppressed:
-                continue
+        except Exception:
+            suppressed = False
+        if suppressed:
+            continue
+        try:
             name = feature.Name
         except Exception:
             continue
@@ -1688,7 +1701,22 @@ async def close_sketch() -> dict:
         doc = _active_doc()
         if doc.SketchManager.ActiveSketch is None:
             return {"closed": False, "message": "No sketch was active."}
+        # Capture the name HERE, one line before exiting it, not in
+        # create_sketch/create_sketch_on_face at open time: live testing
+        # (2026-10-04) showed a sketch opened via create_sketch_on_face can
+        # still report ActiveSketch as None immediately after InsertSketch2,
+        # silently leaving _remember_active_sketch's open-time capture stale.
+        # Right here ActiveSketch is guaranteed non-None (just checked above).
+        _remember_active_sketch(doc)
         doc.InsertSketch2(True)
+        # A sketch just closed on a face (as opposed to a named plane) was
+        # observed not to appear in FeatureManager.GetFeatures(False) yet at
+        # this point -- cut_extrude's SelectByID2("SKETCH") lookup needs the
+        # feature actually registered in the tree, not just a name. Force
+        # that registration now rather than leaving the caller to guess.
+        rebuild = doc.EditRebuild3
+        if callable(rebuild):
+            rebuild()
         return {"closed": True}
 
     return await _run(_impl)
