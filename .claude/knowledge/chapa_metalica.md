@@ -58,9 +58,47 @@ maiores que isso em `add_sheet_metal_edge_flange`.
    nessa face especificamente.
 4. `flatten_sheet_metal` pra conferir a planificação antes de fechar o
    projeto — se a planificação falhar ou ficar com geometria estranha, quase
-   sempre é K-factor ou raio de dobra inconsistente com a espessura.
+   sempre é K-factor ou raio de dobra inconsistente com a espessura. **Ou
+   um filete/chanfro em cima de aresta de dobra — ver aviso abaixo.**
 5. `export_flat_pattern_dxf` é a entrega real pra corte a laser/punção — o
    3D dobrado é pra visualização/montagem, quem fabrica a chapa usa o DXF.
+6. Se for usar `fillet_edges`/`chamfer_edges` numa peça de chapa metálica,
+   chame `flatten_sheet_metal` de novo DEPOIS pra confirmar que o Flat
+   Pattern ainda rebuilda limpo — ver aviso abaixo.
+
+## ⚠️ `fillet_edges`/`chamfer_edges` numa peça de chapa metálica dobrada — quebra o Flat Pattern
+
+Confirmado ao vivo (2026-10-04): `fillet_edges` (e por extensão `chamfer_edges`,
+mesmo padrão de implementação) aplica o filete/chanfro em **todas** as arestas
+do corpo sólido, sem diferenciar aresta "normal" de aresta de dobra. Numa
+peça com duas abas (`create_base_flange` + dois `add_sheet_metal_edge_flange`
+em arestas perpendiculares), rodar `fillet_edges(radius=1)` depois das dobras
+prontas:
+
+- Deixa a peça **dobrada** válida (`validate_model` → `valid:true`, 0 erros)
+  — nada parece errado se você só olhar o estado 3D normal.
+- Mas quebra o **Flat Pattern**: `flatten_sheet_metal()` depois do filete
+  retorna `valid:false`, com os mesmos dois erros do caso do furo em
+  EdgeFlange: `Padrão-Plano1`/`FlatPattern` (`error_code:1`, severidade
+  error) e `Planificar-<DobradeAresta1>1`/`UiBend` (`error_code:1`,
+  severidade warning). Dobrar de volta (`flatten_sheet_metal` de novo)
+  volta a ficar válido — o problema é específico do estado desdobrado.
+
+**Implicação prática:** se a peça precisa ir pra corte a laser/punção
+(`export_flat_pattern_dxf`), um filete/chanfro colocado sem cuidado nas
+arestas de dobra derruba essa exportação, mesmo que o modelo 3D pareça
+perfeito. A ferramenta não avisa disso e não tem como excluir arestas de
+dobra da seleção "todas as arestas" — isso teria que ser implementado no
+`server.py` (ex.: filtrar arestas cujo `GetTypeName2`/feature pai seja
+`OneBend`/`SMBaseFlange` antes de montar a seleção) ou ser responsabilidade
+de quem chama a ferramenta.
+
+**Como evitar:** só filetar/chanfrar ANTES de dobrar (nas arestas do
+blank plano, antes do `add_sheet_metal_edge_flange`), ou, se precisar
+filetar depois de dobrado, chamar `flatten_sheet_metal` logo em seguida pra
+confirmar que não quebrou — e se quebrou, não tem correção automática
+disponível neste toolset: o filete precisa ser desfeito (`delete_feature`)
+ou reaplicado seletivamente, não por este `fillet_edges` que pega tudo.
 
 ## ⚠️ Furo em face de EdgeFlange — limitação confirmada, não tente de novo sem ler isto
 

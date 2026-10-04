@@ -735,6 +735,27 @@ def _select_all_edges(doc) -> int:
     return count
 
 
+#: Feature type names (as GetTypeName2 reports them) that only exist on a
+#: folded sheet-metal body -- i.e. a body with at least one bend.
+_SHEET_METAL_BEND_FEATURE_TYPES = {"SMBaseFlange", "EdgeFlange", "OneBend"}
+
+
+def _has_sheet_metal_bends(doc) -> bool:
+    """True if the active document has a folded sheet-metal bend anywhere
+    in its feature tree (as opposed to e.g. a flat, unbent sheet-metal
+    blank, or a part with no sheet-metal features at all)."""
+    for raw_feature in doc.FeatureManager.GetFeatures(False) or ():
+        try:
+            feature_type = win32com.client.Dispatch(raw_feature).GetTypeName2
+            if callable(feature_type):
+                feature_type = feature_type()
+        except Exception:
+            continue
+        if feature_type in _SHEET_METAL_BEND_FEATURE_TYPES:
+            return True
+    return False
+
+
 def _active_assembly():
     doc = _active_doc()
     if _doc_type(doc) != 2:
@@ -2333,14 +2354,34 @@ async def loft_sketches(sketch_names: list) -> dict:
     return await _run(_impl)
 
 
+_BEND_FILLET_CHAMFER_WARNING = (
+    "This part has sheet-metal bend(s) ({bend_types}). {tool}(...) fillets/"
+    "chamfers EVERY edge of the body, with no way to exclude bend edges -- "
+    "confirmed live, 2026-10-04 (see .claude/knowledge/chapa_metalica.md, "
+    "section 'fillet_edges/chamfer_edges numa peca de chapa metalica "
+    "dobrada'): the folded 3D state stays valid, but flatten_sheet_metal() "
+    "afterward fails (FlatPattern error_code 1). Pass force=True to proceed "
+    "anyway, then call flatten_sheet_metal() yourself to confirm the flat "
+    "pattern still rebuilds before relying on export_flat_pattern_dxf."
+)
+
+
 @mcp.tool()
-async def fillet_edges(radius: float = 2, unit: Optional[str] = None) -> dict:
-    """Apply a constant-radius fillet to every edge of the solid body/bodies."""
+async def fillet_edges(radius: float = 2, unit: Optional[str] = None, force: bool = False) -> dict:
+    """Apply a constant-radius fillet to every edge of the solid body/bodies.
+
+    force: required (set True) on a part with sheet-metal bends -- this
+    tool cannot exclude bend edges from "every edge", and filleting a bend
+    edge is confirmed to break flatten_sheet_metal() afterward even though
+    the folded 3D body stays valid. See the raised error for the full
+    explanation if this fires."""
 
     def _impl():
         if radius <= 0:
             raise ValueError(f"Radius must be positive, got {radius}.")
         doc = _active_doc()
+        if not force and _has_sheet_metal_bends(doc):
+            raise RuntimeError(_BEND_FILLET_CHAMFER_WARNING.format(bend_types="SMBaseFlange/EdgeFlange/OneBend", tool="fillet_edges"))
         radius_m = to_meters(radius, unit)
         edge_count = _select_all_edges(doc)
         empty = win32com.client.VARIANT(pythoncom.VT_EMPTY, None)
@@ -2353,8 +2394,14 @@ async def fillet_edges(radius: float = 2, unit: Optional[str] = None) -> dict:
 
 
 @mcp.tool()
-async def chamfer_edges(distance: float = 2, angle: float = 45, unit: Optional[str] = None) -> dict:
-    """Apply a distance/angle chamfer to every edge of the solid body/bodies."""
+async def chamfer_edges(distance: float = 2, angle: float = 45, unit: Optional[str] = None, force: bool = False) -> dict:
+    """Apply a distance/angle chamfer to every edge of the solid body/bodies.
+
+    force: required (set True) on a part with sheet-metal bends -- this
+    tool cannot exclude bend edges from "every edge", and chamfering a bend
+    edge is confirmed to break flatten_sheet_metal() afterward even though
+    the folded 3D body stays valid. See the raised error for the full
+    explanation if this fires."""
 
     def _impl():
         if distance <= 0:
@@ -2362,6 +2409,8 @@ async def chamfer_edges(distance: float = 2, angle: float = 45, unit: Optional[s
         if not (0 < angle < 90):
             raise ValueError(f"Angle must be between 0 and 90 degrees (exclusive), got {angle}.")
         doc = _active_doc()
+        if not force and _has_sheet_metal_bends(doc):
+            raise RuntimeError(_BEND_FILLET_CHAMFER_WARNING.format(bend_types="SMBaseFlange/EdgeFlange/OneBend", tool="chamfer_edges"))
         dist_m = to_meters(distance, unit)
         edge_count = _select_all_edges(doc)
         feat = doc.FeatureManager.InsertFeatureChamfer(1, 0, dist_m, math.radians(angle), dist_m, 0, 0, 0)
