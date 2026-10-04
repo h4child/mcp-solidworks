@@ -661,12 +661,18 @@ def _select_last_sketch(doc) -> str:
     name = None
 
     # 1) The live object, if close_sketch captured one for the current
-    #    document. Select2 on an ISketch marks it as the active selection the
-    #    same way SelectByID2(..., "SKETCH", ...) would, but doesn't need the
-    #    sketch to be independently findable by name/tree first.
+    #    document. Select4(Append, Callout) is the generic entity-selection
+    #    signature this file already uses for edges/faces/sketch segments
+    #    (_select_all_edges, trim_extend_structural, ...) -- ISketch shares
+    #    it too. (5.8.4 tried IFeature's Select2(Append, Mark) here instead;
+    #    live testing showed that was the wrong method for an ISketch object,
+    #    so it threw, got swallowed by the except below, and this whole path
+    #    silently never engaged.) Marks the sketch as the active selection
+    #    the same way SelectByID2(..., "SKETCH", ...) would, without needing
+    #    the sketch to be independently findable by name/tree first.
     if _last_user_sketch_obj is not None:
         try:
-            if _last_user_sketch_obj.Select2(False, 0):
+            if _last_user_sketch_obj.Select4(False, pythoncom.Nothing):
                 name = _last_user_sketch_name or "<sketch>"
         except Exception:
             _last_user_sketch_obj = None  # stale COM reference -- stop trying it
