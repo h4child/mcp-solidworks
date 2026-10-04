@@ -564,16 +564,29 @@ def _standard_plane_name(doc, which: str) -> str:
 #: value captured at creation time can name it directly.
 _last_user_sketch_name: Optional[str] = None
 
+#: Live COM reference to that same sketch, captured by close_sketch right
+#: before it closes. Needed because a sketch closed via create_sketch_on_face
+#: on a face (not a named plane) was observed, live, to never actually appear
+#: in FeatureManager.GetFeatures(False) before the next cut_extrude runs --
+#: not a timing issue a rebuild fixes (tried; still absent after a forced
+#: EditRebuild3). Selecting this object directly (ISketch.Select2) sidesteps
+#: name/tree lookup entirely, using the handle already in hand instead of
+#: re-finding something that may not be independently enumerable yet.
+_last_user_sketch_obj = None
+
 
 def _remember_active_sketch(doc) -> None:
-    """Capture the name of the sketch doc.InsertSketch2 just opened, while it
-    is still ActiveSketch and therefore unambiguous. Call this right after
-    opening a sketch on a plane/face -- never after closing one."""
-    global _last_user_sketch_name
+    """Capture the name AND live object of the sketch doc.InsertSketch2 just
+    opened, while it is still ActiveSketch and therefore unambiguous. Call
+    this right after opening a sketch on a plane/face -- never after closing
+    one (close_sketch calls this itself, one line before closing, which is
+    more reliable still -- see its comment)."""
+    global _last_user_sketch_name, _last_user_sketch_obj
     try:
         active = doc.SketchManager.ActiveSketch
         if active is not None:
-            _last_user_sketch_name = active.Name
+            _last_user_sketch_obj = win32com.client.Dispatch(active)
+            _last_user_sketch_name = _last_user_sketch_obj.Name
     except Exception:
         pass
 
@@ -637,7 +650,7 @@ def _find_last_sketch(doc) -> Optional[str]:
 
 
 def _select_last_sketch(doc) -> str:
-    global _last_user_sketch_name
+    global _last_user_sketch_name, _last_user_sketch_obj
     try:
         if doc.SketchManager.ActiveSketch is not None:
             doc.SketchManager.InsertSketch(True)  # close it
@@ -646,15 +659,32 @@ def _select_last_sketch(doc) -> str:
 
     doc.ClearSelection2(True)
     name = None
-    if _last_user_sketch_name and _select_by_id(doc, _last_user_sketch_name, "SKETCH"):
+
+    # 1) The live object, if close_sketch captured one for the current
+    #    document. Select2 on an ISketch marks it as the active selection the
+    #    same way SelectByID2(..., "SKETCH", ...) would, but doesn't need the
+    #    sketch to be independently findable by name/tree first.
+    if _last_user_sketch_obj is not None:
+        try:
+            if _last_user_sketch_obj.Select2(False, 0):
+                name = _last_user_sketch_name or "<sketch>"
+        except Exception:
+            _last_user_sketch_obj = None  # stale COM reference -- stop trying it
+
+    # 2) Fall back to selecting by the cached name (handles the case where
+    #    the object was never captured, e.g. a sketch opened by some other
+    #    path, but the name still resolves in the tree).
+    if not name and _last_user_sketch_name and _select_by_id(doc, _last_user_sketch_name, "SKETCH"):
         name = _last_user_sketch_name
-        doc.ClearSelection2(True)  # _select_by_id leaves it selected; re-clear before the real select below
+
+    # 3) Last resort: scan the tree for the last non-suppressed ProfileFeature.
     if not name:
+        doc.ClearSelection2(True)
         name = _find_last_sketch(doc)
-    if not name:
-        raise RuntimeError("No sketch found. Create a sketch and draw a closed profile first.")
-    if not _select_by_id(doc, name, "SKETCH"):
-        raise RuntimeError(f"Could not select sketch '{name}'.")
+        if not name:
+            raise RuntimeError("No sketch found. Create a sketch and draw a closed profile first.")
+        if not _select_by_id(doc, name, "SKETCH"):
+            raise RuntimeError(f"Could not select sketch '{name}'.")
     return name
 
 
