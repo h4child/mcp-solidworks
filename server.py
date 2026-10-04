@@ -557,18 +557,37 @@ def _standard_plane_name(doc, which: str) -> str:
 
 
 def _find_last_sketch(doc) -> Optional[str]:
+    """Return the name of the last user sketch in the feature tree.
+
+    Was implemented as a FirstFeature/GetNextFeature linked-list walk with a
+    bare ``except: break`` -- if traversal threw a COM error past a corrupted
+    or orphaned feature (see BUG 4 in bug_report_solidworks_mcp.txt, feature
+    "Esboço28"), the walk silently stopped there, and every later sketch was
+    never reached: cut_extrude/revolve_sketch kept re-selecting that same
+    stale name forever, including across save/reopen. GetFeatures(False)
+    (the same array-based enumeration already used by list_mates, shell_body,
+    create_helix, etc.) visits every feature regardless of what happened to
+    its neighbors, so one bad feature can no longer cut the scan short.
+    Suppressed features are skipped: an orphaned sketch like "Esboço28" is
+    suppressed, and was never a real candidate for "the sketch you just drew".
+    """
     name = None
-    feat = doc.FirstFeature
-    while feat is not None:
+    for raw_feature in doc.FeatureManager.GetFeatures(False) or ():
         try:
-            if feat.GetTypeName2 == "ProfileFeature":
-                name = feat.Name
+            feature = win32com.client.Dispatch(raw_feature)
+            feature_type = feature.GetTypeName2
+            if callable(feature_type):
+                feature_type = feature_type()
+            if feature_type != "ProfileFeature":
+                continue
+            suppressed = feature.IsSuppressed
+            if callable(suppressed):
+                suppressed = suppressed()
+            if suppressed:
+                continue
+            name = feature.Name
         except Exception:
-            pass
-        try:
-            feat = feat.GetNextFeature
-        except Exception:
-            break
+            continue
     return name
 
 
@@ -1598,7 +1617,16 @@ async def create_sketch(plane: str = "front") -> dict:
 
 @mcp.tool()
 async def create_sketch_on_face(x: float = 0, y: float = 0, z: float = 0, unit: Optional[str] = None) -> dict:
-    """Create a sketch on an existing body face, chosen by a point known to lie on it."""
+    """Create a sketch on an existing body face, chosen by a point known to lie on it.
+
+    x/y/z only pick WHICH face to sketch on. Once the sketch is open, geometry
+    you draw in it (draw_circle, draw_rectangle, ...) uses that face's own
+    implicit sketch coordinates, whose origin and axis orientation SolidWorks
+    derives from the face's surface parameterization -- not from x/y/z, and
+    not predictable ahead of time (confirmed to differ between a face
+    inherited directly from its defining sketch and a folded EdgeFlange face).
+    Draw a small test shape and inspect it with list_faces/measure_body first
+    if you need geometry at a specific position on the face."""
 
     def _impl():
         doc = _active_doc()
@@ -2329,8 +2357,20 @@ async def hole_wizard(face_x: float, face_y: float, face_z: float,
                        thread_standard: str = "ISO",
                        unit: Optional[str] = None) -> dict:
     """Create a hole using the Hole Wizard on a face.
-    face_x/y/z: a point on the face where the hole will be placed.
-    hole_x/y: the 2D position of the hole center on that face (sketch coords).
+    face_x/y/z: a point on the face where the hole will be placed. This ONLY
+    picks which face to use -- it has no effect on where hole_x/hole_y land.
+    hole_x/y: the 2D position of the hole center, in the sketch SolidWorks
+    opens on that face. WARNING: for a face that isn't a named plane,
+    SolidWorks -- not this tool -- decides that sketch's origin and axis
+    orientation from the face's own surface parameterization, which depends
+    on the feature history that produced it and is NOT derivable from
+    face_x/y/z. hole_x=0, hole_y=0 happens to land on face_x/y/z for some
+    faces and not others (confirmed: it does on a flat face inherited
+    directly from its defining sketch, and does not on an EdgeFlange's
+    folded face) -- there is no formula to predict it ahead of time. If
+    placement fails with "Could not select the Hole Wizard placement point",
+    the coordinates fell outside that face's own sketch bounds; adjust by
+    trial and error or place at (0, 0) first and inspect the result.
     hole_type: 'simple', 'counterbore', 'countersink', 'tapped' (threaded).
     size: nominal hole diameter (or thread size for tapped).
     depth: hole depth (ignored for through-all; use depth=0 to drill through).
@@ -2383,7 +2423,17 @@ async def hole_wizard(face_x: float, face_y: float, face_z: float,
             raise ValueError("thread_standard must be 'ISO' or 'ANSI'.")
 
         size_mm = size_m * 1000.0
-        size_label = f"M{int(round(size_mm))}" if math.isclose(size_mm, round(size_mm), abs_tol=1e-6) else f"M{size_mm:g}"
+        # "simple" maps to swStandardISODrillSizes/swStandardAnsiMetricDrillSizes
+        # (143/39) -- a table of bare drill diameters ("8.5", not "M8"). The
+        # fastener-size tables used by counterbore/countersink/tapped (socket
+        # head cap, flat head, tapped hole) DO expect the "M" prefix. Passing
+        # "M8" to the drill-size table finds no match, so Hole Wizard silently
+        # falls back to its last-used favorite (observed: an ANSI inch size)
+        # instead of raising -- this was BUG 3 in bug_report_solidworks_mcp.txt.
+        if kind == "simple":
+            size_label = f"{size_mm:g}"
+        else:
+            size_label = f"M{int(round(size_mm))}" if math.isclose(size_mm, round(size_mm), abs_tol=1e-6) else f"M{size_mm:g}"
         drill_angle = math.radians(118)
 
         if kind == "simple":
@@ -7421,18 +7471,48 @@ async def delete_feature(name: str, delete_children: bool = True) -> dict:
         if not feature_name:
             raise ValueError("Feature name cannot be empty.")
 
+        def _all_features():
+            return list(doc.FeatureManager.GetFeatures(False) or ())
+
         def _feature_names():
-            return {str(feat.Name) for feat in (doc.FeatureManager.GetFeatures(False) or ())}
+            return {str(feat.Name) for feat in _all_features()}
 
         before = _feature_names()
         if feature_name not in before:
             raise ValueError(f"Feature '{feature_name}' does not exist.")
 
+        # SelectByID2 needs a selection-type string that matches what kind of
+        # feature this is -- "BODYFEATURE" (the only type this tool used to
+        # try) only matches features that contribute a solid body (cuts,
+        # bosses, fillets...). A sketch/3D-sketch is type "SKETCH" and a
+        # reference plane/axis is "PLANE"/"AXIS"; asking for "BODYFEATURE" on
+        # any of those always fails with "could not select feature", even
+        # when the feature is perfectly healthy and unsuppressed (this was
+        # BUG 4's second half in bug_report_solidworks_mcp.txt: delete_feature
+        # could never remove the orphaned sketch "Esboço28").
+        sel_type = "BODYFEATURE"
+        for feat in _all_features():
+            if str(feat.Name) != feature_name:
+                continue
+            feature_type = feat.GetTypeName2
+            if callable(feature_type):
+                feature_type = feature_type()
+            sel_type = {
+                "ProfileFeature": "SKETCH",
+                "3DProfileFeature": "SKETCH",
+                "RefPlane": "PLANE",
+                "RefAxis": "AXIS",
+            }.get(feature_type, "BODYFEATURE")
+            break
+
         doc.ClearSelection2(True)
         empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
-        if not doc.Extension.SelectByID2(
-            feature_name, "BODYFEATURE", 0, 0, 0, False, 0, empty, 0
-        ):
+        selected = doc.Extension.SelectByID2(feature_name, sel_type, 0, 0, 0, False, 0, empty, 0)
+        if not selected and sel_type != "BODYFEATURE":
+            # Fall back to the old behavior for any feature type not in the
+            # map above, in case a given install/version files it differently.
+            selected = doc.Extension.SelectByID2(feature_name, "BODYFEATURE", 0, 0, 0, False, 0, empty, 0)
+        if not selected:
             raise RuntimeError(f"SolidWorks could not select feature '{feature_name}'.")
 
         options = 2 if delete_children else 0  # swDeleteSelectionOptions_Children
