@@ -1738,7 +1738,20 @@ async def create_sketch_on_face(x: float = 0, y: float = 0, z: float = 0, unit: 
     not predictable ahead of time (confirmed to differ between a face
     inherited directly from its defining sketch and a folded EdgeFlange face).
     Draw a small test shape and inspect it with list_faces/measure_body first
-    if you need geometry at a specific position on the face."""
+    if you need geometry at a specific position on the face.
+
+    RAISES if the chosen face's surface is directly defined by (coincident
+    with) an existing sketch already in the tree -- e.g. the flat remainder
+    of a sheet-metal EdgeFlange face is literally the plane of that flange's
+    own profile sketch. InsertSketch2 on such a face reopens that EXISTING
+    sketch for editing rather than creating an independent new one (found
+    live, 2026-10-04, via bug_report_solidworks_mcp.txt's EdgeFlange-face
+    scenario: draw_circle appeared to succeed, but silently added the circle
+    into the flange's own defining sketch; every later cut_extrude pointed at
+    that same sketch and failed, because it now mixed the flange's profile
+    geometry with an unrelated circle instead of forming one closed loop).
+    Use a named reference plane (create_reference_plane + create_sketch)
+    instead for this face -- the bug report's own documented workaround."""
 
     def _impl():
         doc = _active_doc()
@@ -1746,8 +1759,19 @@ async def create_sketch_on_face(x: float = 0, y: float = 0, z: float = 0, unit: 
         doc.ClearSelection2(True)
         if not _select_by_id(doc, "", "FACE", x_m, y_m, z_m):
             raise RuntimeError(f"No face found at ({x}, {y}, {z}) {unit or _default_unit}.")
+        pre_existing = {str(feat.Name) for feat in (doc.FeatureManager.GetFeatures(False) or ())}
         doc.InsertSketch2(True)
         _remember_active_sketch(doc)
+        active_name = _last_user_sketch_name
+        if active_name and active_name in pre_existing:
+            doc.InsertSketch2(True)  # close it immediately -- don't leave it open for editing
+            raise RuntimeError(
+                f"The face at ({x}, {y}, {z}) {unit or _default_unit} is directly defined by the "
+                f"existing sketch '{active_name}' -- InsertSketch2 reopened that sketch for editing "
+                f"instead of creating a new one. Drawing here would corrupt '{active_name}' (e.g. a "
+                f"flange's own profile sketch), not add an independent sketch. Use a named reference "
+                f"plane (create_reference_plane + create_sketch) on this face instead."
+            )
         return {"point": {"x": x, "y": y, "z": z}, "unit": unit or _default_unit}
 
     return await _run(_impl)
