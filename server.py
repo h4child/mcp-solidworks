@@ -6403,21 +6403,82 @@ async def set_material(
         if _doc_type(doc) != 1:
             raise RuntimeError("Material can only be set on a part document.")
 
+        resolved_database = _resolve_material_database_path(database)
+
         try:
             part = doc  # IPartDoc
-            part.SetMaterialPropertyName2("", database, material)
+            part.SetMaterialPropertyName2("", resolved_database, material)
         except Exception:
             try:
-                part.SetMaterialPropertyName(database, material)
+                part.SetMaterialPropertyName(resolved_database, material)
             except Exception:
                 raise RuntimeError(
                     f"Failed to set material '{material}'. Check that the name matches "
                     "the SolidWorks material library exactly (case-sensitive)."
                 )
 
-        return {"material": material, "database": database}
+        # SetMaterialPropertyName2 accepts an unresolved database name (e.g. the
+        # "SOLIDWORKS Materials" default) without raising, but silently skips
+        # applying real density data when it can't find a matching .sldmat file
+        # -- confirmed live, 2026-10-04: mass stayed at water density (1000
+        # kg/m3) regardless of which material/density was requested, with no
+        # error at any step. _resolve_material_database_path's job is exactly
+        # to prevent that; verify it actually found a real file.
+        if not os.path.isfile(resolved_database):
+            raise RuntimeError(
+                f"Could not resolve material database '{database}' to an actual "
+                f".sldmat file on disk (tried: {resolved_database}). "
+                f"SetMaterialPropertyName2 will accept this silently but the "
+                f"part's density stays at the SolidWorks default (water, 1000 "
+                f"kg/m3) -- measure_body's mass_kg would be wrong without "
+                f"raising its own error. Pass the full path to the .sldmat file "
+                f"explicitly as 'database' instead."
+            )
+
+        return {"material": material, "database": resolved_database}
 
     return await _run(_impl)
+
+
+def _resolve_material_database_path(database: str) -> str:
+    """Resolve a short material-database name (e.g. the default "SOLIDWORKS
+    Materials") to the full .sldmat file path SetMaterialPropertyName2 needs
+    to actually apply density data, not just accept the call without error.
+
+    Confirmed live, 2026-10-04: passing the short display name "SOLIDWORKS
+    Materials" raises nothing and set_material reports success, but the density
+    used for mass/volume calculations stays at the SolidWorks default (water)
+    regardless of which material was requested -- measure_body returned the
+    identical mass_kg for ASTM A36 Steel (~7850 kg/m3) and 6061 Alloy (~2700
+    kg/m3) on the same body. The real file lives at
+    "<install dir>/lang/<language>/sldmaterials/<name>.sldmat" (filename
+    lowercase, e.g. "solidworks materials.sldmat") -- the same per-language
+    layout create_weldment_profile's _weldment_profile_roots already navigates
+    for weldment profile files, just under sldmaterials/ instead.
+    """
+    if os.path.isfile(database):
+        return database  # caller already passed a real path
+
+    exe = _find_solidworks_exe()
+    install_dir = os.path.dirname(exe) if exe else None
+    if not install_dir:
+        return database  # no install dir found -- let SetMaterialPropertyName2 fail on its own
+
+    lang_root = os.path.join(install_dir, "lang")
+    target_name = f"{database.lower()}.sldmat"
+    if os.path.isdir(lang_root):
+        for language in os.listdir(lang_root):
+            candidate = os.path.join(lang_root, language, "sldmaterials", target_name)
+            if os.path.isfile(candidate):
+                return candidate
+        # Fall back to a full walk in case a given install nests sldmaterials/
+        # differently than lang/<language>/sldmaterials/.
+        for root, _dirs, files in os.walk(lang_root):
+            for name in files:
+                if name.lower() == target_name:
+                    return os.path.join(root, name)
+
+    return database  # nothing found -- let SetMaterialPropertyName2 fail on its own
 
 
 @mcp.tool()
