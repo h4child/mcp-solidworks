@@ -766,6 +766,17 @@ def _preload_and_insert_component(assy, filepath: str, x: float, y: float, z: fl
     """AddComponent5 silently returns None unless the source document is already
     loaded into the SolidWorks session (via a silent OpenDoc6) and the assembly
     is re-activated as ActiveDoc right before the call.
+
+    AddComponent5's own X/Y/Z place the component's BOUNDING-BOX CENTER at that
+    point, not its origin -- confirmed live, 2026-10-04: inserting two parts at
+    (0,0,0) and (10,15,10) landed their origins at (-20,-5,20) and (0,10,20)
+    respectively, each exactly equal to (requested - that part's own bbox
+    center). A caller reasoning in a part's own coordinate system (where
+    insert_component's docstring says "at a position") has no way to predict
+    that offset without a separate measure_body call on the source file first.
+    Measure the just-opened source doc's bounding box here and add its center
+    to x/y/z before the AddComponent5 call, so the component's ORIGIN -- not
+    its bbox center -- ends up at the caller's requested point instead.
     """
     assy_title = _doc_title(assy)
     app = _connect()
@@ -774,6 +785,18 @@ def _preload_and_insert_component(assy, filepath: str, x: float, y: float, z: fl
     loaded_doc, errors, _warnings = _open_doc6(app, filepath, doc_type, 1)
     if loaded_doc is None:
         raise RuntimeError(f"Failed to load component '{filepath}' (error code {errors}).")
+
+    try:
+        bodies = loaded_doc.GetBodies2(0, True)
+        if bodies:
+            body = win32com.client.Dispatch(bodies[0])
+            box = body.GetBodyBox()
+            if box:
+                x += (box[0] + box[3]) / 2.0
+                y += (box[1] + box[4]) / 2.0
+                z += (box[2] + box[5]) / 2.0
+    except Exception:
+        pass  # fall back to AddComponent5's native (bbox-center) placement
 
     active_assy, reactivate_errors = _activate_doc3(app, assy_title, False)
     if active_assy is None:
@@ -1106,7 +1129,12 @@ async def list_open_documents() -> dict:
 @mcp.tool()
 async def insert_component(filepath: str, x: float = 0, y: float = 0, z: float = 0,
                             unit: Optional[str] = None) -> dict:
-    """Insert an existing part or sub-assembly file into the active assembly at a position."""
+    """Insert an existing part or sub-assembly file into the active assembly at a position.
+
+    x/y/z place the component's own origin (its sketch/model origin, as seen
+    when you open that file alone) at this point in the assembly -- not its
+    bounding-box center, which is what the underlying AddComponent5 call does
+    natively if not corrected for (see _preload_and_insert_component)."""
 
     def _impl():
         if not os.path.exists(filepath):
