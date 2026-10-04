@@ -1750,8 +1750,19 @@ async def create_sketch_on_face(x: float = 0, y: float = 0, z: float = 0, unit: 
     into the flange's own defining sketch; every later cut_extrude pointed at
     that same sketch and failed, because it now mixed the flange's profile
     geometry with an unrelated circle instead of forming one closed loop).
-    Use a named reference plane (create_reference_plane + create_sketch)
-    instead for this face -- the bug report's own documented workaround."""
+
+    CONFIRMED DEAD END for cutting an EdgeFlange face specifically (full
+    writeup: .claude/knowledge/chapa_metalica.md, section "Furo em face de
+    EdgeFlange"). This RAISE catches it in some but not all cases -- whether
+    SolidWorks reopens the defining sketch depends on prior state (e.g.
+    whether flatten_sheet_metal was toggled earlier in the session), so a
+    call that doesn't raise here can still fail at cut_extrude instead, or
+    -- worse -- "succeed" while leaving the cut suppressed outside the Flat
+    Pattern configuration (no hole in the actual folded part). Don't retry
+    with different coordinates or a different selection method; none of
+    that is the actual problem. Cut before folding, or use a named
+    reference plane (create_reference_plane + create_sketch) and accept
+    that the result won't survive flatten_sheet_metal()."""
 
     def _impl():
         doc = _active_doc()
@@ -2530,7 +2541,17 @@ async def hole_wizard(face_x: float, face_y: float, face_z: float,
     size: nominal hole diameter (or thread size for tapped).
     depth: hole depth (ignored for through-all; use depth=0 to drill through).
     thread_standard: 'ISO' or 'ANSI' metric. Hole Wizard uses metric M-size
-    families; tapped holes use the matching ISO coarse pitch automatically."""
+    families; tapped holes use the matching ISO coarse pitch automatically.
+
+    CONFIRMED DEAD END on an EdgeFlange's folded face specifically (full
+    writeup: .claude/knowledge/chapa_metalica.md, section "Furo em face de
+    EdgeFlange"): fails deterministically with "Ensure the face is flat",
+    live-reproduced on 2026-10-04 with correct, confirmed coordinates. The
+    face selection itself succeeds; HoleWizard4 refuses the face. Root cause
+    not found on the server side -- don't retry with different size/depth/
+    coordinates, that's not what's failing. create_sketch_on_face +
+    cut_extrude doesn't work around it either (see that tool's docstring).
+    Cut before folding, or tell the user this face needs a manual hole."""
 
     def _impl():
         if size <= 0:
