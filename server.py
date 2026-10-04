@@ -31,6 +31,15 @@ import win32com.client
 import pythoncom
 
 from mcp.server.fastmcp import FastMCP, Image
+from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
+from pydantic import ConfigDict
+
+# Reject unknown tool arguments instead of silently ignoring them. Without
+# this, FastMCP's default Pydantic config (extra="ignore") means a caller
+# that misspells a parameter name (e.g. "x_center" instead of "cx") gets no
+# error at all -- the field just falls back to its default and the tool
+# quietly does the wrong thing (a mispositioned arc/polygon, not a failure).
+ArgModelBase.model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -2028,7 +2037,16 @@ async def draw_spline(points: list[list[float]], natural_ends: bool = True,
         point_data = win32com.client.VARIANT(
             pythoncom.VT_ARRAY | pythoncom.VT_R8, flattened
         )
-        spline = doc.SketchManager.CreateSpline3(point_data, None, None, natural_ends, status)
+        # CreateSpline3's 4th argument is IsPeriodic (True = closed-loop
+        # spline), not "natural ends". Passing natural_ends straight through
+        # made the documented default (True) silently build a periodic
+        # spline that whips back on itself through non-cyclic points --
+        # confirmed live: natural_ends=True produced a huge closed spike
+        # instead of a smooth open curve, natural_ends=False produced the
+        # correct open curve. Invert it so natural_ends=True (the default,
+        # "open spline with free end tangents") maps to IsPeriodic=False.
+        is_periodic = not natural_ends
+        spline = doc.SketchManager.CreateSpline3(point_data, None, None, is_periodic, status)
         if spline is None:
             raise RuntimeError("SolidWorks could not create the spline in the active sketch.")
         return {
