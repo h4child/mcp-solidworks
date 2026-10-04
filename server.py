@@ -649,8 +649,16 @@ def _find_last_sketch(doc) -> Optional[str]:
     return name
 
 
+#: Set by _select_last_sketch on every call to say which of its 3 paths
+#: resolved the name (or why each one before it was skipped/failed), so a
+#: tool's error message can report it instead of us re-guessing blind after
+#: every live-test failure. Read this via get_sketch_status's debug field or
+#: by having cut_extrude's error text include it -- see cut_extrude.
+_last_select_debug: str = ""
+
+
 def _select_last_sketch(doc) -> str:
-    global _last_user_sketch_name, _last_user_sketch_obj
+    global _last_user_sketch_name, _last_user_sketch_obj, _last_select_debug
     try:
         if doc.SketchManager.ActiveSketch is not None:
             doc.SketchManager.InsertSketch(True)  # close it
@@ -659,6 +667,7 @@ def _select_last_sketch(doc) -> str:
 
     doc.ClearSelection2(True)
     name = None
+    debug_steps = [f"cached_name={_last_user_sketch_name!r} cached_obj={'set' if _last_user_sketch_obj is not None else 'None'}"]
 
     # 1) The live object, if close_sketch captured one for the current
     #    document. Select4(Append, Callout) is the generic entity-selection
@@ -672,25 +681,40 @@ def _select_last_sketch(doc) -> str:
     #    the sketch to be independently findable by name/tree first.
     if _last_user_sketch_obj is not None:
         try:
-            if _last_user_sketch_obj.Select4(False, pythoncom.Nothing):
+            ok = _last_user_sketch_obj.Select4(False, pythoncom.Nothing)
+            debug_steps.append(f"step1 Select4->{ok!r}")
+            if ok:
                 name = _last_user_sketch_name or "<sketch>"
-        except Exception:
+        except Exception as exc:
+            debug_steps.append(f"step1 Select4 raised {exc!r}")
             _last_user_sketch_obj = None  # stale COM reference -- stop trying it
+    else:
+        debug_steps.append("step1 skipped (no cached_obj)")
 
     # 2) Fall back to selecting by the cached name (handles the case where
     #    the object was never captured, e.g. a sketch opened by some other
     #    path, but the name still resolves in the tree).
-    if not name and _last_user_sketch_name and _select_by_id(doc, _last_user_sketch_name, "SKETCH"):
-        name = _last_user_sketch_name
+    if not name:
+        if _last_user_sketch_name:
+            ok = _select_by_id(doc, _last_user_sketch_name, "SKETCH")
+            debug_steps.append(f"step2 SelectByID2({_last_user_sketch_name!r})->{ok}")
+            if ok:
+                name = _last_user_sketch_name
+        else:
+            debug_steps.append("step2 skipped (no cached_name)")
 
     # 3) Last resort: scan the tree for the last non-suppressed ProfileFeature.
     if not name:
         doc.ClearSelection2(True)
         name = _find_last_sketch(doc)
+        debug_steps.append(f"step3 _find_last_sketch->{name!r}")
         if not name:
+            _last_select_debug = " | ".join(debug_steps)
             raise RuntimeError("No sketch found. Create a sketch and draw a closed profile first.")
         if not _select_by_id(doc, name, "SKETCH"):
+            _last_select_debug = " | ".join(debug_steps)
             raise RuntimeError(f"Could not select sketch '{name}'.")
+    _last_select_debug = " | ".join(debug_steps) + f" | RESULT={name!r}"
     return name
 
 
@@ -2109,7 +2133,10 @@ async def cut_extrude(depth: float = 10, through_all: bool = False,
             0, 0.0, False, False,
         )
         if feat is None:
-            raise RuntimeError(f"Cut failed on sketch '{sketch_name}'. Check that its profile is closed.")
+            raise RuntimeError(
+                f"Cut failed on sketch '{sketch_name}'. Check that its profile is closed. "
+                f"[_select_last_sketch debug: {_last_select_debug}]"
+            )
         return {"sketch": sketch_name, "through_all": through_all,
                 "depth": None if through_all else depth, "unit": unit or _default_unit}
 
