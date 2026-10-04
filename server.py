@@ -556,8 +556,33 @@ def _standard_plane_name(doc, which: str) -> str:
     return planes[idx]
 
 
+#: Name of the most recent sketch opened by create_sketch/create_sketch_on_face
+#: in this server process, captured the instant it becomes ActiveSketch (see
+#: _remember_active_sketch). This is the authoritative source for "the sketch
+#: you just drew" -- by the time cut_extrude/revolve_sketch run, close_sketch
+#: has already cleared doc.SketchManager.ActiveSketch, so nothing short of a
+#: value captured at creation time can name it directly.
+_last_user_sketch_name: Optional[str] = None
+
+
+def _remember_active_sketch(doc) -> None:
+    """Capture the name of the sketch doc.InsertSketch2 just opened, while it
+    is still ActiveSketch and therefore unambiguous. Call this right after
+    opening a sketch on a plane/face -- never after closing one."""
+    global _last_user_sketch_name
+    try:
+        active = doc.SketchManager.ActiveSketch
+        if active is not None:
+            _last_user_sketch_name = active.Name
+    except Exception:
+        pass
+
+
 def _find_last_sketch(doc) -> Optional[str]:
-    """Return the name of the last user sketch in the feature tree.
+    """Fallback for _select_last_sketch: return the last non-suppressed
+    ProfileFeature in the tree, when _last_user_sketch_name isn't usable
+    (e.g. a sketch that predates this server process, or was opened by some
+    path other than create_sketch/create_sketch_on_face).
 
     Was implemented as a FirstFeature/GetNextFeature linked-list walk with a
     bare ``except: break`` -- if traversal threw a COM error past a corrupted
@@ -570,6 +595,13 @@ def _find_last_sketch(doc) -> Optional[str]:
     its neighbors, so one bad feature can no longer cut the scan short.
     Suppressed features are skipped: an orphaned sketch like "Esboço28" is
     suppressed, and was never a real candidate for "the sketch you just drew".
+
+    CAVEAT (found live, 2026-10-04): this can still pick the wrong feature on
+    a sheet-metal part -- SolidWorks' own bend/flatten machinery leaves
+    non-suppressed internal features also typed "ProfileFeature" (observed:
+    "Curva-Linhas2", right after a OneBend feature) that sort after the sketch
+    you actually drew. That is exactly why this is now a fallback rather than
+    the primary path.
     """
     name = None
     for raw_feature in doc.FeatureManager.GetFeatures(False) or ():
@@ -592,6 +624,7 @@ def _find_last_sketch(doc) -> Optional[str]:
 
 
 def _select_last_sketch(doc) -> str:
+    global _last_user_sketch_name
     try:
         if doc.SketchManager.ActiveSketch is not None:
             doc.SketchManager.InsertSketch(True)  # close it
@@ -599,7 +632,12 @@ def _select_last_sketch(doc) -> str:
         pass
 
     doc.ClearSelection2(True)
-    name = _find_last_sketch(doc)
+    name = None
+    if _last_user_sketch_name and _select_by_id(doc, _last_user_sketch_name, "SKETCH"):
+        name = _last_user_sketch_name
+        doc.ClearSelection2(True)  # _select_by_id leaves it selected; re-clear before the real select below
+    if not name:
+        name = _find_last_sketch(doc)
     if not name:
         raise RuntimeError("No sketch found. Create a sketch and draw a closed profile first.")
     if not _select_by_id(doc, name, "SKETCH"):
@@ -1610,6 +1648,7 @@ async def create_sketch(plane: str = "front") -> dict:
         if not _select_by_id(doc, plane_name, "PLANE"):
             raise RuntimeError(f"Could not select plane '{plane_name}'.")
         doc.InsertSketch2(True)
+        _remember_active_sketch(doc)
         return {"plane": plane_name}
 
     return await _run(_impl)
@@ -1635,6 +1674,7 @@ async def create_sketch_on_face(x: float = 0, y: float = 0, z: float = 0, unit: 
         if not _select_by_id(doc, "", "FACE", x_m, y_m, z_m):
             raise RuntimeError(f"No face found at ({x}, {y}, {z}) {unit or _default_unit}.")
         doc.InsertSketch2(True)
+        _remember_active_sketch(doc)
         return {"point": {"x": x, "y": y, "z": z}, "unit": unit or _default_unit}
 
     return await _run(_impl)
