@@ -16,3 +16,4 @@ RELATORIO_REPOSITORIO.md
 .venv/
 backup_extensao/
 .github/
+.pytest_cache/
