@@ -5407,11 +5407,11 @@ _DRAWING_EDGE_IID = "{83A33D42-27C5-11CE-BFD4-00400513BB57}"
 # swViewEntityType_e: edges.
 _VIEW_ENTITY_EDGE = 1
 
-# swDimensionType_e.swAngularDimension. Resolved from the installed type
-# library when available so the number is not hard-coded against one release;
-# the literal is the documented fallback and only decides whether a value is
-# reported in degrees or millimetres.
-_ANGULAR_DIM_TYPE_FALLBACK = 3
+# No angular-dimension constant is hard-coded here on purpose: the unit of a
+# dimension is settled in _read_dimension_value by comparing SystemValue (SI)
+# against Value (display units), which needs no enum and so cannot be wrong
+# about a build whose enum differs. A guessed constant would silently report
+# radians as millimetres.
 
 # swThisConfiguration, for IDimension.GetSystemValue3.
 _THIS_CONFIGURATION = 1
@@ -5425,13 +5425,6 @@ _INPUT_DIM_VAL_ON_CREATE = 10
 _ENTITY_REGISTRY = ad.EntityRegistry()
 
 
-def _angular_dim_type() -> int:
-    try:
-        return int(win32com.client.constants.swAngularDimension)
-    except Exception:
-        return _ANGULAR_DIM_TYPE_FALLBACK
-
-
 # ---------------------------------------------------------------------------
 # Drawing reads: sheets, views, entities, dimensions
 # ---------------------------------------------------------------------------
@@ -5443,17 +5436,31 @@ def _sheet_names(doc) -> list:
 
 
 def _sheet_and_views(doc, sheet_name: str):
-    """(ISheet, [IView]) for one sheet, excluding the sheet's own pseudo-view.
+    """(ISheet, [IView]) for one sheet, excluding any sheet pseudo-view.
 
-    ISheet.GetViews returns the sheet itself as the first element -- a view
-    whose outline is the whole sheet. Including it makes every real view look
-    like it overlaps something, so it is dropped here once rather than
-    remembered at every call site.
+    ISheet.GetViews returns the REAL views only -- confirmed live on
+    SolidWorks 2025 PT-BR: a sheet with one view returns one element, a sheet
+    with two returns two. An earlier version of this function assumed element
+    0 was the sheet's own pseudo-view (which is how IDrawingDoc.GetFirstView
+    behaves) and dropped it, so get_drawing_layout reported zero views on a
+    sheet that had one, and _find_view could not find anything.
+
+    The sheet pseudo-view is filtered by NAME rather than by position, so a
+    build that does include it is still handled without dropping a real view.
     """
     sheet = win32com.client.Dispatch(doc.Sheet(sheet_name))
     raw = _com_member(sheet, "GetViews") or ()
-    views = [win32com.client.Dispatch(v) for v in raw]
-    return sheet, views[1:] if views else []
+    views = []
+    for item in raw:
+        view = win32com.client.Dispatch(item)
+        try:
+            if str(_com_member(view, "Name")) == sheet_name:
+                continue  # the sheet's own pseudo-view, not a model view
+        except Exception:
+            log.debug("Could not read a view name on sheet %r", sheet_name,
+                      exc_info=True)
+        views.append(view)
+    return sheet, views
 
 
 def _all_drawing_views(doc) -> list:
@@ -5629,6 +5636,85 @@ def _read_view_entities(doc, view, view_name: str, register: bool = True) -> lis
     return entities
 
 
+def _read_dimension_value(dim):
+    """(value, unit) of an IDimension: millimetres or degrees.
+
+    Measured live on SolidWorks 2025 PT-BR for one linear drawing dimension
+    of 400 mm:
+
+        GetSystemValue3(1, None) -> None      <- the documented call
+        GetSystemValue3(1, "")   -> None
+        GetSystemValue2("")      -> 0.4       (metres)
+        SystemValue              -> 0.4       (metres)
+        Value                    -> 400.0     (document display units)
+        GetValue3(1, None)       -> (400.0,)  (display units)
+
+    So the documented GetSystemValue3 cannot be relied on, and the earlier
+    version of this reader multiplied its None by 1000.
+
+    The unit is settled WITHOUT a swDimensionType_e constant, by using the
+    two readings against each other: SystemValue is always SI (metres for a
+    length, radians for an angle) while Value is in display units. If
+    Value matches SystemValue x 1000 it is a length; if it matches
+    degrees(SystemValue) it is an angle. Guessing an enum value for angular
+    dimensions, and being wrong, would silently report radians-as-millimetres.
+    """
+    system = None
+    for getter in ("SystemValue",):
+        try:
+            system = _com_member(dim, getter)
+            if system is not None:
+                break
+        except Exception:
+            log.debug("IDimension.%s unavailable", getter, exc_info=True)
+    if system is None:
+        for call, args in (("GetSystemValue2", ("",)),
+                           ("GetSystemValue3", (_THIS_CONFIGURATION, None))):
+            try:
+                raw = _com_member(dim, call, *args)
+                if isinstance(raw, (tuple, list)):
+                    raw = raw[0] if raw else None
+                if raw is not None:
+                    system = raw
+                    break
+            except Exception:
+                log.debug("IDimension.%s unavailable", call, exc_info=True)
+    if system is None:
+        raise RuntimeError(
+            "SolidWorks reported no value for this dimension "
+            "(SystemValue, GetSystemValue2 and GetSystemValue3 all returned "
+            "nothing)."
+        )
+
+    system = float(system)
+    as_mm = round(system * 1000.0, 3)
+    as_deg = round(math.degrees(system), 4)
+
+    display = None
+    try:
+        display = _com_member(dim, "Value")
+    except Exception:
+        log.debug("IDimension.Value unavailable", exc_info=True)
+    if display is None:
+        try:
+            raw = _com_member(dim, "GetValue3", _THIS_CONFIGURATION, None)
+            if isinstance(raw, (tuple, list)) and raw:
+                display = raw[0]
+        except Exception:
+            log.debug("IDimension.GetValue3 unavailable", exc_info=True)
+
+    if display is not None:
+        display = float(display)
+        if abs(display - as_mm) <= max(0.01, abs(as_mm) * 1e-6):
+            return as_mm, "mm"
+        if abs(display - as_deg) <= max(0.01, abs(as_deg) * 1e-6):
+            return as_deg, "deg"
+
+    # Nothing to cross-check against: a length is overwhelmingly the common
+    # case, and saying which assumption was made beats implying certainty.
+    return as_mm, "mm?"
+
+
 def _read_view_dimensions(doc, view, view_name: str) -> list:
     """Every dimension displayed in a view, with its measured value.
 
@@ -5636,14 +5722,31 @@ def _read_view_dimensions(doc, view, view_name: str) -> list:
     whether a dimension landed on the right edge, is duplicated, or has come
     adrift from the model.
     """
-    angular_type = _angular_dim_type()
-    registry_ids = _ENTITY_REGISTRY.ids_for_view(_doc_title(doc), view_name)
-    known = {}
-    for entity_id in registry_ids:
+    doc_title = _doc_title(doc)
+    # (com_identity, entity_id) pairs, compared with ==. NOT a dict: the COM
+    # identity is unhashable -- see _entity_key.
+    known: list = []
+    for entity_id in _ENTITY_REGISTRY.ids_for_view(doc_title, view_name):
         try:
-            known[_entity_key(_ENTITY_REGISTRY.resolve(_doc_title(doc), entity_id)["entity"])] = entity_id
+            item = _ENTITY_REGISTRY.resolve(doc_title, entity_id)
+            known.append((_entity_key(item["entity"]), entity_id))
         except Exception:
-            continue
+            log.debug("Could not key registered entity %s", entity_id, exc_info=True)
+
+    def _entity_id_of(com_entity):
+        if com_entity is None:
+            return None
+        try:
+            key = _entity_key(com_entity)
+        except Exception:
+            return "unregistered"
+        for candidate, entity_id in known:
+            try:
+                if candidate == key:
+                    return entity_id
+            except Exception:
+                continue
+        return "unregistered"
 
     out, index = [], 0
     try:
@@ -5658,45 +5761,55 @@ def _read_view_dimensions(doc, view, view_name: str) -> list:
         entry = {"id": f"{view_name}#D{index}"}
         try:
             dimension = win32com.client.Dispatch(_com_member(display, "GetDimension2", 0))
-            raw_value = _com_member(dimension, "GetSystemValue3",
-                                    _THIS_CONFIGURATION, None)
-            if isinstance(raw_value, (tuple, list)):
-                raw_value = raw_value[0]
-            dim_type = int(_com_member(display, "Type2"))
-            is_angular = dim_type == angular_type
+            value, unit = _read_dimension_value(dimension)
+            try:
+                dim_type = int(_com_member(display, "Type2"))
+            except Exception:
+                dim_type = None
             entry.update({
                 "name": str(_com_member(dimension, "FullName")),
                 "type_code": dim_type,
-                "unit": "deg" if is_angular else "mm",
-                "value_mm": ad.deg(raw_value) if is_angular else ad.mm(raw_value),
+                "unit": unit,
+                "value_mm": value,
                 "driven": bool(_com_member(dimension, "DrivenState") == 1),
             })
         except Exception as exc:
             entry["read_error"] = str(exc)
             log.warning("Could not read dimension %s", entry["id"], exc_info=True)
 
+        # One try per concern: a failure reading the text position used to
+        # abandon the attachment read as well, and the attachment read is the
+        # one the coverage check depends on.
+        annotation = None
         try:
             annotation = win32com.client.Dispatch(_com_member(display, "GetAnnotation"))
-            position = tuple(_com_member(annotation, "GetPosition") or ())
-            entry["text_position_mm"] = [ad.mm(c) for c in position[:2]]
-            attached = _com_member(annotation, "GetAttachedEntities3") or ()
-            types = _com_member(annotation, "GetAttachedEntityTypes") or ()
-            entry["attached"] = [
-                None if e is None else known.get(_entity_key(e), "unregistered")
-                for e in attached
-            ]
-            entry["attached_count"] = sum(1 for e in attached if e is not None)
-            # IAnnotation.GetAttachedEntityTypes: a dissociated annotation
-            # reports a null entity and swSelNOTHING for that slot.
-            entry["dangling"] = (
-                any(e is None for e in attached)
-                or (len(attached) == 0 and len(types) == 0)
-            )
         except Exception as exc:
-            entry.setdefault("read_error", str(exc))
-            entry["attached"] = []
-            entry["attached_count"] = 0
-            entry["dangling"] = None
+            entry.setdefault("read_error", f"GetAnnotation: {exc}")
+
+        if annotation is not None:
+            try:
+                position = tuple(_com_member(annotation, "GetPosition") or ())
+                entry["text_position_mm"] = [ad.mm(c) for c in position[:2]]
+            except Exception as exc:
+                entry.setdefault("read_error", f"GetPosition: {exc}")
+
+            try:
+                attached = _com_member(annotation, "GetAttachedEntities3") or ()
+                types = _com_member(annotation, "GetAttachedEntityTypes") or ()
+                entry["attached"] = [_entity_id_of(e) for e in attached]
+                entry["attached_count"] = sum(1 for e in attached if e is not None)
+                # IAnnotation.GetAttachedEntityTypes: a dissociated annotation
+                # reports a null entity and swSelNOTHING for that slot.
+                entry["dangling"] = (
+                    any(e is None for e in attached)
+                    or (len(attached) == 0 and len(types) == 0)
+                )
+            except Exception as exc:
+                entry.setdefault("read_error", f"GetAttachedEntities3: {exc}")
+
+        entry.setdefault("attached", [])
+        entry.setdefault("attached_count", 0)
+        entry.setdefault("dangling", None)
 
         out.append(entry)
         try:
@@ -5707,12 +5820,19 @@ def _read_view_dimensions(doc, view, view_name: str) -> list:
 
 
 def _entity_key(com_entity):
-    """A comparable key for a COM entity.
+    """A COMPARABLE -- not hashable -- key for a COM entity.
 
     Comparing proxies by ``id()`` does not work: pywin32 builds a fresh
     wrapper on every access, so the same edge gets a different ``id()`` each
     time and no dimension would ever match a registered entity. The COM
-    identity of the underlying IUnknown is the thing that is actually stable.
+    identity of the underlying IUnknown is what is actually stable.
+
+    The returned PyIUnknown supports ``==`` but NOT ``hash()``. Using it as a
+    dict key raises "unhashable type: 'PyIUnknown'", which is exactly what
+    made every dimension report attached=[] and made verify_drawing flag
+    plainly dimensioned edges as having no dimension. Match with ``==`` over
+    a list of pairs instead; a drawing view has tens of entities, so the
+    linear scan costs nothing.
     """
     try:
         return win32com.client.Dispatch(com_entity)._oleobj_.QueryInterface(
@@ -6000,23 +6120,19 @@ def _add_dimension_at(doc, px_m: float, py_m: float):
 
 def _measure_display_dimension(display, view_name: str, index_hint: int = 1) -> dict:
     """Read back what a freshly created dimension actually measures."""
-    angular_type = _angular_dim_type()
     display = win32com.client.Dispatch(display)
     out = {"id": f"{view_name}#D{index_hint}"}
     dimension = win32com.client.Dispatch(_com_member(display, "GetDimension2", 0))
-    raw_value = _com_member(dimension, "GetSystemValue3", _THIS_CONFIGURATION, None)
-    if isinstance(raw_value, (tuple, list)):
-        raw_value = raw_value[0]
+    value, unit = _read_dimension_value(dimension)
     try:
         dim_type = int(_com_member(display, "Type2"))
     except Exception:
-        dim_type = -1
-    is_angular = dim_type == angular_type
+        dim_type = None
     out.update({
         "name": str(_com_member(dimension, "FullName")),
         "type_code": dim_type,
-        "unit": "deg" if is_angular else "mm",
-        "value": ad.deg(raw_value) if is_angular else ad.mm(raw_value),
+        "unit": unit,
+        "value": value,
     })
     try:
         annotation = win32com.client.Dispatch(_com_member(display, "GetAnnotation"))

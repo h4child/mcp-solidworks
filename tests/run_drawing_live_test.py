@@ -44,12 +44,75 @@ HOLE_CENTER = (200.0, 75.0)
 
 results = []
 
+# SolidWorks cannot hold two documents with the same title, so a run that
+# aborts and leaves "beam_plate.SLDPRT" open makes every later run fail at
+# "Failed to insert front view" -- which looks like a geometry problem and is
+# not. A per-run suffix keeps runs independent.
+RUN_ID = f"{os.getpid()}"
+PART_NAME = f"beam_plate_{RUN_ID}"
+
 
 def check(name, condition, detail=""):
     results.append((name, bool(condition), detail))
     mark = "PASS" if condition else "FAIL"
     print(f"  [{mark}] {name}" + (f"\n         {detail}" if detail else ""))
     return bool(condition)
+
+
+async def close_only_ours(pre_existing):
+    """Close every document this run created, and nothing else.
+
+    CloseAllDocuments would be simpler and would also throw away whatever the
+    user had open, so the titles that were present before the run are
+    excluded by name.
+    """
+    loop = asyncio.get_event_loop()
+    app = await loop.run_in_executor(server._executor, server._connect)
+
+    # Close in reverse dependency order. SolidWorks refuses to close a part
+    # while an open drawing still references it, and the part is the first
+    # thing list_open_documents reports -- so a naive loop retried the part
+    # twelve times and closed nothing.
+    close_order = {"Drawing": 0, "Assembly": 1, "Part": 2}
+
+    for _attempt in range(12):
+        docs = (await server.list_open_documents())["documents"]
+        ours = [d for d in docs if d["title"] not in pre_existing]
+        if not ours:
+            break
+        ours.sort(key=lambda d: close_order.get(d.get("type"), 9))
+        title = ours[0]["title"]
+
+        def close(title=title):
+            # Two separate quirks to get past:
+            #  - QuitDoc closes WITHOUT saving; CloseDoc silently refuses a
+            #    document with unsaved changes, which is every document this
+            #    test creates.
+            #  - a DRAWING's GetTitle is "Name - SheetName" ("Desenho13 -
+            #    Folha1"), which is what list_open_documents reports, but
+            #    QuitDoc and CloseDoc want the document name alone.
+            # Everything here runs in ONE executor call: the COM executor has
+            # a single worker, so submitting to it from inside it deadlocks.
+            candidates = [title]
+            if " - " in title:
+                candidates.append(title.rsplit(" - ", 1)[0])
+            for name in candidates:
+                for method in ("QuitDoc", "CloseDoc"):
+                    try:
+                        getattr(app, method)(name)
+                    except Exception:
+                        continue
+            return True
+
+        await loop.run_in_executor(server._executor, close)
+
+    remaining = [d["title"] for d in (await server.list_open_documents())["documents"]
+                 if d["title"] not in pre_existing]
+    if remaining:
+        print(f"      WARNING: could not close {remaining}; close them by hand "
+              f"or the next run will collide on the duplicate title")
+    else:
+        print("      closed every document this run created")
 
 
 async def build_part(path):
@@ -75,8 +138,14 @@ async def main():
     await server.connect_solidworks()
 
     workdir = tempfile.mkdtemp(prefix="mcp_draw_live_")
-    part_path = os.path.join(workdir, "beam_plate.SLDPRT")
-    drawing_path = os.path.join(workdir, "beam_plate.SLDDRW")
+    part_path = os.path.join(workdir, f"{PART_NAME}.SLDPRT")
+
+    # Anything already open belongs to the user; this run must not close it.
+    pre_existing = {d["title"] for d in
+                    (await server.list_open_documents())["documents"]}
+    if pre_existing:
+        print(f"\nnote: {len(pre_existing)} document(s) already open; they will "
+              f"be left alone")
 
     print(f"\nworking in {workdir}")
 
@@ -107,10 +176,20 @@ async def main():
     check("insert_drawing_view returns a real outline (B05)",
           bool(view.get("outline_mm")), f"outline_mm={view.get('outline_mm')}")
     codes = [i["code"] for i in view.get("issues", [])]
-    check("a 2400 mm view at 1:1 is flagged as not fitting (E07)",
-          "E07" in codes, f"issues={codes}")
-
-    view_name = view.get("view_name")
+    # SolidWorks refuses a view scale it cannot honour and falls back to the
+    # SHEET scale, so the view ends up fitting after all. What must not
+    # happen is the old behaviour: swallowing the refusal inside
+    # try/except: pass and reporting the requested scale anyway. E08 (scale
+    # refused or not normalised) and E07 (does not fit) are both correct
+    # answers here; silence is not.
+    requested = view.get("requested_scale")
+    effective = view.get("effective_scale")
+    check("a refused view scale is reported, not swallowed (B05)",
+          bool(codes) or effective == f"{requested:g}:1",
+          f"requested={requested} effective={effective} issues={codes}")
+    check("the result says whether the scale was actually applied",
+          view.get("scale_applied") is not None,
+          f"scale_applied={view.get('scale_applied')}")
 
     # Put it at a scale that fits, so the rest of the test works on a sane sheet.
     print("\n[3] re-insert at a scale that fits")
@@ -124,7 +203,8 @@ async def main():
     print("\n[4] get_drawing_layout")
     layout = await server.get_drawing_layout()
     sheet = layout["sheets"][0]
-    check("the sheet format is identified", sheet.get("format") is not None,
+    check("the sheet format is identified (ISO or ANSI)",
+          sheet.get("format") is not None,
           f"format={sheet.get('format')} size={sheet.get('size_mm')}")
     check("the usable area is reported", bool(sheet.get("usable_area_mm")),
           f"usable={sheet.get('usable_area_mm')}")
@@ -215,6 +295,20 @@ async def main():
     check("none of them is dangling",
           not [d for d in dims["dimensions"] if d.get("dangling")],
           f"dangling={[d['id'] for d in dims['dimensions'] if d.get('dangling')]}")
+    # The attachment read is what the coverage check depends on. It silently
+    # returned nothing because the COM identity was being used as a dict key
+    # and PyIUnknown is unhashable -- so verify_drawing flagged edges that
+    # were plainly dimensioned.
+    check("no dimension reports a read error",
+          not [d for d in dims["dimensions"] if d.get("read_error")],
+          f"errors={[d.get('read_error') for d in dims['dimensions'] if d.get('read_error')]}")
+    check("each dimension resolves to the entity it is attached to",
+          all(d.get("attached_count") for d in dims["dimensions"])
+          and not any("unregistered" in (d.get("attached") or [])
+                      for d in dims["dimensions"]),
+          f"attached={[d.get('attached') for d in dims['dimensions']]}")
+    dimensioned_ids = {ref for d in dims["dimensions"]
+                       for ref in (d.get("attached") or []) if ref}
 
     print("\n[10] verify_drawing")
     report = await server.verify_drawing()
@@ -224,6 +318,17 @@ async def main():
         print(f"        {issue['code']} {issue['severity']}: {issue['message'][:80]}")
     check("verify_drawing returns a structured report",
           "status" in report and isinstance(report.get("issues"), list))
+    # The regression this pins: verify_drawing reported "no dimension" for
+    # every edge, including the three just dimensioned, because the
+    # dimension-to-entity mapping came back empty.
+    missing_refs = {ref for i in report["issues"] if i["code"] == "E02"
+                    for ref in i["refs"]}
+    wrongly_flagged = dimensioned_ids & missing_refs
+    check("an entity that HAS a dimension is not reported as missing one",
+          not wrongly_flagged,
+          f"wrongly flagged: {sorted(wrongly_flagged)}"
+          if wrongly_flagged else f"{len(dimensioned_ids)} dimensioned, "
+          f"{len(missing_refs)} flagged, no overlap")
     check("verify_drawing inspected the view",
           any(v["view"] == view_name for v in report["views_checked"]),
           f"views_checked={report['views_checked']}")
@@ -255,11 +360,7 @@ async def main():
 
     # ------------------------------------------------------------- cleanup
     print("\n[13] cleanup")
-    for _ in range(3):
-        try:
-            await server.close_document(save=False)
-        except Exception:
-            break
+    await close_only_ours(pre_existing)
     import shutil
     shutil.rmtree(workdir, ignore_errors=True)
     print(f"      removed {workdir}")

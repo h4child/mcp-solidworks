@@ -97,6 +97,19 @@ PAPER_FORMATS: dict[str, tuple[float, float]] = {
     "A4": (297.0, 210.0),
 }
 
+# The ANSI/US series, in millimetres. A stock SolidWorks install often
+# defaults to Letter, and identify_format returning None for the sheet the
+# user actually has makes every format-dependent check silently inert --
+# found live on a 279.4 x 215.9 sheet.
+ANSI_FORMATS: dict[str, tuple[float, float]] = {
+    "Letter/ANSI A": (279.4, 215.9),   # 11 x 8.5 in
+    "Legal": (355.6, 215.9),           # 14 x 8.5 in
+    "Tabloid/ANSI B": (431.8, 279.4),  # 17 x 11 in
+    "ANSI C": (558.8, 431.8),          # 22 x 17 in
+    "ANSI D": (863.6, 558.8),          # 34 x 22 in
+    "ANSI E": (1117.6, 863.6),         # 44 x 34 in
+}
+
 # Margins per ABNT NBR 10068: 25 mm on the filing edge, 10 mm elsewhere.
 DEFAULT_MARGIN_MM = 10.0
 DEFAULT_BINDING_MARGIN_MM = 25.0
@@ -109,12 +122,17 @@ DEFAULT_DIM_OFFSET_MM = 12.0
 
 
 def identify_format(width_mm: float, height_mm: float, tol: float = 5.0) -> Optional[str]:
-    """Name the ISO format of a sheet, in either orientation."""
-    for name, (w, h) in PAPER_FORMATS.items():
-        if (abs(width_mm - w) <= tol and abs(height_mm - h) <= tol) or (
-            abs(width_mm - h) <= tol and abs(height_mm - w) <= tol
-        ):
-            return name
+    """Name the paper format of a sheet, in either orientation.
+
+    ISO (A0-A4) is tried first, then ANSI/US. Returns None only for a truly
+    custom size; the caller can still work from size_mm.
+    """
+    for table in (PAPER_FORMATS, ANSI_FORMATS):
+        for name, (w, h) in table.items():
+            if (abs(width_mm - w) <= tol and abs(height_mm - h) <= tol) or (
+                abs(width_mm - h) <= tol and abs(height_mm - w) <= tol
+            ):
+                return name
     return None
 
 

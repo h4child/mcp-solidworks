@@ -349,6 +349,37 @@ def test_a_clean_layout_produces_no_issues():
     assert issues == []
 
 
+def test_a_letter_sheet_is_identified_and_not_reported_as_unknown():
+    """A stock SolidWorks install often defaults to Letter.
+
+    identify_format knew only A0-A4, so on the 279.4 x 215.9 sheet the user
+    actually had it returned None -- and every format-dependent check became
+    silently inert. Found by the live test, not by reading the code.
+    """
+    assert ad.identify_format(279.4, 215.9) == "Letter/ANSI A"
+    assert ad.identify_format(215.9, 279.4) == "Letter/ANSI A"
+
+
+@pytest.mark.parametrize("w,h,name", [
+    (1189, 841, "A0"), (420, 297, "A3"), (297, 210, "A4"),
+    (355.6, 215.9, "Legal"), (431.8, 279.4, "Tabloid/ANSI B"),
+    (863.6, 558.8, "ANSI D"),
+])
+def test_both_paper_series_are_recognised(w, h, name):
+    assert ad.identify_format(w, h) == name
+
+
+def test_letter_and_a4_are_not_confused():
+    """279.4 x 215.9 and 297 x 210 are only ~18 and ~6 mm apart, so the
+    tolerance has to be tight enough to tell them apart."""
+    assert ad.identify_format(279.4, 215.9) != "A4"
+    assert ad.identify_format(297.0, 210.0) == "A4"
+
+
+def test_a_genuinely_custom_size_returns_none():
+    assert ad.identify_format(1234.0, 567.0) is None
+
+
 def test_the_usable_area_keeps_the_binding_margin_on_the_left():
     """ABNT NBR 10068: 25 mm on the filing edge, 10 mm elsewhere."""
     area = ad.SheetConfig().usable_area(420, 297)
