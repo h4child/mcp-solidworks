@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "solidworks-mcp",
   "display_name": "SolidWorks MCP",
-  "version": "5.10.0",
+  "version": "5.11.0",
   "description": "MCP server for SolidWorks automation through the Windows COM API, built with FastMCP.",
   "long_description": "Controls SolidWorks via COM for parts, assemblies, sketches, features, drawings, appearances, validation, and selected mechanical mates. Designed for trusted local desktop automation.",
   "author": {
@@ -621,6 +621,14 @@
     {
       "name": "execute_python",
       "description": "Run privileged local Python with sw/doc in scope; disabled unless SOLIDWORKS_MCP_ENABLE_EXECUTE_PYTHON=1."
+    },
+    {
+      "name": "extract_assembly_bom",
+      "description": "Build a full multi-level BOM of the active assembly: walks every level of the tree, groups rows by file path AND referenced configuration, skips suppressed and excluded components, and totals the mass."
+    },
+    {
+      "name": "lookup_material_properties",
+      "description": "Read a material's real physical properties (density, elastic modulus, Poisson's ratio, yield and tensile strength, thermal properties) straight from the SolidWorks .sldmat library. Read-only."
     }
   ],
   "keywords": [

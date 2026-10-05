@@ -15,3 +15,4 @@ RELATORIO_REPOSITORIO.md
 *.mcpb
 .venv/
 backup_extensao/
+.github/

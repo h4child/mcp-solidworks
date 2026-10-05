@@ -1284,18 +1284,27 @@ async def insert_component(filepath: str, x: float = 0, y: float = 0, z: float =
 
 
 @mcp.tool()
-async def list_components() -> dict:
-    """List every component (part/sub-assembly instance) in the active assembly.
+async def list_components(top_level_only: bool = False) -> dict:
+    """List the components of the active assembly, at every level by default.
+
+    top_level_only=True returns only the first level, which is what this tool
+    used to do unconditionally -- in an assembly built from subassemblies that
+    hid most of the parts.
 
     ``suppressed`` and ``visible`` are independent: a component can be shown
     (not suppressed) but hidden from view, or vice versa. Use ``visible`` to
     know what is actually on screen right now.
-    """
+
+    Each entry carries its `level` (0 = top) and `parent`, so the tree can be
+    reconstructed. For BOM quantities and grouping use extract_assembly_bom."""
 
     def _impl():
         assy = _active_assembly()
         components = []
-        for raw in assy.GetComponents(True) or ():
+        # IAssemblyDoc.GetComponents(ToplevelOnly): True means first level
+        # only. Passing False returns every component at every level, already
+        # flattened.
+        for raw in assy.GetComponents(bool(top_level_only)) or ():
             comp = win32com.client.Dispatch(raw)
             entry = {
                 "name": comp.Name2,
@@ -1310,16 +1319,42 @@ async def list_components() -> dict:
                 entry["visible"] = bool(state)
             except Exception:
                 entry["visible"] = None
+            for attribute, key in (("ReferencedConfiguration", "configuration"),
+                                   ("ExcludeFromBOM", "excluded_from_bom"),
+                                   ("IsVirtual", "virtual")):
+                try:
+                    value = _com_member(comp, attribute)
+                    entry[key] = bool(value) if key != "configuration" else (
+                        str(value) if value is not None else None)
+                except Exception:
+                    entry[key] = None
+            # Name2 of a nested component is "sub-1/part-1": the path through
+            # the tree. Its depth is the level, which GetComponents(False)
+            # does not otherwise report.
+            entry["level"] = entry["name"].count("/")
+            entry["parent"] = (entry["name"].rsplit("/", 1)[0]
+                               if "/" in entry["name"] else None)
             components.append(entry)
-        return {"count": len(components), "components": components}
+        return {
+            "assembly": _doc_title(_active_doc()),
+            "top_level_only": bool(top_level_only),
+            "count": len(components),
+            "components": components,
+        }
 
     return await _run(_impl)
 
 
 @mcp.tool()
 async def extract_assembly_data(config: str = "") -> dict:
-    """Walk every top-level component of the active assembly and return name,
+    """Walk every TOP-LEVEL component of the active assembly and return name,
     material/custom properties, and mass/dimensions for each one in a single call.
+
+    SUPERSEDED for BOM work by extract_assembly_bom, which walks every level.
+    This tool reads only the first level, so parts inside subassemblies do not
+    appear and a subassembly counts as one item. It is kept unchanged because
+    callers depend on its exact shape; use it when the first level is really
+    what is wanted.
 
     Built for BOM-style extraction (e.g. an AI pipeline that needs quantity,
     material, weight, and dimensions per part): without this, a caller needs
@@ -1451,6 +1486,242 @@ async def extract_assembly_data(config: str = "") -> dict:
             "unique_part_count": len(order),
             "components": components,
             "bom": [bom[k] for k in order],
+        }
+
+    return await _run(_impl)
+
+
+def _component_flags(comp) -> dict:
+    """Read the flags that decide whether a component belongs in a BOM."""
+    flags = {}
+    for attribute, key in (("IsSuppressed", "suppressed"),
+                           ("ExcludeFromBOM", "excluded_from_bom"),
+                           ("IsVirtual", "virtual"),
+                           ("ReferencedConfiguration", "configuration"),
+                           ("GetPathName", "path"),
+                           ("Name2", "name")):
+        try:
+            value = _com_member(comp, attribute)
+        except Exception:
+            value = None
+        if key in ("configuration", "path", "name"):
+            flags[key] = str(value) if value is not None else None
+        else:
+            flags[key] = bool(value)
+    return flags
+
+
+def _component_model_doc(comp):
+    """The IModelDoc2 behind a component, or None if it is not loaded.
+
+    Dynamic IDispatch auto-invokes zero-argument methods on attribute access,
+    so comp.GetModelDoc2 is often ALREADY the resolved document; pywin32 also
+    makes every dispatched object callable, so callable() cannot tell the two
+    cases apart. Try the call, fall back to the value.
+    """
+    try:
+        raw = comp.GetModelDoc2
+        if callable(raw):
+            try:
+                raw = raw()
+            except Exception:
+                pass
+        return win32com.client.Dispatch(raw) if raw is not None else None
+    except Exception:
+        return None
+
+
+def _is_assembly_component(comp) -> bool:
+    model = _component_model_doc(comp)
+    if model is None:
+        return False
+    try:
+        return _doc_type(model) == 2
+    except Exception:
+        return False
+
+
+def _walk_assembly(comp, level: int, parent: Optional[str], out: list,
+                   max_depth: int, visited: set) -> None:
+    """Depth-first walk of an assembly tree, appending one entry per instance.
+
+    Every physical instance appears once, so counting instances gives the
+    right BOM quantity with no need to multiply by a parent quantity: a
+    subassembly used twice is walked twice.
+
+    ``visited`` guards against a circular reference, which SolidWorks allows
+    to exist in a broken assembly and which would otherwise recurse forever.
+    """
+    flags = _component_flags(comp)
+    identity = (flags["path"], flags["configuration"], flags["name"], level)
+    if identity in visited:
+        return
+    visited.add(identity)
+
+    is_assembly = _is_assembly_component(comp)
+    entry = dict(flags, level=level, parent=parent, is_assembly=is_assembly,
+                 component=comp)
+    out.append(entry)
+
+    if not is_assembly or flags["suppressed"] or level >= max_depth:
+        return
+    try:
+        children = _com_member(comp, "GetChildren") or ()
+    except Exception:
+        log.debug("Could not read children of %r", flags["name"], exc_info=True)
+        return
+    for raw_child in children:
+        try:
+            child = win32com.client.Dispatch(raw_child)
+        except Exception:
+            continue
+        _walk_assembly(child, level + 1, flags["name"], out, max_depth, visited)
+
+
+@mcp.tool()
+async def extract_assembly_bom(config: str = "",
+                               include_subassemblies: bool = True,
+                               include_suppressed: bool = False,
+                               max_depth: int = 10) -> dict:
+    """Build a full multi-level BOM of the active assembly in one call.
+
+    Walks EVERY level of the assembly tree, not just the first, and groups
+    rows by (file path, referenced configuration) -- so the same plate in a
+    2 mm and a 3 mm configuration becomes two rows instead of being silently
+    summed into one.
+
+    Each BOM row carries quantity, material, custom properties, mass and
+    bounding box. Each tree entry carries its level and parent, so a
+    per-subassembly BOM can be built from the same result.
+
+    include_subassemblies: list the subassembly itself as its own row, as well
+        as its contents. Structural work usually wants this (the subassembly
+        is a weldment that gets a code of its own); turn it off for a pure
+        parts list.
+    include_suppressed: suppressed components are left out by default, because
+        a suppressed part is not in the physical build.
+    Components marked "Exclude from bill of materials" are always left out.
+    config: configuration to read custom properties from; empty (the default)
+        reads document-level properties.
+
+    Use this instead of extract_assembly_data for anything that feeds a BOM,
+    a cut list or a weight total."""
+
+    def _impl():
+        assy = _active_assembly()
+        factor = 1.0 / UNIT_TO_METERS.get(_default_unit, 0.001)
+
+        tree: list = []
+        visited: set = set()
+        for raw in assy.GetComponents(True) or ():
+            try:
+                comp = win32com.client.Dispatch(raw)
+            except Exception:
+                continue
+            _walk_assembly(comp, 0, None, tree, max_depth, visited)
+
+        rows: dict = {}
+        order: list = []
+        entries: list = []
+        skipped = {"suppressed": 0, "excluded_from_bom": 0, "not_loaded": 0}
+
+        for node in tree:
+            comp = node.pop("component")
+            entry = dict(node, properties=None, measurement=None, errors=[])
+            entries.append(entry)
+
+            if entry["excluded_from_bom"]:
+                skipped["excluded_from_bom"] += 1
+                entry["counted"] = False
+                continue
+            if entry["suppressed"] and not include_suppressed:
+                skipped["suppressed"] += 1
+                entry["counted"] = False
+                continue
+            if entry["is_assembly"] and not include_subassemblies:
+                entry["counted"] = False
+                continue
+
+            model_doc = _component_model_doc(comp)
+            if model_doc is None:
+                entry["errors"].append(
+                    "component document is not loaded (suppressed or lightweight)")
+                skipped["not_loaded"] += 1
+                entry["counted"] = False
+                continue
+
+            try:
+                cpm = model_doc.Extension.CustomPropertyManager(config)
+                entry["properties"] = _read_custom_properties(cpm)
+            except Exception as exc:
+                entry["errors"].append(f"could not read custom properties: {exc}")
+
+            if entry["properties"] is not None and not any(
+                k.lower() == "material" for k in entry["properties"]
+            ):
+                native_material = _native_material_name(model_doc, config)
+                if native_material:
+                    entry["properties"]["Material"] = {
+                        "value": native_material,
+                        "resolved": native_material,
+                    }
+
+            if not entry["is_assembly"]:
+                try:
+                    entry["measurement"] = _measure_model_doc(model_doc, factor)
+                except Exception as exc:
+                    entry["errors"].append(f"could not measure body: {exc}")
+
+            entry["counted"] = True
+            # The grouping key the old code got wrong: it keyed on the file
+            # path alone, so two configurations of one file were summed as a
+            # single item.
+            key = (entry["path"] or entry["name"], entry["configuration"] or "")
+            if key not in rows:
+                rows[key] = {
+                    "path": entry["path"],
+                    "configuration": entry["configuration"],
+                    "representative_name": entry["name"],
+                    "is_assembly": entry["is_assembly"],
+                    "min_level": entry["level"],
+                    "quantity": 0,
+                    "properties": entry["properties"],
+                    "measurement": entry["measurement"],
+                    "instance_names": [],
+                }
+                order.append(key)
+            row = rows[key]
+            row["quantity"] += 1
+            row["instance_names"].append(entry["name"])
+            row["min_level"] = min(row["min_level"], entry["level"])
+            if row["properties"] is None and entry["properties"]:
+                row["properties"] = entry["properties"]
+            if row["measurement"] is None and entry["measurement"]:
+                row["measurement"] = entry["measurement"]
+
+        bom = [rows[k] for k in order]
+        total_mass = 0.0
+        mass_incomplete = []
+        for row in bom:
+            if row["is_assembly"]:
+                continue
+            mass = (row.get("measurement") or {}).get("mass_kg")
+            if mass is None:
+                mass_incomplete.append(row["representative_name"])
+            else:
+                total_mass += mass * row["quantity"]
+
+        return {
+            "assembly": _doc_title(_active_doc()),
+            "levels_walked": max((e["level"] for e in entries), default=0) + 1,
+            "instance_count": len(entries),
+            "counted_instance_count": sum(1 for e in entries if e.get("counted")),
+            "unique_row_count": len(bom),
+            "skipped": skipped,
+            "total_mass_kg": round(total_mass, 4),
+            "mass_incomplete_for": mass_incomplete,
+            "bom": bom,
+            "tree": entries,
         }
 
     return await _run(_impl)
@@ -1818,20 +2089,35 @@ async def create_motion_study(name: Optional[str] = None, activate: bool = True)
 
 @mcp.tool()
 async def export_document(filepath: str) -> dict:
-    """Export the active document to STEP, STL, IGES, PDF, DXF, or Parasolid.
-    The format is determined by the file extension:
-    .step/.stp, .stl, .igs/.iges, .pdf (drawings), .dxf, .x_t (Parasolid), .3mf"""
+    """Export the active document to STEP, STL, IGES, PDF, DWG, DXF or Parasolid.
+
+    The format comes from the file extension:
+    .step/.stp, .stl, .igs/.iges, .pdf (drawings), .dwg and .dxf (drawings),
+    .x_t/.x_b (Parasolid), .sat, .3mf
+
+    .dwg and .dxf of a DRAWING export every sheet, each to its own file: for
+    sheets beyond the first, SolidWorks appends the sheet name to the
+    filename. The returned `sheets` field says how many there were, since the
+    extra files are not named by the caller."""
 
     def _impl():
-        doc = _active_doc()
         abs_path = os.path.abspath(filepath)
         ext = os.path.splitext(abs_path)[1].lower()
-        valid = {".step", ".stp", ".stl", ".igs", ".iges", ".pdf", ".dxf", ".x_t", ".x_b", ".sat", ".3mf"}
+        valid = {".step", ".stp", ".stl", ".igs", ".iges", ".pdf", ".dwg", ".dxf",
+                 ".x_t", ".x_b", ".sat", ".3mf"}
         if ext not in valid:
             raise ValueError(f"Unsupported export format '{ext}'. Use: {', '.join(sorted(valid))}")
+        doc = _active_doc()
 
-        if ext == ".pdf" and _doc_type(doc) != 3:
-            raise RuntimeError("PDF export is only supported for drawing documents.")
+        # .dwg was missing entirely, even though the drawing-only
+        # export_flat_pattern_dxf already accepted it. Structural-steel
+        # offices exchange DWG with AutoCAD constantly.
+        drawing_only = {".pdf", ".dwg"}
+        if ext in drawing_only and _doc_type(doc) != 3:
+            raise RuntimeError(
+                f"{ext} export is only supported for drawing documents "
+                f"(.slddrw). Open or create a drawing first."
+            )
 
         parent = os.path.dirname(abs_path)
         if parent:
@@ -1857,7 +2143,19 @@ async def export_document(filepath: str) -> dict:
         if not ok:
             raise RuntimeError(f"Export failed (error {errors.value}, warning {warnings.value}).")
         log.info("Exported to %s", abs_path)
-        return {"path": abs_path, "format": ext.lstrip(".")}
+        result = {"path": abs_path, "format": ext.lstrip(".")}
+        if _doc_type(doc) == 3:
+            try:
+                result["sheets"] = len(_sheet_names(doc))
+            except Exception:
+                log.debug("Could not count sheets after export", exc_info=True)
+        if not os.path.exists(abs_path):
+            raise RuntimeError(
+                f"SolidWorks reported success but no file was written to "
+                f"{abs_path}."
+            )
+        result["size_bytes"] = os.path.getsize(abs_path)
+        return result
 
     return await _run(_impl)
 
@@ -3186,6 +3484,8 @@ async def add_gusset(
     x1: float = 0, y1: float = 0, z1: float = 0,
     x2: float = 0, y2: float = 0, z2: float = 0,
     profile: str = "triangular",
+    leg1: float = 50, leg2: float = 50, leg3: float = 25,
+    profile_angle: float = 45,
     unit: Optional[str] = None,
 ) -> dict:
     """Add a gusset plate (reinforcement triangle) between two planar faces.
@@ -3197,11 +3497,30 @@ async def add_gusset(
     x1/y1/z1: a point on the first face.
     x2/y2/z2: a point on the second face.
     thickness: plate thickness.
-    profile: 'triangular' (straight hypotenuse) or 'flat' (polygonal infill)."""
+    profile: 'triangular' (straight hypotenuse) or 'flat' (polygonal infill).
+    leg1/leg2: the gusset's two legs along the supporting faces.
+    leg3: the third distance of a 'flat' (polygonal) profile; ignored for a
+    triangular one.
+    profile_angle: the polygonal profile's angle, in degrees.
+
+    The legs used to be hard-coded as 50 and converted with the CALLER's unit,
+    so unit="m" produced a 50-metre gusset and there was no way to ask for the
+    size the structure actually needs."""
 
     def _impl():
         if thickness <= 0:
             raise ValueError(f"Thickness must be positive, got {thickness}.")
+        for label, value in (("leg1", leg1), ("leg2", leg2)):
+            if value <= 0:
+                raise ValueError(f"{label} must be positive, got {value}.")
+        if not 0 < profile_angle < 180:
+            raise ValueError(
+                f"profile_angle must be between 0 and 180 degrees, got {profile_angle}."
+            )
+        if profile.lower() == "flat" and leg3 <= 0:
+            raise ValueError(
+                f"A 'flat' (polygonal) gusset needs a positive leg3, got {leg3}."
+            )
         doc = _active_doc()
         t_m = to_meters(thickness, unit)
 
@@ -3228,12 +3547,12 @@ async def add_gusset(
         # InsertGussetFeature2(Depth, DirType, LocType, BIsProfile, ProfileD1,
         #   ProfileD2, ProfileD3, ProfileAngle, ProfileD4, BOffset, DProfileOffset,
         #   CrvIndex, BReverseDir, BReverseFace, BUseLenDim, Faces) — 16 args.
-        d1 = to_meters(50, unit)  # default gusset leg 1
-        d2 = to_meters(50, unit)  # default gusset leg 2
+        d1 = to_meters(leg1, unit)
+        d2 = to_meters(leg2, unit)
         # A polygonal gusset needs a third distance plus either an angle or a
-        # fourth distance. Use the documented d3 + 45 degree form; setting d3
-        # to zero produces no profile in SolidWorks.
-        d3 = to_meters(25, unit) if is_polygon else 0.0
+        # fourth distance. Use the documented d3 + angle form; setting d3 to
+        # zero produces no profile in SolidWorks.
+        d3 = to_meters(leg3, unit) if is_polygon else 0.0
         d4 = 0.0
         use_length_dimension = False
         feat = doc.FeatureManager.InsertGussetFeature2(
@@ -3244,7 +3563,7 @@ async def add_gusset(
             d1,                # ProfileD1
             d2,                # ProfileD2
             d3,                # ProfileD3 (required for polygon profiles)
-            math.radians(45),  # ProfileAngle
+            math.radians(profile_angle),  # ProfileAngle
             d4,                # ProfileD4 (used when BUseLenDim is True)
             False,             # BOffset
             0.0,               # DProfileOffset
@@ -3268,6 +3587,10 @@ async def add_gusset(
             "feature": feat_name,
             "thickness": thickness,
             "profile": profile,
+            "leg1": leg1,
+            "leg2": leg2,
+            "leg3": leg3 if is_polygon else None,
+            "profile_angle_deg": profile_angle,
             "unit": unit or _default_unit,
         }
 
@@ -3803,15 +4126,29 @@ async def add_sheet_metal_edge_flange(
 
 
 @mcp.tool()
-async def flatten_sheet_metal() -> dict:
-    """Flatten the sheet metal part to show its flat pattern.
+async def flatten_sheet_metal(state: str = "flat") -> dict:
+    """Put a sheet metal part into its flat or folded state.
 
     Shows the sheet metal body unfolded into a single flat shape — exactly
     how it should be cut from a flat plate on a CNC, laser, or plasma cutter.
-    Call this again (or use list_features and suppress the Flat-Pattern) to
-    go back to the folded state."""
+
+    state:
+      "flat"   (default) ensure the flat pattern is showing. Idempotent:
+               calling it twice leaves the part flat both times.
+      "folded" ensure the part is folded back to 3D.
+      "toggle" flip whichever state it is in now.
+
+    The default used to be the toggle, which made a retry after a timeout
+    silently fold the part again."""
 
     def _impl():
+        # Validate before touching COM: rejecting a typo should not need a
+        # SolidWorks connection, and it makes the rule testable on its own.
+        wanted = state.strip().lower()
+        if wanted not in ("flat", "folded", "toggle"):
+            raise ValueError(
+                f"state must be 'flat', 'folded' or 'toggle', got '{state}'."
+            )
         doc = _active_doc()
 
         feat = doc.FirstFeature
@@ -3833,35 +4170,51 @@ async def flatten_sheet_metal() -> dict:
             is_suppressed = flat_pattern.IsSuppressed
             if callable(is_suppressed):
                 is_suppressed = is_suppressed()
-            if is_suppressed:
-                flat_pattern.Select2(False, 0)
-                # These zero-argument ModelDoc2 commands are exposed as
-                # already-invoked Boolean properties by late-bound pywin32.
-                # Adding parentheses tries to call that Boolean and raises
-                # TypeError after SolidWorks has already changed the state.
-                changed = doc.EditUnsuppress2
-                if not changed:
-                    raise RuntimeError("SolidWorks could not unsuppress the flat pattern.")
-                doc.ClearSelection2(True)
-                return {"state": "flattened", "action": "unsuppressed flat-pattern"}
-            else:
-                flat_pattern.Select2(False, 0)
-                changed = doc.EditSuppress2
-                if not changed:
-                    raise RuntimeError("SolidWorks could not suppress the flat pattern.")
-                doc.ClearSelection2(True)
-                return {"state": "folded", "action": "suppressed flat-pattern (back to 3D)"}
+            currently = "folded" if is_suppressed else "flat"
+            target = ("folded" if currently == "flat" else "flat") \
+                if wanted == "toggle" else wanted
 
+            if target == currently:
+                return {"state": currently, "action": "no change needed",
+                        "requested": wanted, "changed": False}
+
+            flat_pattern.Select2(False, 0)
+            # These zero-argument ModelDoc2 commands are exposed as
+            # already-invoked Boolean properties by late-bound pywin32.
+            # Adding parentheses tries to call that Boolean and raises
+            # TypeError after SolidWorks has already changed the state.
+            if target == "flat":
+                changed = doc.EditUnsuppress2
+                action = "unsuppressed flat-pattern"
+            else:
+                changed = doc.EditSuppress2
+                action = "suppressed flat-pattern (back to 3D)"
+            doc.ClearSelection2(True)
+            if not changed:
+                raise RuntimeError(
+                    f"SolidWorks could not put the flat pattern into the "
+                    f"'{target}' state."
+                )
+            return {"state": target, "action": action,
+                    "requested": wanted, "changed": True}
+
+        # No Flat-Pattern feature in the tree at all. A part with no flat
+        # pattern is already folded, so "folded" is satisfied without
+        # creating one -- creating it would be a change the caller did not
+        # ask for.
+        if wanted == "folded":
+            return {"state": "folded", "action": "no flat-pattern exists",
+                    "requested": wanted, "changed": False}
         try:
             doc.FeatureManager.InsertSheetMetalFlatPattern2(True)
-            return {"state": "flattened", "action": "created flat-pattern"}
-        except Exception:
-            pass
-
-        raise RuntimeError(
-            "Could not flatten the part. Ensure it is a sheet metal part "
-            "(created with create_base_flange or converted to sheet metal)."
-        )
+            return {"state": "flat", "action": "created flat-pattern",
+                    "requested": wanted, "changed": True}
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not flatten the part: {exc}. Ensure it is a sheet metal "
+                f"part (created with create_base_flange or converted to sheet "
+                f"metal)."
+            ) from exc
 
     return await _run(_impl)
 
@@ -4735,6 +5088,7 @@ async def create_reference_plane(
     reference: str = "front",
     offset: float = 50,
     angle: float = 0,
+    angle_about: Optional[str] = None,
     flip: bool = False,
     unit: Optional[str] = None,
 ) -> dict:
@@ -4747,8 +5101,18 @@ async def create_reference_plane(
     reference: the existing plane to reference — 'front', 'top', 'right', or a
                user-created plane's name.
     offset: distance from the reference plane along its normal.
-    angle: rotation angle in degrees (0 = parallel offset; nonzero = angled).
-    flip: reverse the offset direction."""
+    angle: rotation angle in degrees. 0 gives a parallel offset plane. A
+           nonzero angle needs something to rotate ABOUT, so pass angle_about
+           with the name of a reference axis or edge; without one SolidWorks
+           has no axis and the call is refused rather than quietly producing
+           a parallel plane.
+    angle_about: name of the axis or edge to rotate about. Used only when
+           angle is nonzero.
+    flip: reverse the offset direction.
+
+    Returns the plane's name and, where SolidWorks reports it, the origin and
+    normal the plane actually ended up with, so a wrong plane stops being
+    silent."""
 
     def _impl():
         doc = _active_doc()
@@ -4763,42 +5127,87 @@ async def create_reference_plane(
         if flip:
             offset_m = -offset_m
 
+        # swRefPlaneReferenceConstraints_e: 8 = Distance, 16 = Angle.
+        # The constraint is decided HERE, before the COM call. The previous
+        # version always tried Distance first and only fell back to Angle if
+        # that returned None -- and Distance nearly always succeeds, so
+        # angle=30 silently produced a plane PARALLEL to the reference while
+        # the return value still reported "angle": 30.
+        if angle == 0:
+            constraint, value = 8, offset_m
+        else:
+            constraint, value = 16, angle_rad
+            if angle_about:
+                if not _select_plane_by_name(doc, angle_about, append=True, mark=0):
+                    empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+                    for sel_type in ("AXIS", "EDGE"):
+                        if doc.Extension.SelectByID2(angle_about, sel_type, 0, 0, 0,
+                                                     True, 0, empty, 0):
+                            break
+                    else:
+                        doc.ClearSelection2(True)
+                        raise RuntimeError(
+                            f"Could not select '{angle_about}' as the axis to "
+                            f"rotate about. Create it first with "
+                            f"create_reference_axis."
+                        )
+
         try:
             feat = doc.FeatureManager.InsertRefPlane(
-                8,           # Constraint1: 8=Distance
-                offset_m,    # Distance
+                constraint, value,
                 0, 0.0,      # Constraint2 unused
                 0, 0.0,      # Constraint3 unused
             )
-        except Exception:
-            feat = None
-
-        if feat is None and angle != 0:
-            try:
-                feat = doc.FeatureManager.InsertRefPlane(
-                    16, angle_rad,   # Constraint1: 16=Angle
-                    0, 0.0,
-                    0, 0.0,
-                )
-            except Exception:
-                feat = None
+        except Exception as exc:
+            doc.ClearSelection2(True)
+            raise RuntimeError(
+                f"InsertRefPlane failed for reference='{reference}', "
+                f"offset={offset}, angle={angle}: {exc}"
+            ) from exc
 
         if feat is None:
+            doc.ClearSelection2(True)
+            hint = ""
+            if angle != 0 and not angle_about:
+                hint = (" An angled plane needs an axis to rotate about: pass "
+                        "angle_about with a reference axis or edge name.")
             raise RuntimeError(
                 f"Reference plane creation failed. reference='{reference}', "
-                f"offset={offset}, angle={angle}."
+                f"offset={offset}, angle={angle}.{hint}"
             )
 
         feat_dispatch = win32com.client.Dispatch(feat)
         name = feat_dispatch.Name if hasattr(feat_dispatch, "Name") else "Plane"
+        doc.ClearSelection2(True)
 
-        return {
+        factor = 1.0 / UNIT_TO_METERS[unit or _default_unit]
+        result = {
             "plane": name,
             "reference": reference,
             "offset": offset,
+            "offset_applied": round(offset_m * factor, 6),
             "angle": angle,
+            "angle_about": angle_about,
+            "constraint": "angle" if constraint == 16 else "distance",
+            "flip": flip,
             "unit": unit or _default_unit,
         }
+        # Read the plane back. flip=True with reference='right' has been seen
+        # to land the plane at X=0 instead of the requested offset; reporting
+        # the real origin is what turns that from a silent wrong answer into
+        # something the caller can check.
+        try:
+            ref_plane = win32com.client.Dispatch(
+                _com_member(feat_dispatch, "GetSpecificFeature2"))
+            transform = win32com.client.Dispatch(_com_member(ref_plane, "Transform"))
+            data = tuple(_com_member(transform, "ArrayData"))
+            result["origin"] = [round(c * factor, 4) for c in data[9:12]]
+            result["normal"] = [round(c, 6) for c in data[6:9]]
+        except Exception:
+            log.debug("Could not read back the position of plane %r", name,
+                      exc_info=True)
+            result["position_read"] = "unavailable on this SolidWorks build"
+        return result
 
     return await _run(_impl)
 
@@ -5494,8 +5903,6 @@ async def get_view_entities(view_name: str, kinds: str = "line,circle,arc",
     min_length_mm."""
 
     def _impl():
-        doc = _active_drawing()
-        view = _find_view(doc, view_name)
         wanted = {k.strip().lower() for k in kinds.split(",") if k.strip()}
         unknown = wanted - {"line", "circle", "arc"}
         if unknown:
@@ -5503,6 +5910,8 @@ async def get_view_entities(view_name: str, kinds: str = "line,circle,arc",
                 f"Unknown entity kind(s): {', '.join(sorted(unknown))}. "
                 f"Use line, circle and/or arc."
             )
+        doc = _active_drawing()
+        view = _find_view(doc, view_name)
         entities = _read_view_entities(doc, view, view_name)
         selected = [
             e for e in entities
@@ -5650,8 +6059,6 @@ async def dimension_by_entity_ids(entity_ids: list[str], side: str = "auto",
     attached to, where the text went, and an `issues` list."""
 
     def _impl():
-        doc = _active_drawing()
-        config = ad.SheetConfig()
         if not 1 <= len(entity_ids) <= 2:
             raise ValueError(
                 f"Pass 1 or 2 entity IDs, got {len(entity_ids)}. One ID measures "
@@ -5661,6 +6068,8 @@ async def dimension_by_entity_ids(entity_ids: list[str], side: str = "auto",
             raise ValueError(
                 f"side must be 'auto' or one of {', '.join(ad.SIDES)}, got '{side}'."
             )
+        doc = _active_drawing()
+        config = ad.SheetConfig()
         doc_title = _doc_title(doc)
         items = [_ENTITY_REGISTRY.resolve(doc_title, eid) for eid in entity_ids]
         view_names = {item["view"] for item in items}
@@ -7324,6 +7733,145 @@ async def create_assembly_pattern(
 # Material & Appearance tools
 # ===========================================================================
 
+# SolidWorks stores a material library as XML with physical properties under
+# <physicalproperties>, keyed by the finite-element short names rather than by
+# readable labels: DENS is density in kg/m3, SIGYLD yield strength in Pa.
+_MATERIAL_PROPERTY_KEYS = {
+    "DENS": ("density_kg_m3", 1.0),
+    "EX": ("elastic_modulus_pa", 1.0),
+    "NUXY": ("poisson_ratio", 1.0),
+    "SIGYLD": ("yield_strength_pa", 1.0),
+    "SIGXT": ("tensile_strength_pa", 1.0),
+    "ALPX": ("thermal_expansion_per_k", 1.0),
+    "KX": ("thermal_conductivity_w_mk", 1.0),
+    "C": ("specific_heat_j_kgk", 1.0),
+}
+
+_material_library_cache: dict = {}
+
+
+def _read_material_library(database_path: str) -> dict:
+    """Parse a .sldmat into {material name: {property: value}}.
+
+    Reading the library directly is the only way this server can state a
+    density it has actually verified: IPartDoc.SetMaterialPropertyName2 is
+    silently ineffective on some builds (see set_material), and a mass that
+    is wrong without an error is the worst outcome for a BOM.
+    """
+    cached = _material_library_cache.get(database_path)
+    if cached is not None:
+        return cached
+    import xml.etree.ElementTree as ElementTree
+
+    try:
+        root = ElementTree.parse(database_path).getroot()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not read the material library {database_path}: {exc}"
+        ) from exc
+
+    materials: dict = {}
+    for element in root.iter("material"):
+        name = element.get("name")
+        if not name:
+            continue
+        entry: dict = {"name": name, "matid": element.get("matid")}
+        for properties in element.iter("physicalproperties"):
+            for child in properties:
+                mapped = _MATERIAL_PROPERTY_KEYS.get(child.tag.upper())
+                if mapped is None:
+                    continue
+                key, factor = mapped
+                try:
+                    entry[key] = float(child.get("value")) * factor
+                except (TypeError, ValueError):
+                    continue
+        materials[name] = entry
+    _material_library_cache[database_path] = materials
+    return materials
+
+
+def _library_density(material: str, database_path: str):
+    """Density of one material straight from the library file, or None."""
+    try:
+        entry = _read_material_library(database_path).get(material)
+    except Exception:
+        return None
+    return (entry or {}).get("density_kg_m3")
+
+
+def _document_density(doc):
+    """Density (kg/m3) the document is currently computing mass with.
+
+    Derived from mass/volume rather than read from a property, because that
+    is the number the BOM will actually use and it cannot be faked by a
+    material name that was stored without taking effect.
+    """
+    try:
+        status = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+        props = doc.Extension.GetMassProperties2(1, status, False)
+        if props and len(props) > 5 and props[3]:
+            return props[5] / props[3]
+    except Exception:
+        log.debug("Could not compute the document density", exc_info=True)
+    return None
+
+
+@mcp.tool()
+async def lookup_material_properties(material: str = "",
+                                     database: str = "SOLIDWORKS Materials",
+                                     search: str = "") -> dict:
+    """Read a material's real physical properties from the SolidWorks library.
+
+    Returns density (kg/m3), elastic modulus, Poisson's ratio, yield and
+    tensile strength, and thermal properties, parsed from the .sldmat file
+    itself -- so the numbers are the library's, not an estimate.
+
+    material: exact name, e.g. "Alloy Steel", "AISI 304", "6061 Alloy".
+    search: instead of an exact name, list every material whose name contains
+            this text. Use it to find the exact spelling.
+    database: library name ("SOLIDWORKS Materials") or a full .sldmat path.
+
+    Use this to compute a weight that does not depend on the part's assigned
+    material -- necessary while set_material cannot apply a density on this
+    SolidWorks build -- and for hand calculations (yield strength for a
+    stress check, density for a weight estimate). Read-only; it touches no
+    document."""
+
+    def _impl():
+        database_path = _resolve_material_database_path(database)
+        if not os.path.isfile(database_path):
+            raise RuntimeError(
+                f"Could not resolve material database '{database}' to a "
+                f".sldmat file (tried: {database_path})."
+            )
+        materials = _read_material_library(database_path)
+        if search:
+            needle = search.lower()
+            matches = sorted(n for n in materials if needle in n.lower())
+            return {"database": database_path, "search": search,
+                    "match_count": len(matches),
+                    "matches": [materials[n] for n in matches[:50]],
+                    "truncated": len(matches) > 50}
+        if not material:
+            return {"database": database_path,
+                    "material_count": len(materials),
+                    "names": sorted(materials)[:200],
+                    "hint": "pass material= for one material, or search= to filter"}
+        entry = materials.get(material)
+        if entry is None:
+            needle = material.lower()
+            close = sorted(n for n in materials if needle in n.lower())[:10]
+            raise ValueError(
+                f"No material named '{material}' in {os.path.basename(database_path)}. "
+                + (f"Did you mean: {', '.join(close)}?" if close
+                   else "Use search= to list candidates.")
+            )
+        return {"database": database_path, **entry}
+
+    return await _run(_impl)
+
+
 @mcp.tool()
 async def set_material(
     material: str = "AISI 1020",
@@ -7418,20 +7966,69 @@ async def set_material(
                     "the SolidWorks material library exactly (case-sensitive)."
                 )
 
-        # Belt-and-braces: read the material back and confirm it actually
-        # stuck, instead of trusting an API that is proven to accept wrong
-        # arguments without complaint. Density-based mass is the ultimate
-        # proof, but reading the name back is cheap and catches this class
-        # of bug immediately rather than only when someone cross-checks mass.
-        applied = _native_material_name(doc, config_name)
-        if applied != material:
+        # Verify by DENSITY, which is the number the BOM uses and the only
+        # witness that cannot be faked. The previous check compared the
+        # material NAME read back from GetMaterialPropertyName2; that is
+        # weaker, and on this build the name reads back as "" even when the
+        # call reported no error, so the message blamed the wrong thing.
+        expected_density = _library_density(material, resolved_database)
+        actual_density = _document_density(doc)
+        applied_name = _native_material_name(doc, config_name)
+
+        result = {
+            "material": material,
+            "database": resolved_database,
+            "expected_density_kg_m3": expected_density,
+            "document_density_kg_m3": (round(actual_density, 3)
+                                       if actual_density else None),
+            "material_name_read_back": applied_name,
+        }
+
+        if expected_density and actual_density:
+            if abs(actual_density - expected_density) <= max(1.0, expected_density * 0.01):
+                result["verified"] = "density matches the material library"
+                return result
+            # Exactly water means SolidWorks never picked up a density at all,
+            # which is the documented failure mode here -- distinguish it from
+            # "some other material is applied" so the message is actionable.
+            looks_like_water = abs(actual_density - 1000.0) < 1.0
             raise RuntimeError(
-                f"SetMaterialPropertyName2 reported no error, but the document's "
-                f"material reads back as {applied!r}, not {material!r}. The "
-                f"assignment did not actually take effect."
+                f"set_material did not take effect. SolidWorks raised no error, "
+                f"but the part still computes mass at "
+                f"{actual_density:.1f} kg/m3"
+                + (" (water, i.e. no material density at all)" if looks_like_water else "")
+                + f", while '{material}' is {expected_density:.1f} kg/m3 in "
+                f"{os.path.basename(resolved_database)}.\n\n"
+                f"IPartDoc.SetMaterialPropertyName2 has been confirmed silently "
+                f"ineffective on this SolidWorks build: five documented argument "
+                f"orders were tried live and none changed the density. Until that "
+                f"is resolved:\n"
+                f"  - apply the material by hand in SolidWorks (right-click "
+                f"Material in the feature tree, Edit Material), or\n"
+                f"  - compute weight as volume x density, taking the density "
+                f"from lookup_material_properties('{material}').\n"
+                f"Do NOT trust measure_body's mass_kg on a part whose material "
+                f"was set through this tool."
             )
 
-        return {"material": material, "database": resolved_database}
+        # Without a library density there is nothing to verify against, so say
+        # so rather than implying success.
+        if expected_density is None:
+            result["verified"] = (
+                f"could not find '{material}' in "
+                f"{os.path.basename(resolved_database)} to check its density; "
+                f"the assignment was not verified"
+            )
+        else:
+            result["verified"] = (
+                "could not read the document's density; the assignment was not "
+                "verified"
+            )
+        result["warning"] = (
+            "unverified material assignment -- check mass_kg against "
+            "lookup_material_properties before using it in a BOM"
+        )
+        return result
 
     return await _run(_impl)
 
@@ -8964,40 +9561,59 @@ def _measure_model_doc(doc, factor: float) -> dict:
     """
     result = {}
 
+    # CreateMassProperty was effectively dead code: dynamic IDispatch exposes
+    # it as an already-evaluated property, so `doc.Extension.CreateMassProperty()`
+    # raised DISP_E_MEMBERNOTFOUND every time and the GetMassProperties2
+    # fallback below did all the work -- confirmed live, 2026-10-04. Going
+    # through _com_member makes the primary path work, which matters because
+    # IMassProperty is the only one that reports Density.
     try:
-        mp = doc.Extension.CreateMassProperty()
+        mp = _com_member(doc.Extension, "CreateMassProperty")
         if mp is not None:
             mp = win32com.client.Dispatch(mp)
+            for member, key in (("Mass", "mass_kg"), ("Volume", "volume_m3"),
+                                ("SurfaceArea", "surface_area_m2"),
+                                ("Density", "density_kg_m3")):
+                try:
+                    result[key] = _com_member(mp, member)
+                except Exception:
+                    log.debug("IMassProperty.%s unavailable", member, exc_info=True)
             try:
-                result["mass_kg"] = mp.Mass
-            except Exception:
-                pass
-            try:
-                result["volume_m3"] = mp.Volume
-            except Exception:
-                pass
-            try:
-                result["surface_area_m2"] = mp.SurfaceArea
-            except Exception:
-                pass
-            try:
-                com = mp.CenterOfMass
+                com = _com_member(mp, "CenterOfMass")
                 if com:
                     result["center_of_mass_m"] = list(com)
             except Exception:
-                pass
+                log.debug("IMassProperty.CenterOfMass unavailable", exc_info=True)
     except Exception:
-        log.debug("CreateMassProperty failed, trying GetMassProperties")
+        log.debug("CreateMassProperty unavailable, using GetMassProperties2",
+                  exc_info=True)
+
+    if "mass_kg" not in result or "volume_m3" not in result:
         try:
             status = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
             props = doc.Extension.GetMassProperties2(1, status, False)
-            if props:
-                result["center_of_mass_m"] = [props[0], props[1], props[2]]
-                result["volume_m3"] = props[3]
-                result["surface_area_m2"] = props[4]
-                result["mass_kg"] = props[5]
+            if props and len(props) > 5:
+                result.setdefault("center_of_mass_m", [props[0], props[1], props[2]])
+                result.setdefault("volume_m3", props[3])
+                result.setdefault("surface_area_m2", props[4])
+                result.setdefault("mass_kg", props[5])
         except Exception:
-            pass
+            log.debug("GetMassProperties2 also failed", exc_info=True)
+
+    # A part with no material computes mass at water density, and a mass that
+    # is wrong without an error is exactly what makes a BOM untrustworthy.
+    # Say so in the result instead of leaving the caller to notice.
+    mass, volume = result.get("mass_kg"), result.get("volume_m3")
+    if mass is not None and volume:
+        density = mass / volume
+        result["density_kg_m3"] = round(density, 3)
+        if abs(density - 1000.0) < 1.0:
+            result["density_warning"] = (
+                "mass is being computed at 1000 kg/m3 (water): this part has no "
+                "effective material density, so mass_kg is NOT a real weight. "
+                "Assign the material by hand in SolidWorks, or compute the "
+                "weight as volume_m3 x density from lookup_material_properties."
+            )
 
     # Union the boxes of EVERY body, not just bodies[0]. A weldment -- the
     # typical structural part -- is multibody by construction, so measuring
@@ -9630,16 +10246,26 @@ async def list_equations() -> dict:
 
 @mcp.tool()
 async def add_equation(equation: str, solve: bool = True) -> dict:
-    """Add an equation or global variable, e.g. ``\"Length\" = 25mm``."""
+    """Add an equation or global variable, e.g. ``\"Length\" = 25mm``.
+
+    solve=False adds the equation without evaluating it, so several can be
+    added before one rebuild. Use list_equations or rebuild_model afterwards
+    to apply them."""
 
     def _impl():
         manager = _equation_manager(_active_doc())
         index = int(manager.Add2(-1, equation, bool(solve)))
         if index < 0:
             raise RuntimeError(f"SolidWorks rejected equation: {equation}")
-        if not solve:
-            _evaluate_equations(manager)
-        return {"index": index, "equation": manager.Equation(index), "solved": solve}
+        # IEquationMgr.Add2 already honours its third argument, so the only
+        # thing an extra EvaluateAll can do is evaluate when the caller asked
+        # NOT to. The condition here used to be `if not solve`, i.e. exactly
+        # backwards: solve=False added the equation and then evaluated it
+        # anyway, while the return still reported "solved": False.
+        evaluation_result = _evaluate_equations(manager) if solve else None
+        return {"index": index, "equation": manager.Equation(index),
+                "value": manager.Value(index), "solved": bool(solve),
+                "evaluation_result": evaluation_result}
 
     return await _run(_impl)
 
@@ -9814,14 +10440,54 @@ async def pack_and_go(
             os.path.dirname(destination_path) or ".",
             f".{os.path.splitext(os.path.basename(destination_path))[0]}_staging",
         )
+        # This fallback copies files with shutil; it does NOT rewrite the
+        # references inside an assembly. Renaming a part while the assembly
+        # still points at the old name produces a copy that opens with
+        # missing references -- worse than no copy at all, and the process
+        # rule is "always make a working copy". So refuse the rename here
+        # rather than produce a broken package.
+        if prefix or suffix:
+            raise RuntimeError(
+                "Native Pack and Go failed and the fallback cannot apply a "
+                f"prefix/suffix: renaming files without rewriting the "
+                f"assembly's internal references produces a copy with missing "
+                f"references. Retry without prefix/suffix, or fix the native "
+                f"Pack and Go error first: {native_error}"
+            )
+
         os.makedirs(staging_dir, exist_ok=True)
         copied = []
+        collisions = []
+        used_names: dict = {}
         for original in dependency_paths:
             filename = os.path.basename(original)
-            target_name = f"{prefix}{os.path.splitext(filename)[0]}{suffix}{os.path.splitext(filename)[1]}"
+            stem, extension = os.path.splitext(filename)
+            target_name = f"{stem}{extension}"
+            # Two parts of the same name from different folders used to
+            # overwrite each other silently, in both the flattened and the
+            # models/ layout, because the destination name was just the
+            # basename. Disambiguate instead.
+            key = target_name.lower()
+            if key in used_names:
+                index = 2
+                while f"{stem}_{index}{extension}".lower() in used_names:
+                    index += 1
+                target_name = f"{stem}_{index}{extension}"
+                collisions.append({
+                    "original": original,
+                    "clashed_with": used_names[key],
+                    "renamed_to": target_name,
+                })
+            used_names[target_name.lower()] = original
+
             relative_target = target_name if flatten_to_single_folder else os.path.join("models", target_name)
             target = os.path.join(staging_dir, relative_target)
             os.makedirs(os.path.dirname(target), exist_ok=True)
+            if os.path.exists(target):
+                raise RuntimeError(
+                    f"Refusing to overwrite an existing file in the package: "
+                    f"{target}. Choose an empty destination."
+                )
             shutil.copy2(original, target)
             copied.append(relative_target)
         if is_zip:
@@ -9831,14 +10497,30 @@ async def pack_and_go(
             shutil.rmtree(staging_dir, ignore_errors=True)
         if not copied or (is_zip and not os.path.isfile(destination_path)):
             raise RuntimeError("The managed packaging fallback did not create output files.")
-        return {
+        result = {
             "destination": destination_path,
             "format": "zip" if is_zip else "folder",
             "source_document_count": len(dependency_paths),
+            "copied_file_count": len(copied),
             "copied_files": copied,
             "backend": "managed_dependency_fallback",
             "native_pack_and_go_error": native_error,
         }
+        if len(copied) != len(dependency_paths):
+            raise RuntimeError(
+                f"Packaged {len(copied)} of {len(dependency_paths)} dependencies; "
+                f"the package is incomplete."
+            )
+        if collisions:
+            result["name_collisions"] = collisions
+            result["warning"] = (
+                f"{len(collisions)} file(s) shared a name with another and were "
+                f"renamed to avoid overwriting. The copied assembly will report "
+                f"those as missing references, because this fallback does not "
+                f"rewrite internal references. Open it and repair the paths, or "
+                f"re-run once native Pack and Go works."
+            )
+        return result
 
     return await _run(_impl)
 
