@@ -1955,9 +1955,29 @@ async def unsuppress_component(name: str) -> dict:
 
 @mcp.tool()
 async def add_mate(mate_type: str, point1: dict, point2: dict) -> dict:
-    """Mate two faces/planes, each chosen by a point that
-    lies on it, e.g. point1={"x":0,"y":0,"z":0,"unit":"mm"}. Supported mate_type
-    values: 'coincident', 'concentric', 'parallel', 'perpendicular', 'tangent'."""
+    """Mate two faces/planes, each chosen by a point that lies on it,
+    e.g. point1={"x":0,"y":0,"z":0,"unit":"mm"}. Supported mate_type values:
+    'coincident', 'concentric', 'parallel', 'perpendicular', 'tangent'.
+
+    TWO LIMITS WORTH KNOWING BEFORE RELYING ON THIS.
+
+    It resolves each point through SelectByID2, which picks from the current
+    CAMERA. A face hidden behind the model cannot be reached at all, whatever
+    coordinate is passed -- so an internal face, such as a piston's pin-boss
+    bore inside the skirt, is unreachable from any orientation, and the call
+    either fails or silently grabs the outer face in front of it. Use
+    list_faces on the part first to get a pick point that really lies on the
+    face wanted, and set_view('isometric') before picking; that only helps for
+    a convex part.
+
+    It also returns no geometry: the mate is created, but the resulting
+    component position is not read back. A 'concentric' mate removes only two
+    degrees of freedom -- it aligns the axes and leaves sliding along the
+    shared axis free -- so the part stops wherever the solver left it. After
+    any concentric mate, call get_component_transform on the mated component
+    and check the position along that axis against the geometry that is
+    supposed to limit it, BEFORE fix_component. See
+    .claude/knowledge/montagens_mecanicas_reais.md."""
 
     def _impl():
         assy = _active_assembly()
@@ -8805,13 +8825,32 @@ async def create_automotive_piston_assembly(
     unit: Optional[str] = None,
     save_path: Optional[str] = None,
 ) -> dict:
-    """Create a complete automotive piston-and-connecting-rod assembly.
+    """Create an automotive piston-and-connecting-rod assembly, UNMATED.
 
-    This is the moving assembly represented in engine cutaway drawings: the
-    piston with three ring grooves and a hollow skirt, a transverse wrist pin,
-    an I-style connecting rod, a plain big-end bearing, and a separate rod cap.
-    Each component is saved as an editable SolidWorks part, then inserted into
-    a final ``.SLDASM`` assembly at the correct shared pin/crank centerlines.
+    Builds the piston with three ring grooves and a hollow skirt, a transverse
+    wrist pin, an I-style connecting rod, a plain big-end bearing and a
+    separate rod cap. Each component is saved as an editable SolidWorks part
+    and inserted into a final ``.SLDASM``.
+
+    WHAT THIS DOES NOT DO. It creates NO MATES. The five components are
+    positioned by computed x/y/z offsets and nothing constrains them to each
+    other, so:
+
+      - it is not a moving assembly. There is no kinematic joint; nothing in
+        it can rotate or slide.
+      - whether the rod actually seats between the piston's pin bosses
+        depends entirely on how each part sits relative to its OWN origin.
+        Any mismatch shows up as a gap, and nothing here measures it.
+      - no interference check and no fit verification is performed.
+
+    Treat the result as a positioned reference model, not a working joint.
+    For a real joint, mate the components yourself -- concentric on the pin
+    against both the boss bore and the rod eye, plus a width mate to centre
+    the rod in the gap between the bosses -- and then confirm the outcome
+    with get_component_transform and interference_check. A concentric mate
+    removes only two degrees of freedom and leaves sliding along the shared
+    axis FREE, which is the usual reason a piston-rod joint looks aligned
+    and is not. See .claude/knowledge/montagens_mecanicas_reais.md.
 
     ``connecting_rod_length`` is the distance between the wrist-pin and
     crank-pin centers.  All dimensions use ``unit`` (mm by default).  Pass

@@ -143,3 +143,46 @@ inválidas e o componente aparece **suprimido**. Se `unsuppress_component`
 falhar (confirmado: status 3, causa não diagnosticada), o caminho robusto é
 `delete_component` + `insert_component` de novo na mesma posição, e refazer
 as mates do zero contra a geometria nova.
+
+## 9. `create_automotive_piston_assembly` não cria mate nenhum
+
+Confirmado por leitura do código (2026-10-05), contagem no corpo inteiro da
+função (195 linhas):
+
+```
+add_mate                   0      insert_component           5
+add_advanced_mate          0      fix_component              0
+AddMate                    0      set_component_transform    0
+interference_check         0      validate_model             0
+```
+
+A ferramenta insere cinco componentes (pistão, pino, biela, bronzina, capa)
+em offsets x/y/z calculados e **para**. Não existe restrição entre eles.
+Consequências:
+
+- **Não é montagem móvel**, apesar de a docstring antiga chamá-la de "the
+  moving assembly": não há junta cinemática, nada ali gira ou desliza.
+- **O encaixe depende só da origem de cada peça.** Se a biela não nasceu
+  posicionada em relação à própria origem exatamente como o offset assume,
+  ela aparece deslocada — e nada mede isso. É a causa direta do sintoma
+  "pistão e biela nunca ficam com uma conexão boa".
+- Nenhum `interference_check`, nenhuma verificação dimensional.
+
+Trate o resultado como **modelo de referência posicionado**, não como junta.
+Para junta de verdade, mateie à mão e verifique:
+
+1. `concentric` pino ↔ furo do mancal, e `concentric` pino ↔ olhal da biela.
+2. `add_advanced_mate("width")` entre as duas faces internas dos mancais para
+   centrar o olhal no vão — é isso que trava o eixo axial que o item 2 deste
+   arquivo explica ficar livre.
+3. `get_component_transform` na biela e compare a posição axial com o centro
+   do vão (calculado, não estimado) **antes** de `fix_component`.
+4. `interference_check` no fim.
+
+Cuidado adicional ao mateal à mão: `add_mate` seleciona face por coordenada
+via `SelectByID2`, que **pica a partir da câmera** e não alcança face oculta
+atrás do modelo (a própria docstring de `list_faces` registra que isso só
+vale para peça convexa). O furo do mancal do pistão é interno à saia —
+nenhuma orientação de câmera o alcança. Para faces internas, `add_mate` por
+coordenada não serve; use o pino como intermediário (cujas faces são
+externas) em vez de tentar mateal a biela direto no mancal.
