@@ -13,18 +13,18 @@ foram movidos para `tests/output/legacy/`, separados em `parts/`, `packages/`,
 Execute em qualquer máquina com Python:
 
 ```powershell
-python -m unittest discover -s tests -p "test_*.py" -v
+python -m pytest
 python tests/run_live_test_project.py --dry-run
 ```
 
-Os testes estáticos verificam sintaxe, as 143 funções MCP, a equivalência entre
+Os testes estáticos verificam sintaxe, as 150 funções MCP, a equivalência entre
 `server.py` e `manifest.json`, documentação de versão, regras de `.gitignore`
 e padrões comuns de credenciais.
 
-> Nota (v5.9.2): os arquivos `tests/test_*.py` descritos acima não estão
-> versionados no repositório no momento — só os executores `run_*.py` estão.
-> O comando `unittest discover` roda, mas não encontra testes até eles serem
-> (re)adicionados.
+Desde a v5.12.0 a suíte está em `tests/test_contract.py`,
+`tests/test_bugfixes.py` (um teste de regressão por bug B01–B11) e
+`tests/test_alfa_drawing.py` (geometria do desenho, sem COM).
+`tests/run_drawing_live_test.py` valida a camada de desenho ao vivo.
 
 ## Integração real
 

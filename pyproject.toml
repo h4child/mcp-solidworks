@@ -1,6 +1,6 @@
 [project]
 name = "solidworks-mcp"
-version = "5.9.2"
+version = "5.12.0"
 description = "MCP server for SolidWorks automation through the Windows COM API."
 requires-python = ">=3.10"
 dependencies = [
@@ -15,3 +15,12 @@ dependencies = [
 
 [project.license]
 text = "MIT"
+
+[tool.pytest.ini_options]
+# Collect ONLY test_*.py. The run_*_live_test.py scripts in tests/ match
+# pytest's default "*_test.py" pattern, and they are not tests: they are
+# standalone scripts that drive a live SolidWorks session and call sys.exit()
+# at import time. Collecting them made `pytest tests/` open documents, build
+# geometry and then abort the whole run with an INTERNALERROR.
+python_files = ["test_*.py"]
+testpaths = ["tests"]

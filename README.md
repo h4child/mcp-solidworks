@@ -1,7 +1,7 @@
 # SolidWorks MCP Server
 
 Servidor MCP em Python que controla o SolidWorks via COM (`win32com`), escrito
-com o SDK oficial (`mcp`, usando `FastMCP`). **143 ferramentas** (v5.9.2).
+com o SDK oficial (`mcp`, usando `FastMCP`). **150 ferramentas** (v5.12.0).
 
 ## Para quem so quer usar
 
@@ -14,7 +14,7 @@ Requisitos: Windows, SolidWorks 2022+ instalado e licenciado, e Claude Desktop.
 
 ```bash
 pip install -r requirements.txt
-python -m unittest tests.test_contract
+python -m pytest
 ```
 
 Configuracao manual em `claude_desktop_config.json`:
@@ -38,7 +38,7 @@ Python e dependencias sozinho a partir do `pyproject.toml` -- necessario porque
 forma portatil.
 
 ```bash
-npx mcpb pack . solidworks-mcp-5.9.2.mcpb
+npx mcpb pack . solidworks-mcp-5.12.0.mcpb
 ```
 
 Abra o SolidWorks (opcional -- o servidor consegue abrir sozinho) e peca para o
@@ -104,12 +104,15 @@ dialogo de confirmacao do SolidWorks, que travaria a chamada COM.
 ### Operacoes de corpo / referencia
 `mirror_feature` (OK), `mirror_body` (OK), `move_copy_body` (OK),
 `create_reference_plane` (OK), `set_appearance` (OK),
-`set_material` (EXP -- o nome do material e aplicado e lido de volta, mas a
-densidade continua em 1000 kg/m3 (agua): confirmado ao vivo em 05/10/2026,
-mesmo com o `.sldmat` resolvido, ordem de argumentos corrigida e nome da
-configuracao ativa. Massa de `measure_body`/`extract_assembly_data` fica
-errada ate a causa ser encontrada -- ver comentario em `set_material` no
-`server.py`),
+`set_material` (EXP -- a densidade continua em 1000 kg/m3 (agua): confirmado
+ao vivo em 05/10/2026, mesmo com o `.sldmat` resolvido, cinco ordens de
+argumentos testadas e nome da configuracao ativa; o nome tambem le de volta
+vazio. Desde a v5.12.0 a ferramenta verifica pela DENSIDADE e falha com erro
+explicito em vez de reportar sucesso; `measure_body` devolve `density_kg_m3` e
+avisa quando a massa esta em densidade de agua; `lookup_material_properties`
+le densidade/modulo/escoamento direto do `.sldmat` (peso = volume x
+densidade) como caminho correto enquanto a causa raiz -- no SolidWorks ou na
+instalacao, nao no codigo -- nao e encontrada),
 `create_reference_axis` (EXP -- InsertAxis2 depende de selecao valida),
 `combine_bodies` (EXP -- corpos precisam se tocar/interseccionar),
 `split_body` (EXP -- fluxo Pre/PostSplitBody), `add_rib` (EXP)
@@ -274,13 +277,25 @@ nao esta disponivel", inclusive `connect_solidworks`, porque o caminho de
 reconexao nunca era alcancado. Agora `_com_is_alive()` invoca a chamada de
 fato, e o mesmo padrao de no-op foi corrigido no rebuild de `shell_body`.
 
+### Novas em v5.12.0 (7 ferramentas, 143 -> 150)
+- Camada de leitura/verificacao de desenho (modulo `alfa_drawing.py`, sem COM,
+  testado em Linux): `get_drawing_layout`, `get_view_entities`,
+  `get_view_dimensions`, `dimension_by_entity_ids` (cota por entidade, com
+  `expected_mm` e erro E01 se medir outra coisa) e `verify_drawing` (relatorio
+  estruturado de cobertura de cotas, sobreposicao, escala). Validado ao vivo
+  29/29 em `tests/run_drawing_live_test.py`.
+- `extract_assembly_bom`: BOM recursiva (todos os niveis), chave (arquivo,
+  configuracao), ignora suprimidos/excluidos. `extract_assembly_data` fica
+  mantida para compatibilidade, marcada como substituida.
+- `lookup_material_properties`: propriedades lidas do `.sldmat`.
+
 ### Arquitetura
 - Todas as chamadas COM rodam em uma unica thread dedicada (COM/STA).
 - Timeout de 120s por operacao COM; limpeza automatica no shutdown.
 - Late binding (dispatch dinamico) -- igual ao ambiente do Claude Desktop.
 
 ### Camada de metodologia (design-sandbox): instructions, resource e prompt
-As 143 ferramentas sao primitivas; sozinhas nao ensinam a IA a projetar bem.
+As 150 ferramentas sao primitivas; sozinhas nao ensinam a IA a projetar bem.
 O servidor expoe as outras duas primitivas do protocolo MCP para cobrir essa
 lacuna, codificando o metodo ja validado nas replicas de engenharia deste
 projeto (ver `RELATORIO_TESTES.md`) em vez de depender de disciplina manual
@@ -336,8 +351,10 @@ Alvos da lista original, ja concluidos (validados ao vivo, hoje OK):
 2. ~~`create_weldment_profile`~~ (estruturas de plataformas/tanques).
 3. ~~`create_base_flange`~~ (tanques de chapa).
 
-Alvos atuais (v5.9.2), por impacto:
-1. `set_material` -- densidade nao aplicada (afeta peso de toda BOM).
+Alvos atuais (v5.12.0), por impacto:
+1. `set_material` -- densidade nao aplicada (afeta peso de toda BOM). Proximo
+   passo: aplicar material a mao (Editar Material) e ver se a densidade muda;
+   se nao mudar, o defeito e da instalacao. Contorno: `lookup_material_properties`.
 2. Desenho tecnico EXP -- `add_drawing_dimension`, `insert_section_view`,
    `insert_detail_view`, `add_balloon`, `insert_bom_table`,
    `insert_cut_list_table`.

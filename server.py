@@ -34,6 +34,11 @@ from mcp.server.fastmcp import FastMCP, Image
 from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
 from pydantic import ConfigDict
 
+# Drawing geometry, selection policy and verification rules. Kept in a
+# COM-free module so the whole of it is testable under pytest without
+# SolidWorks open -- see tests/test_alfa_drawing.py.
+import alfa_drawing as ad
+
 # Reject unknown tool arguments instead of silently ignoring them. Without
 # this, FastMCP's default Pydantic config (extra="ignore") means a caller
 # that misspells a parameter name (e.g. "x_center" instead of "cx") gets no
@@ -434,15 +439,28 @@ def _save_doc3(doc, options: int = 0):
     return bool(succeeded), errors, warnings
 
 
-def _com_member(obj, name):
+def _com_member(obj, name, *args):
     """Read a COM member that typed and dynamic dispatch expose differently.
 
     The same SolidWorks member arrives as a bound method under dynamic
     IDispatch and as a plain value under the generated type library, so the
     inspection tools normalize both shapes through here.
+
+    Dynamic dispatch can also hand back an already-evaluated object that is
+    still ``callable``; invoking it then raises "member not found" even though
+    the value itself is what was wanted. For a no-argument member that raise
+    is recoverable, so fall back to the value. With arguments it is not --
+    falling back would silently drop them -- so the error propagates.
     """
     value = getattr(obj, name)
-    return value() if callable(value) else value
+    if not callable(value):
+        return value
+    try:
+        return value(*args)
+    except Exception:
+        if args:
+            raise
+        return value
 
 
 def _doc_title(doc) -> str:
@@ -972,8 +990,24 @@ async def insert_drawing_view(source_filepath: str, view_type: str = "front",
                                x: float = 150, y: float = 150,
                                scale: float = 1.0, unit: Optional[str] = None) -> dict:
     """Insert a standard model view into the active drawing.
+
     view_type: front, back, left, right, top, bottom, isometric, trimetric, dimetric.
-    x/y is the position on the drawing sheet. scale is the view scale (e.g. 2 = 2:1)."""
+
+    x/y is the GEOMETRIC CENTRE of the view on the sheet, not its corner --
+    a view placed at (150, 150) extends half its width either side.
+
+    scale is the decimal ratio: 1 for 1:1, 2 for 2:1, 0.05 for 1:20. It is NOT
+    the denominator, so scale=20 means 20:1.
+
+    Returns the view's name (needed by every other drawing tool), its real
+    outline, size and centre in mm, the sheet format and usable area, and the
+    scale SolidWorks ACTUALLY applied -- which can differ from the one asked
+    for. `issues` reports a refused scale, a scale that is not on the
+    normalised series, and a view that does not fit the usable area, with the
+    normalised scale that would fit.
+
+    Call get_drawing_layout first on a sheet that already has views: two
+    inserts without explicit positions stack both views on the same centre."""
 
     def _impl():
         doc = _active_doc()
@@ -1029,13 +1063,85 @@ async def insert_drawing_view(source_filepath: str, view_type: str = "front",
                 f"Failed to insert {view_type} view of '{model_name}'. "
                 "Ensure the source document exists and contains geometry."
             )
+        view = win32com.client.Dispatch(view)
+        view_name = _view_name(view)
+
+        # The scale assignment used to sit in `try: ... except: pass`, and the
+        # return value echoed the REQUESTED scale either way. A refused
+        # assignment therefore produced a view at the sheet scale while the
+        # tool reported the scale asked for -- and every sheet coordinate
+        # computed from that number was wrong. Now the assignment is reported,
+        # and what comes back is the scale SolidWorks actually holds.
+        scale_applied, scale_error = True, None
         try:
-            view = win32com.client.Dispatch(view)
             view.ScaleRatio = (scale, 1.0)
+            # The API help for IView.ScaleRatio says to rebuild after changing
+            # it; without this the outline read below can still be the old one.
+            doc.EditRebuild3()
+        except Exception as exc:
+            scale_applied, scale_error = False, str(exc)
+            log.warning("Could not set the scale of view %r to %s: %s",
+                        view_name, scale, exc)
+
+        effective_ratio = _view_scale_ratio(view)
+        result = {
+            "view_name": view_name,
+            "view_type": view_type,
+            "source": source_filepath,
+            "position": [x, y],
+            "requested_scale": scale,
+            "effective_scale": ad.format_scale(*effective_ratio),
+            "effective_scale_ratio": list(effective_ratio),
+            "scale_applied": scale_applied,
+            "unit": unit or _default_unit,
+            "issues": [],
+        }
+        if scale_error:
+            result["scale_error"] = scale_error
+            result["issues"].append(ad.issue(
+                "E08", "critical",
+                f"the requested scale {scale:g}:1 was refused; the view is at "
+                f"{result['effective_scale']}", view_name))
+        if not ad.is_normalized_scale(*effective_ratio):
+            nearest = ad.nearest_normalized_scale(effective_ratio[0] / effective_ratio[1])
+            result["issues"].append(ad.issue(
+                "E08", "warning",
+                f"{result['effective_scale']} is not on the normalised series; "
+                f"nearest is {nearest[0]}:{nearest[1]}", view_name))
+
+        # The outline is what makes a later dimension or view placement
+        # meaningful; the old return had no way to tell whether the view even
+        # landed on the paper.
+        try:
+            outline_m = _view_outline_m(view)
+            result["outline_mm"] = [ad.mm(c) for c in outline_m]
+            result["size_mm"] = [round(s, 3) for s in ad.box_size(result["outline_mm"])]
+            result["center_mm"] = [ad.mm(c) for c in _view_position_m(view)]
+            sheet = win32com.client.Dispatch(_com_member(doc, "GetCurrentSheet"))
+            props = _sheet_properties(sheet)
+            width_mm, height_mm = ad.mm(props["width_m"]), ad.mm(props["height_m"])
+            config = ad.SheetConfig()
+            result["sheet_format"] = ad.identify_format(width_mm, height_mm)
+            result["sheet_size_mm"] = [width_mm, height_mm]
+            usable = config.usable_area(width_mm, height_mm)
+            result["usable_area_mm"] = usable
+            if not ad.box_contains(usable, result["outline_mm"]):
+                fitting = ad.pick_scale_that_fits(
+                    [s / (effective_ratio[0] / effective_ratio[1]) for s in result["size_mm"]],
+                    (usable[2] - usable[0], usable[3] - usable[1]),
+                    margin_mm=config.dim_band_mm)
+                hint = (f"; {fitting[0]}:{fitting[1]} would fit"
+                        if fitting else "; no normalised scale fits this sheet")
+                result["issues"].append(ad.issue(
+                    "E07", "critical",
+                    f"view {view_name} is {result['size_mm'][0]:g} x "
+                    f"{result['size_mm'][1]:g} mm and does not fit the usable area "
+                    f"of the {result['sheet_format'] or 'sheet'}{hint}", view_name))
         except Exception:
-            pass
-        return {"view_type": view_type, "source": source_filepath,
-                "position": [x, y], "scale": scale, "unit": unit or _default_unit}
+            log.warning("Could not measure view %r after insertion", view_name,
+                        exc_info=True)
+        result["ok"] = not any(i["severity"] == "critical" for i in result["issues"])
+        return result
 
     return await _run(_impl)
 
@@ -1178,18 +1284,27 @@ async def insert_component(filepath: str, x: float = 0, y: float = 0, z: float =
 
 
 @mcp.tool()
-async def list_components() -> dict:
-    """List every component (part/sub-assembly instance) in the active assembly.
+async def list_components(top_level_only: bool = False) -> dict:
+    """List the components of the active assembly, at every level by default.
+
+    top_level_only=True returns only the first level, which is what this tool
+    used to do unconditionally -- in an assembly built from subassemblies that
+    hid most of the parts.
 
     ``suppressed`` and ``visible`` are independent: a component can be shown
     (not suppressed) but hidden from view, or vice versa. Use ``visible`` to
     know what is actually on screen right now.
-    """
+
+    Each entry carries its `level` (0 = top) and `parent`, so the tree can be
+    reconstructed. For BOM quantities and grouping use extract_assembly_bom."""
 
     def _impl():
         assy = _active_assembly()
         components = []
-        for raw in assy.GetComponents(True) or ():
+        # IAssemblyDoc.GetComponents(ToplevelOnly): True means first level
+        # only. Passing False returns every component at every level, already
+        # flattened.
+        for raw in assy.GetComponents(bool(top_level_only)) or ():
             comp = win32com.client.Dispatch(raw)
             entry = {
                 "name": comp.Name2,
@@ -1204,16 +1319,42 @@ async def list_components() -> dict:
                 entry["visible"] = bool(state)
             except Exception:
                 entry["visible"] = None
+            for attribute, key in (("ReferencedConfiguration", "configuration"),
+                                   ("ExcludeFromBOM", "excluded_from_bom"),
+                                   ("IsVirtual", "virtual")):
+                try:
+                    value = _com_member(comp, attribute)
+                    entry[key] = bool(value) if key != "configuration" else (
+                        str(value) if value is not None else None)
+                except Exception:
+                    entry[key] = None
+            # Name2 of a nested component is "sub-1/part-1": the path through
+            # the tree. Its depth is the level, which GetComponents(False)
+            # does not otherwise report.
+            entry["level"] = entry["name"].count("/")
+            entry["parent"] = (entry["name"].rsplit("/", 1)[0]
+                               if "/" in entry["name"] else None)
             components.append(entry)
-        return {"count": len(components), "components": components}
+        return {
+            "assembly": _doc_title(_active_doc()),
+            "top_level_only": bool(top_level_only),
+            "count": len(components),
+            "components": components,
+        }
 
     return await _run(_impl)
 
 
 @mcp.tool()
 async def extract_assembly_data(config: str = "") -> dict:
-    """Walk every top-level component of the active assembly and return name,
+    """Walk every TOP-LEVEL component of the active assembly and return name,
     material/custom properties, and mass/dimensions for each one in a single call.
+
+    SUPERSEDED for BOM work by extract_assembly_bom, which walks every level.
+    This tool reads only the first level, so parts inside subassemblies do not
+    appear and a subassembly counts as one item. It is kept unchanged because
+    callers depend on its exact shape; use it when the first level is really
+    what is wanted.
 
     Built for BOM-style extraction (e.g. an AI pipeline that needs quantity,
     material, weight, and dimensions per part): without this, a caller needs
@@ -1345,6 +1486,242 @@ async def extract_assembly_data(config: str = "") -> dict:
             "unique_part_count": len(order),
             "components": components,
             "bom": [bom[k] for k in order],
+        }
+
+    return await _run(_impl)
+
+
+def _component_flags(comp) -> dict:
+    """Read the flags that decide whether a component belongs in a BOM."""
+    flags = {}
+    for attribute, key in (("IsSuppressed", "suppressed"),
+                           ("ExcludeFromBOM", "excluded_from_bom"),
+                           ("IsVirtual", "virtual"),
+                           ("ReferencedConfiguration", "configuration"),
+                           ("GetPathName", "path"),
+                           ("Name2", "name")):
+        try:
+            value = _com_member(comp, attribute)
+        except Exception:
+            value = None
+        if key in ("configuration", "path", "name"):
+            flags[key] = str(value) if value is not None else None
+        else:
+            flags[key] = bool(value)
+    return flags
+
+
+def _component_model_doc(comp):
+    """The IModelDoc2 behind a component, or None if it is not loaded.
+
+    Dynamic IDispatch auto-invokes zero-argument methods on attribute access,
+    so comp.GetModelDoc2 is often ALREADY the resolved document; pywin32 also
+    makes every dispatched object callable, so callable() cannot tell the two
+    cases apart. Try the call, fall back to the value.
+    """
+    try:
+        raw = comp.GetModelDoc2
+        if callable(raw):
+            try:
+                raw = raw()
+            except Exception:
+                pass
+        return win32com.client.Dispatch(raw) if raw is not None else None
+    except Exception:
+        return None
+
+
+def _is_assembly_component(comp) -> bool:
+    model = _component_model_doc(comp)
+    if model is None:
+        return False
+    try:
+        return _doc_type(model) == 2
+    except Exception:
+        return False
+
+
+def _walk_assembly(comp, level: int, parent: Optional[str], out: list,
+                   max_depth: int, visited: set) -> None:
+    """Depth-first walk of an assembly tree, appending one entry per instance.
+
+    Every physical instance appears once, so counting instances gives the
+    right BOM quantity with no need to multiply by a parent quantity: a
+    subassembly used twice is walked twice.
+
+    ``visited`` guards against a circular reference, which SolidWorks allows
+    to exist in a broken assembly and which would otherwise recurse forever.
+    """
+    flags = _component_flags(comp)
+    identity = (flags["path"], flags["configuration"], flags["name"], level)
+    if identity in visited:
+        return
+    visited.add(identity)
+
+    is_assembly = _is_assembly_component(comp)
+    entry = dict(flags, level=level, parent=parent, is_assembly=is_assembly,
+                 component=comp)
+    out.append(entry)
+
+    if not is_assembly or flags["suppressed"] or level >= max_depth:
+        return
+    try:
+        children = _com_member(comp, "GetChildren") or ()
+    except Exception:
+        log.debug("Could not read children of %r", flags["name"], exc_info=True)
+        return
+    for raw_child in children:
+        try:
+            child = win32com.client.Dispatch(raw_child)
+        except Exception:
+            continue
+        _walk_assembly(child, level + 1, flags["name"], out, max_depth, visited)
+
+
+@mcp.tool()
+async def extract_assembly_bom(config: str = "",
+                               include_subassemblies: bool = True,
+                               include_suppressed: bool = False,
+                               max_depth: int = 10) -> dict:
+    """Build a full multi-level BOM of the active assembly in one call.
+
+    Walks EVERY level of the assembly tree, not just the first, and groups
+    rows by (file path, referenced configuration) -- so the same plate in a
+    2 mm and a 3 mm configuration becomes two rows instead of being silently
+    summed into one.
+
+    Each BOM row carries quantity, material, custom properties, mass and
+    bounding box. Each tree entry carries its level and parent, so a
+    per-subassembly BOM can be built from the same result.
+
+    include_subassemblies: list the subassembly itself as its own row, as well
+        as its contents. Structural work usually wants this (the subassembly
+        is a weldment that gets a code of its own); turn it off for a pure
+        parts list.
+    include_suppressed: suppressed components are left out by default, because
+        a suppressed part is not in the physical build.
+    Components marked "Exclude from bill of materials" are always left out.
+    config: configuration to read custom properties from; empty (the default)
+        reads document-level properties.
+
+    Use this instead of extract_assembly_data for anything that feeds a BOM,
+    a cut list or a weight total."""
+
+    def _impl():
+        assy = _active_assembly()
+        factor = 1.0 / UNIT_TO_METERS.get(_default_unit, 0.001)
+
+        tree: list = []
+        visited: set = set()
+        for raw in assy.GetComponents(True) or ():
+            try:
+                comp = win32com.client.Dispatch(raw)
+            except Exception:
+                continue
+            _walk_assembly(comp, 0, None, tree, max_depth, visited)
+
+        rows: dict = {}
+        order: list = []
+        entries: list = []
+        skipped = {"suppressed": 0, "excluded_from_bom": 0, "not_loaded": 0}
+
+        for node in tree:
+            comp = node.pop("component")
+            entry = dict(node, properties=None, measurement=None, errors=[])
+            entries.append(entry)
+
+            if entry["excluded_from_bom"]:
+                skipped["excluded_from_bom"] += 1
+                entry["counted"] = False
+                continue
+            if entry["suppressed"] and not include_suppressed:
+                skipped["suppressed"] += 1
+                entry["counted"] = False
+                continue
+            if entry["is_assembly"] and not include_subassemblies:
+                entry["counted"] = False
+                continue
+
+            model_doc = _component_model_doc(comp)
+            if model_doc is None:
+                entry["errors"].append(
+                    "component document is not loaded (suppressed or lightweight)")
+                skipped["not_loaded"] += 1
+                entry["counted"] = False
+                continue
+
+            try:
+                cpm = model_doc.Extension.CustomPropertyManager(config)
+                entry["properties"] = _read_custom_properties(cpm)
+            except Exception as exc:
+                entry["errors"].append(f"could not read custom properties: {exc}")
+
+            if entry["properties"] is not None and not any(
+                k.lower() == "material" for k in entry["properties"]
+            ):
+                native_material = _native_material_name(model_doc, config)
+                if native_material:
+                    entry["properties"]["Material"] = {
+                        "value": native_material,
+                        "resolved": native_material,
+                    }
+
+            if not entry["is_assembly"]:
+                try:
+                    entry["measurement"] = _measure_model_doc(model_doc, factor)
+                except Exception as exc:
+                    entry["errors"].append(f"could not measure body: {exc}")
+
+            entry["counted"] = True
+            # The grouping key the old code got wrong: it keyed on the file
+            # path alone, so two configurations of one file were summed as a
+            # single item.
+            key = (entry["path"] or entry["name"], entry["configuration"] or "")
+            if key not in rows:
+                rows[key] = {
+                    "path": entry["path"],
+                    "configuration": entry["configuration"],
+                    "representative_name": entry["name"],
+                    "is_assembly": entry["is_assembly"],
+                    "min_level": entry["level"],
+                    "quantity": 0,
+                    "properties": entry["properties"],
+                    "measurement": entry["measurement"],
+                    "instance_names": [],
+                }
+                order.append(key)
+            row = rows[key]
+            row["quantity"] += 1
+            row["instance_names"].append(entry["name"])
+            row["min_level"] = min(row["min_level"], entry["level"])
+            if row["properties"] is None and entry["properties"]:
+                row["properties"] = entry["properties"]
+            if row["measurement"] is None and entry["measurement"]:
+                row["measurement"] = entry["measurement"]
+
+        bom = [rows[k] for k in order]
+        total_mass = 0.0
+        mass_incomplete = []
+        for row in bom:
+            if row["is_assembly"]:
+                continue
+            mass = (row.get("measurement") or {}).get("mass_kg")
+            if mass is None:
+                mass_incomplete.append(row["representative_name"])
+            else:
+                total_mass += mass * row["quantity"]
+
+        return {
+            "assembly": _doc_title(_active_doc()),
+            "levels_walked": max((e["level"] for e in entries), default=0) + 1,
+            "instance_count": len(entries),
+            "counted_instance_count": sum(1 for e in entries if e.get("counted")),
+            "unique_row_count": len(bom),
+            "skipped": skipped,
+            "total_mass_kg": round(total_mass, 4),
+            "mass_incomplete_for": mass_incomplete,
+            "bom": bom,
+            "tree": entries,
         }
 
     return await _run(_impl)
@@ -1712,20 +2089,35 @@ async def create_motion_study(name: Optional[str] = None, activate: bool = True)
 
 @mcp.tool()
 async def export_document(filepath: str) -> dict:
-    """Export the active document to STEP, STL, IGES, PDF, DXF, or Parasolid.
-    The format is determined by the file extension:
-    .step/.stp, .stl, .igs/.iges, .pdf (drawings), .dxf, .x_t (Parasolid), .3mf"""
+    """Export the active document to STEP, STL, IGES, PDF, DWG, DXF or Parasolid.
+
+    The format comes from the file extension:
+    .step/.stp, .stl, .igs/.iges, .pdf (drawings), .dwg and .dxf (drawings),
+    .x_t/.x_b (Parasolid), .sat, .3mf
+
+    .dwg and .dxf of a DRAWING export every sheet, each to its own file: for
+    sheets beyond the first, SolidWorks appends the sheet name to the
+    filename. The returned `sheets` field says how many there were, since the
+    extra files are not named by the caller."""
 
     def _impl():
-        doc = _active_doc()
         abs_path = os.path.abspath(filepath)
         ext = os.path.splitext(abs_path)[1].lower()
-        valid = {".step", ".stp", ".stl", ".igs", ".iges", ".pdf", ".dxf", ".x_t", ".x_b", ".sat", ".3mf"}
+        valid = {".step", ".stp", ".stl", ".igs", ".iges", ".pdf", ".dwg", ".dxf",
+                 ".x_t", ".x_b", ".sat", ".3mf"}
         if ext not in valid:
             raise ValueError(f"Unsupported export format '{ext}'. Use: {', '.join(sorted(valid))}")
+        doc = _active_doc()
 
-        if ext == ".pdf" and _doc_type(doc) != 3:
-            raise RuntimeError("PDF export is only supported for drawing documents.")
+        # .dwg was missing entirely, even though the drawing-only
+        # export_flat_pattern_dxf already accepted it. Structural-steel
+        # offices exchange DWG with AutoCAD constantly.
+        drawing_only = {".pdf", ".dwg"}
+        if ext in drawing_only and _doc_type(doc) != 3:
+            raise RuntimeError(
+                f"{ext} export is only supported for drawing documents "
+                f"(.slddrw). Open or create a drawing first."
+            )
 
         parent = os.path.dirname(abs_path)
         if parent:
@@ -1751,7 +2143,19 @@ async def export_document(filepath: str) -> dict:
         if not ok:
             raise RuntimeError(f"Export failed (error {errors.value}, warning {warnings.value}).")
         log.info("Exported to %s", abs_path)
-        return {"path": abs_path, "format": ext.lstrip(".")}
+        result = {"path": abs_path, "format": ext.lstrip(".")}
+        if _doc_type(doc) == 3:
+            try:
+                result["sheets"] = len(_sheet_names(doc))
+            except Exception:
+                log.debug("Could not count sheets after export", exc_info=True)
+        if not os.path.exists(abs_path):
+            raise RuntimeError(
+                f"SolidWorks reported success but no file was written to "
+                f"{abs_path}."
+            )
+        result["size_bytes"] = os.path.getsize(abs_path)
+        return result
 
     return await _run(_impl)
 
@@ -3080,6 +3484,8 @@ async def add_gusset(
     x1: float = 0, y1: float = 0, z1: float = 0,
     x2: float = 0, y2: float = 0, z2: float = 0,
     profile: str = "triangular",
+    leg1: float = 50, leg2: float = 50, leg3: float = 25,
+    profile_angle: float = 45,
     unit: Optional[str] = None,
 ) -> dict:
     """Add a gusset plate (reinforcement triangle) between two planar faces.
@@ -3091,11 +3497,30 @@ async def add_gusset(
     x1/y1/z1: a point on the first face.
     x2/y2/z2: a point on the second face.
     thickness: plate thickness.
-    profile: 'triangular' (straight hypotenuse) or 'flat' (polygonal infill)."""
+    profile: 'triangular' (straight hypotenuse) or 'flat' (polygonal infill).
+    leg1/leg2: the gusset's two legs along the supporting faces.
+    leg3: the third distance of a 'flat' (polygonal) profile; ignored for a
+    triangular one.
+    profile_angle: the polygonal profile's angle, in degrees.
+
+    The legs used to be hard-coded as 50 and converted with the CALLER's unit,
+    so unit="m" produced a 50-metre gusset and there was no way to ask for the
+    size the structure actually needs."""
 
     def _impl():
         if thickness <= 0:
             raise ValueError(f"Thickness must be positive, got {thickness}.")
+        for label, value in (("leg1", leg1), ("leg2", leg2)):
+            if value <= 0:
+                raise ValueError(f"{label} must be positive, got {value}.")
+        if not 0 < profile_angle < 180:
+            raise ValueError(
+                f"profile_angle must be between 0 and 180 degrees, got {profile_angle}."
+            )
+        if profile.lower() == "flat" and leg3 <= 0:
+            raise ValueError(
+                f"A 'flat' (polygonal) gusset needs a positive leg3, got {leg3}."
+            )
         doc = _active_doc()
         t_m = to_meters(thickness, unit)
 
@@ -3122,12 +3547,12 @@ async def add_gusset(
         # InsertGussetFeature2(Depth, DirType, LocType, BIsProfile, ProfileD1,
         #   ProfileD2, ProfileD3, ProfileAngle, ProfileD4, BOffset, DProfileOffset,
         #   CrvIndex, BReverseDir, BReverseFace, BUseLenDim, Faces) — 16 args.
-        d1 = to_meters(50, unit)  # default gusset leg 1
-        d2 = to_meters(50, unit)  # default gusset leg 2
+        d1 = to_meters(leg1, unit)
+        d2 = to_meters(leg2, unit)
         # A polygonal gusset needs a third distance plus either an angle or a
-        # fourth distance. Use the documented d3 + 45 degree form; setting d3
-        # to zero produces no profile in SolidWorks.
-        d3 = to_meters(25, unit) if is_polygon else 0.0
+        # fourth distance. Use the documented d3 + angle form; setting d3 to
+        # zero produces no profile in SolidWorks.
+        d3 = to_meters(leg3, unit) if is_polygon else 0.0
         d4 = 0.0
         use_length_dimension = False
         feat = doc.FeatureManager.InsertGussetFeature2(
@@ -3138,7 +3563,7 @@ async def add_gusset(
             d1,                # ProfileD1
             d2,                # ProfileD2
             d3,                # ProfileD3 (required for polygon profiles)
-            math.radians(45),  # ProfileAngle
+            math.radians(profile_angle),  # ProfileAngle
             d4,                # ProfileD4 (used when BUseLenDim is True)
             False,             # BOffset
             0.0,               # DProfileOffset
@@ -3162,6 +3587,10 @@ async def add_gusset(
             "feature": feat_name,
             "thickness": thickness,
             "profile": profile,
+            "leg1": leg1,
+            "leg2": leg2,
+            "leg3": leg3 if is_polygon else None,
+            "profile_angle_deg": profile_angle,
             "unit": unit or _default_unit,
         }
 
@@ -3697,15 +4126,29 @@ async def add_sheet_metal_edge_flange(
 
 
 @mcp.tool()
-async def flatten_sheet_metal() -> dict:
-    """Flatten the sheet metal part to show its flat pattern.
+async def flatten_sheet_metal(state: str = "flat") -> dict:
+    """Put a sheet metal part into its flat or folded state.
 
     Shows the sheet metal body unfolded into a single flat shape — exactly
     how it should be cut from a flat plate on a CNC, laser, or plasma cutter.
-    Call this again (or use list_features and suppress the Flat-Pattern) to
-    go back to the folded state."""
+
+    state:
+      "flat"   (default) ensure the flat pattern is showing. Idempotent:
+               calling it twice leaves the part flat both times.
+      "folded" ensure the part is folded back to 3D.
+      "toggle" flip whichever state it is in now.
+
+    The default used to be the toggle, which made a retry after a timeout
+    silently fold the part again."""
 
     def _impl():
+        # Validate before touching COM: rejecting a typo should not need a
+        # SolidWorks connection, and it makes the rule testable on its own.
+        wanted = state.strip().lower()
+        if wanted not in ("flat", "folded", "toggle"):
+            raise ValueError(
+                f"state must be 'flat', 'folded' or 'toggle', got '{state}'."
+            )
         doc = _active_doc()
 
         feat = doc.FirstFeature
@@ -3727,35 +4170,51 @@ async def flatten_sheet_metal() -> dict:
             is_suppressed = flat_pattern.IsSuppressed
             if callable(is_suppressed):
                 is_suppressed = is_suppressed()
-            if is_suppressed:
-                flat_pattern.Select2(False, 0)
-                # These zero-argument ModelDoc2 commands are exposed as
-                # already-invoked Boolean properties by late-bound pywin32.
-                # Adding parentheses tries to call that Boolean and raises
-                # TypeError after SolidWorks has already changed the state.
-                changed = doc.EditUnsuppress2
-                if not changed:
-                    raise RuntimeError("SolidWorks could not unsuppress the flat pattern.")
-                doc.ClearSelection2(True)
-                return {"state": "flattened", "action": "unsuppressed flat-pattern"}
-            else:
-                flat_pattern.Select2(False, 0)
-                changed = doc.EditSuppress2
-                if not changed:
-                    raise RuntimeError("SolidWorks could not suppress the flat pattern.")
-                doc.ClearSelection2(True)
-                return {"state": "folded", "action": "suppressed flat-pattern (back to 3D)"}
+            currently = "folded" if is_suppressed else "flat"
+            target = ("folded" if currently == "flat" else "flat") \
+                if wanted == "toggle" else wanted
 
+            if target == currently:
+                return {"state": currently, "action": "no change needed",
+                        "requested": wanted, "changed": False}
+
+            flat_pattern.Select2(False, 0)
+            # These zero-argument ModelDoc2 commands are exposed as
+            # already-invoked Boolean properties by late-bound pywin32.
+            # Adding parentheses tries to call that Boolean and raises
+            # TypeError after SolidWorks has already changed the state.
+            if target == "flat":
+                changed = doc.EditUnsuppress2
+                action = "unsuppressed flat-pattern"
+            else:
+                changed = doc.EditSuppress2
+                action = "suppressed flat-pattern (back to 3D)"
+            doc.ClearSelection2(True)
+            if not changed:
+                raise RuntimeError(
+                    f"SolidWorks could not put the flat pattern into the "
+                    f"'{target}' state."
+                )
+            return {"state": target, "action": action,
+                    "requested": wanted, "changed": True}
+
+        # No Flat-Pattern feature in the tree at all. A part with no flat
+        # pattern is already folded, so "folded" is satisfied without
+        # creating one -- creating it would be a change the caller did not
+        # ask for.
+        if wanted == "folded":
+            return {"state": "folded", "action": "no flat-pattern exists",
+                    "requested": wanted, "changed": False}
         try:
             doc.FeatureManager.InsertSheetMetalFlatPattern2(True)
-            return {"state": "flattened", "action": "created flat-pattern"}
-        except Exception:
-            pass
-
-        raise RuntimeError(
-            "Could not flatten the part. Ensure it is a sheet metal part "
-            "(created with create_base_flange or converted to sheet metal)."
-        )
+            return {"state": "flat", "action": "created flat-pattern",
+                    "requested": wanted, "changed": True}
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not flatten the part: {exc}. Ensure it is a sheet metal "
+                f"part (created with create_base_flange or converted to sheet "
+                f"metal)."
+            ) from exc
 
     return await _run(_impl)
 
@@ -4629,6 +5088,7 @@ async def create_reference_plane(
     reference: str = "front",
     offset: float = 50,
     angle: float = 0,
+    angle_about: Optional[str] = None,
     flip: bool = False,
     unit: Optional[str] = None,
 ) -> dict:
@@ -4641,8 +5101,18 @@ async def create_reference_plane(
     reference: the existing plane to reference — 'front', 'top', 'right', or a
                user-created plane's name.
     offset: distance from the reference plane along its normal.
-    angle: rotation angle in degrees (0 = parallel offset; nonzero = angled).
-    flip: reverse the offset direction."""
+    angle: rotation angle in degrees. 0 gives a parallel offset plane. A
+           nonzero angle needs something to rotate ABOUT, so pass angle_about
+           with the name of a reference axis or edge; without one SolidWorks
+           has no axis and the call is refused rather than quietly producing
+           a parallel plane.
+    angle_about: name of the axis or edge to rotate about. Used only when
+           angle is nonzero.
+    flip: reverse the offset direction.
+
+    Returns the plane's name and, where SolidWorks reports it, the origin and
+    normal the plane actually ended up with, so a wrong plane stops being
+    silent."""
 
     def _impl():
         doc = _active_doc()
@@ -4657,42 +5127,87 @@ async def create_reference_plane(
         if flip:
             offset_m = -offset_m
 
+        # swRefPlaneReferenceConstraints_e: 8 = Distance, 16 = Angle.
+        # The constraint is decided HERE, before the COM call. The previous
+        # version always tried Distance first and only fell back to Angle if
+        # that returned None -- and Distance nearly always succeeds, so
+        # angle=30 silently produced a plane PARALLEL to the reference while
+        # the return value still reported "angle": 30.
+        if angle == 0:
+            constraint, value = 8, offset_m
+        else:
+            constraint, value = 16, angle_rad
+            if angle_about:
+                if not _select_plane_by_name(doc, angle_about, append=True, mark=0):
+                    empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+                    for sel_type in ("AXIS", "EDGE"):
+                        if doc.Extension.SelectByID2(angle_about, sel_type, 0, 0, 0,
+                                                     True, 0, empty, 0):
+                            break
+                    else:
+                        doc.ClearSelection2(True)
+                        raise RuntimeError(
+                            f"Could not select '{angle_about}' as the axis to "
+                            f"rotate about. Create it first with "
+                            f"create_reference_axis."
+                        )
+
         try:
             feat = doc.FeatureManager.InsertRefPlane(
-                8,           # Constraint1: 8=Distance
-                offset_m,    # Distance
+                constraint, value,
                 0, 0.0,      # Constraint2 unused
                 0, 0.0,      # Constraint3 unused
             )
-        except Exception:
-            feat = None
-
-        if feat is None and angle != 0:
-            try:
-                feat = doc.FeatureManager.InsertRefPlane(
-                    16, angle_rad,   # Constraint1: 16=Angle
-                    0, 0.0,
-                    0, 0.0,
-                )
-            except Exception:
-                feat = None
+        except Exception as exc:
+            doc.ClearSelection2(True)
+            raise RuntimeError(
+                f"InsertRefPlane failed for reference='{reference}', "
+                f"offset={offset}, angle={angle}: {exc}"
+            ) from exc
 
         if feat is None:
+            doc.ClearSelection2(True)
+            hint = ""
+            if angle != 0 and not angle_about:
+                hint = (" An angled plane needs an axis to rotate about: pass "
+                        "angle_about with a reference axis or edge name.")
             raise RuntimeError(
                 f"Reference plane creation failed. reference='{reference}', "
-                f"offset={offset}, angle={angle}."
+                f"offset={offset}, angle={angle}.{hint}"
             )
 
         feat_dispatch = win32com.client.Dispatch(feat)
         name = feat_dispatch.Name if hasattr(feat_dispatch, "Name") else "Plane"
+        doc.ClearSelection2(True)
 
-        return {
+        factor = 1.0 / UNIT_TO_METERS[unit or _default_unit]
+        result = {
             "plane": name,
             "reference": reference,
             "offset": offset,
+            "offset_applied": round(offset_m * factor, 6),
             "angle": angle,
+            "angle_about": angle_about,
+            "constraint": "angle" if constraint == 16 else "distance",
+            "flip": flip,
             "unit": unit or _default_unit,
         }
+        # Read the plane back. flip=True with reference='right' has been seen
+        # to land the plane at X=0 instead of the requested offset; reporting
+        # the real origin is what turns that from a silent wrong answer into
+        # something the caller can check.
+        try:
+            ref_plane = win32com.client.Dispatch(
+                _com_member(feat_dispatch, "GetSpecificFeature2"))
+            transform = win32com.client.Dispatch(_com_member(ref_plane, "Transform"))
+            data = tuple(_com_member(transform, "ArrayData"))
+            result["origin"] = [round(c * factor, 4) for c in data[9:12]]
+            result["normal"] = [round(c, 6) for c in data[6:9]]
+        except Exception:
+            log.debug("Could not read back the position of plane %r", name,
+                      exc_info=True)
+            result["position_read"] = "unavailable on this SolidWorks build"
+        return result
 
     return await _run(_impl)
 
@@ -4864,103 +5379,966 @@ def _active_drawing():
 
 
 def _get_selected_view(doc):
-    """Return the currently active/selected drawing view, or the first view."""
-    def _noarg_member(obj, name):
-        value = getattr(obj, name)
-        if callable(value):
-            try:
-                return value()
-            except Exception:
-                # Dynamic COM dispatch can expose an already-evaluated object
-                # as callable; in that case invoking it raises "member not
-                # found", while the original value is the desired object.
-                return value
-        return value
+    """Return the currently active/selected drawing view, or the first view.
 
+    Kept for the tools that genuinely act on "whatever the user selected".
+    Anything that places geometry or a dimension must NOT use this: on a sheet
+    with four views the active one is rarely the one the coordinates fall in.
+    Those callers go through ``_find_view_for_point`` instead.
+    """
     try:
-        view = _noarg_member(doc, "ActiveDrawingView")
+        view = _com_member(doc, "ActiveDrawingView")
         if view is not None:
             return win32com.client.Dispatch(view)
     except Exception:
-        pass
+        log.debug("ActiveDrawingView unavailable", exc_info=True)
     try:
-        views = _noarg_member(doc, "GetFirstView")  # sheet is first "view"
-        view = _noarg_member(win32com.client.Dispatch(views), "GetNextView")
+        views = _com_member(doc, "GetFirstView")  # sheet is first "view"
+        view = _com_member(win32com.client.Dispatch(views), "GetNextView")
         if view is not None:
             return win32com.client.Dispatch(view)
     except Exception:
-        pass
+        log.debug("GetFirstView/GetNextView unavailable", exc_info=True)
     return None
 
 
 _DRAWING_EDGE_IID = "{83A33D42-27C5-11CE-BFD4-00400513BB57}"
 
+# swViewEntityType_e: edges.
+_VIEW_ENTITY_EDGE = 1
 
-def _select_drawing_edge_near(doc, x_m: float, y_m: float, tolerance_m: float = 0.002):
-    """Select the visible drawing edge closest to a sheet-space point.
+# No angular-dimension constant is hard-coded here on purpose: the unit of a
+# dimension is settled in _read_dimension_value by comparing SystemValue (SI)
+# against Value (display units), which needs no enum and so cannot be wrong
+# about a build whose enum differs. A guessed constant would silently report
+# radians as millimetres.
 
-    ``SelectByID2`` does not reliably hit projected model edges in drawings.
-    This uses the documented IView entity enumeration and selection APIs while
-    preserving the public MCP contract of accepting sheet coordinates.
+# swThisConfiguration, for IDimension.GetSystemValue3.
+_THIS_CONFIGURATION = 1
+
+# swUserPreferenceToggle_e.swInputDimValOnCreate. Left on, SolidWorks opens a
+# modal value box when a dimension is created and the COM call never returns
+# -- the same trap add_sketch_dimension already works around.
+_INPUT_DIM_VAL_ON_CREATE = 10
+
+# Stable short IDs for drawing entities, shared by the read and write tools.
+_ENTITY_REGISTRY = ad.EntityRegistry()
+
+
+# ---------------------------------------------------------------------------
+# Drawing reads: sheets, views, entities, dimensions
+# ---------------------------------------------------------------------------
+
+
+def _sheet_names(doc) -> list:
+    names = _com_member(doc, "GetSheetNames") or ()
+    return [str(n) for n in names]
+
+
+def _sheet_and_views(doc, sheet_name: str):
+    """(ISheet, [IView]) for one sheet, excluding any sheet pseudo-view.
+
+    ISheet.GetViews returns the REAL views only -- confirmed live on
+    SolidWorks 2025 PT-BR: a sheet with one view returns one element, a sheet
+    with two returns two. An earlier version of this function assumed element
+    0 was the sheet's own pseudo-view (which is how IDrawingDoc.GetFirstView
+    behaves) and dropped it, so get_drawing_layout reported zero views on a
+    sheet that had one, and _find_view could not find anything.
+
+    The sheet pseudo-view is filtered by NAME rather than by position, so a
+    build that does include it is still handled without dropping a real view.
     """
-    source_view = _get_selected_view(doc)
-    if source_view is None:
-        raise RuntimeError("No model view is available to select a drawing edge.")
+    sheet = win32com.client.Dispatch(doc.Sheet(sheet_name))
+    raw = _com_member(sheet, "GetViews") or ()
+    views = []
+    for item in raw:
+        view = win32com.client.Dispatch(item)
+        try:
+            if str(_com_member(view, "Name")) == sheet_name:
+                continue  # the sheet's own pseudo-view, not a model view
+        except Exception:
+            log.debug("Could not read a view name on sheet %r", sheet_name,
+                      exc_info=True)
+        views.append(view)
+    return sheet, views
 
+
+def _all_drawing_views(doc) -> list:
+    """Every real view of every sheet, as (sheet_name, view) pairs."""
+    out = []
+    for name in _sheet_names(doc):
+        try:
+            _sheet, views = _sheet_and_views(doc, name)
+        except Exception:
+            log.warning("Could not read views of sheet %r", name, exc_info=True)
+            continue
+        out.extend((name, v) for v in views)
+    return out
+
+
+def _view_name(view) -> str:
+    return str(_com_member(view, "Name"))
+
+
+def _find_view(doc, view_name: str):
+    """The view with this name, on any sheet.
+
+    Raises with the available names, because a wrong view name is the error
+    the model is most likely to make and the least able to recover from
+    without being told what exists.
+    """
+    available = []
+    for _sheet_name, view in _all_drawing_views(doc):
+        name = _view_name(view)
+        available.append(name)
+        if name == view_name:
+            return view
+    raise RuntimeError(
+        f"No drawing view named '{view_name}'. Available: "
+        f"{', '.join(available) if available else '(none)'}. "
+        f"Call get_drawing_layout to list them."
+    )
+
+
+def _view_outline_m(view) -> list:
+    return ad.normalize_box(tuple(_com_member(view, "GetOutline")))
+
+
+def _view_xform(view) -> tuple:
+    xform = tuple(_com_member(view, "GetViewXform"))
+    if len(xform) != 13:
+        raise RuntimeError(
+            f"SolidWorks returned a {len(xform)}-element view transform for "
+            f"'{_view_name(view)}'; 13 were expected."
+        )
+    return xform
+
+
+def _view_scale_ratio(view) -> tuple:
+    try:
+        ratio = tuple(view.ScaleRatio)
+        if len(ratio) >= 2 and ratio[1]:
+            return (float(ratio[0]), float(ratio[1]))
+    except Exception:
+        log.debug("ScaleRatio unreadable on %r", _view_name(view), exc_info=True)
+    return (1.0, 1.0)
+
+
+def _view_position_m(view) -> list:
+    try:
+        pos = tuple(view.Position)
+        return [float(pos[0]), float(pos[1])]
+    except Exception:
+        return ad.box_center(_view_outline_m(view))
+
+
+def _sheet_properties(sheet) -> dict:
+    """Paper size, scale and projection angle of a sheet.
+
+    ISheet.GetProperties2 returns
+    [paperSize, template, scale1, scale2, firstAngle, width, height, ...]
+    with width and height in metres.
+    """
+    props = tuple(_com_member(sheet, "GetProperties2") or ())
+    if len(props) < 7:
+        raise RuntimeError(
+            f"ISheet.GetProperties2 returned {len(props)} values; at least 7 were expected."
+        )
+    return {
+        "paper_size_code": int(props[0]),
+        "sheet_scale": (float(props[2]), float(props[3])),
+        "first_angle": bool(props[4]),
+        "width_m": float(props[5]),
+        "height_m": float(props[6]),
+    }
+
+
+def _view_edge_owners(view):
+    """[(component_name, component_variant)] whose edges to enumerate.
+
+    IView.GetVisibleEntities2 takes the component as its first argument. The
+    old code always passed a null variant, which works for a part view but
+    enumerates nothing for an assembly view -- exactly where balloons and
+    weld symbols are used. For an assembly, iterate the drawing components.
+    """
     empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
     try:
-        entities = source_view.GetVisibleEntities2(empty, 1) or ()  # swViewEntityType_Edge
-        xform = tuple(source_view.GetViewXform)
-        if len(xform) != 13:
-            raise RuntimeError("SolidWorks returned an invalid drawing-view transform.")
-    except Exception as exc:
-        raise RuntimeError("Could not enumerate visible edges in the selected drawing view.") from exc
+        raw = _com_member(view, "GetVisibleDrawingComponents") or ()
+    except Exception:
+        raw = ()
+    owners = []
+    for item in raw:
+        try:
+            drawing_component = win32com.client.Dispatch(item)
+            component = _com_member(drawing_component, "Component")
+            if component is None:
+                continue
+            component = win32com.client.Dispatch(component)
+            owners.append((str(_com_member(component, "Name2")), component))
+        except Exception:
+            log.debug("Skipping an unreadable drawing component", exc_info=True)
+    return owners or [(None, empty)]
 
-    def project(point):
-        x, y, z = point
-        # IView.GetViewXform: rotation [0:9], translation [9:12], and scale
-        # [12]. SolidWorks stores the rotation matrix by columns.
-        scale = xform[12]
-        return (
-            (xform[0] * x + xform[3] * y + xform[6] * z) * scale + xform[9],
-            (xform[1] * x + xform[4] * y + xform[7] * z) * scale + xform[10],
+
+def _read_edge_geometry(view, raw_entity, xform):
+    """Classify one visible edge, reading only what COM can actually give.
+
+    A circle's radius lives on the underlying ICurve, not on the edge, so it
+    needs a second hop that the old code never made.
+    """
+    edge = win32com.client.Dispatch(raw_entity, "IEdge", _DRAWING_EDGE_IID)
+    params = tuple(_com_member(edge, "GetCurveParams"))
+    is_circle, circle_params = False, None
+    try:
+        curve = win32com.client.Dispatch(_com_member(edge, "GetCurve"))
+        is_circle = bool(_com_member(curve, "IsCircle"))
+        if is_circle:
+            circle_params = tuple(_com_member(curve, "CircleParams"))
+    except Exception:
+        log.debug("Curve type unreadable for an edge; treating it as a line",
+                  exc_info=True)
+        is_circle, circle_params = False, None
+    return ad.classify_edge(xform, params, circle_params=circle_params,
+                            is_circle=is_circle)
+
+
+def _read_view_entities(doc, view, view_name: str, register: bool = True) -> list:
+    """Every visible edge of a view as an ad.EdgeInfo with a stable ID."""
+    xform = _view_xform(view)
+    doc_title = _doc_title(doc)
+    entities, index = [], 0
+    for component_name, component in _view_edge_owners(view):
+        try:
+            raw_entities = _com_member(view, "GetVisibleEntities2",
+                                       component, _VIEW_ENTITY_EDGE) or ()
+        except Exception:
+            log.warning("GetVisibleEntities2 failed for view %r component %r",
+                        view_name, component_name, exc_info=True)
+            continue
+        for raw_entity in raw_entities:
+            try:
+                info = _read_edge_geometry(view, raw_entity, xform)
+            except Exception:
+                log.debug("Skipping an unclassifiable edge in %r", view_name,
+                          exc_info=True)
+                continue
+            index += 1
+            info.component = component_name
+            if register:
+                info.id = _ENTITY_REGISTRY.register(
+                    doc_title, view_name, index,
+                    {"entity": raw_entity, "component": component,
+                     "kind": info.kind},
+                )
+            else:
+                info.id = f"{view_name}#E{index}"
+            entities.append(info)
+    return entities
+
+
+def _read_dimension_value(dim):
+    """(value, unit) of an IDimension: millimetres or degrees.
+
+    Measured live on SolidWorks 2025 PT-BR for one linear drawing dimension
+    of 400 mm:
+
+        GetSystemValue3(1, None) -> None      <- the documented call
+        GetSystemValue3(1, "")   -> None
+        GetSystemValue2("")      -> 0.4       (metres)
+        SystemValue              -> 0.4       (metres)
+        Value                    -> 400.0     (document display units)
+        GetValue3(1, None)       -> (400.0,)  (display units)
+
+    So the documented GetSystemValue3 cannot be relied on, and the earlier
+    version of this reader multiplied its None by 1000.
+
+    The unit is settled WITHOUT a swDimensionType_e constant, by using the
+    two readings against each other: SystemValue is always SI (metres for a
+    length, radians for an angle) while Value is in display units. If
+    Value matches SystemValue x 1000 it is a length; if it matches
+    degrees(SystemValue) it is an angle. Guessing an enum value for angular
+    dimensions, and being wrong, would silently report radians-as-millimetres.
+    """
+    system = None
+    for getter in ("SystemValue",):
+        try:
+            system = _com_member(dim, getter)
+            if system is not None:
+                break
+        except Exception:
+            log.debug("IDimension.%s unavailable", getter, exc_info=True)
+    if system is None:
+        for call, args in (("GetSystemValue2", ("",)),
+                           ("GetSystemValue3", (_THIS_CONFIGURATION, None))):
+            try:
+                raw = _com_member(dim, call, *args)
+                if isinstance(raw, (tuple, list)):
+                    raw = raw[0] if raw else None
+                if raw is not None:
+                    system = raw
+                    break
+            except Exception:
+                log.debug("IDimension.%s unavailable", call, exc_info=True)
+    if system is None:
+        raise RuntimeError(
+            "SolidWorks reported no value for this dimension "
+            "(SystemValue, GetSystemValue2 and GetSystemValue3 all returned "
+            "nothing)."
         )
 
-    def distance_to_segment_sq(start, end):
-        sx, sy = start
-        ex, ey = end
-        dx, dy = ex - sx, ey - sy
-        length_sq = dx * dx + dy * dy
-        if length_sq == 0:
-            return (x_m - sx) ** 2 + (y_m - sy) ** 2
-        fraction = max(0.0, min(1.0, ((x_m - sx) * dx + (y_m - sy) * dy) / length_sq))
-        cx, cy = sx + fraction * dx, sy + fraction * dy
-        return (x_m - cx) ** 2 + (y_m - cy) ** 2
+    system = float(system)
+    as_mm = round(system * 1000.0, 3)
+    as_deg = round(math.degrees(system), 4)
 
-    closest_edge = None
-    closest_distance_sq = float("inf")
-    for raw_entity in entities:
+    display = None
+    try:
+        display = _com_member(dim, "Value")
+    except Exception:
+        log.debug("IDimension.Value unavailable", exc_info=True)
+    if display is None:
         try:
-            edge = win32com.client.Dispatch(raw_entity, "IEdge", _DRAWING_EDGE_IID)
-            params = tuple(edge.GetCurveParams())
-            if len(params) < 6:
+            raw = _com_member(dim, "GetValue3", _THIS_CONFIGURATION, None)
+            if isinstance(raw, (tuple, list)) and raw:
+                display = raw[0]
+        except Exception:
+            log.debug("IDimension.GetValue3 unavailable", exc_info=True)
+
+    if display is not None:
+        display = float(display)
+        if abs(display - as_mm) <= max(0.01, abs(as_mm) * 1e-6):
+            return as_mm, "mm"
+        if abs(display - as_deg) <= max(0.01, abs(as_deg) * 1e-6):
+            return as_deg, "deg"
+
+    # Nothing to cross-check against: a length is overwhelmingly the common
+    # case, and saying which assumption was made beats implying certainty.
+    return as_mm, "mm?"
+
+
+def _read_view_dimensions(doc, view, view_name: str) -> list:
+    """Every dimension displayed in a view, with its measured value.
+
+    This is the read the old code never had: without it nothing can tell
+    whether a dimension landed on the right edge, is duplicated, or has come
+    adrift from the model.
+    """
+    doc_title = _doc_title(doc)
+    # (com_identity, entity_id) pairs, compared with ==. NOT a dict: the COM
+    # identity is unhashable -- see _entity_key.
+    known: list = []
+    for entity_id in _ENTITY_REGISTRY.ids_for_view(doc_title, view_name):
+        try:
+            item = _ENTITY_REGISTRY.resolve(doc_title, entity_id)
+            known.append((_entity_key(item["entity"]), entity_id))
+        except Exception:
+            log.debug("Could not key registered entity %s", entity_id, exc_info=True)
+
+    def _entity_id_of(com_entity):
+        if com_entity is None:
+            return None
+        try:
+            key = _entity_key(com_entity)
+        except Exception:
+            return "unregistered"
+        for candidate, entity_id in known:
+            try:
+                if candidate == key:
+                    return entity_id
+            except Exception:
                 continue
-            distance_sq = distance_to_segment_sq(project(params[:3]), project(params[3:6]))
-            if distance_sq < closest_distance_sq:
-                closest_edge = raw_entity
-                closest_distance_sq = distance_sq
+        return "unregistered"
+
+    out, index = [], 0
+    try:
+        display = _com_member(view, "GetFirstDisplayDimension5")
+    except Exception:
+        log.warning("GetFirstDisplayDimension5 failed on view %r", view_name,
+                    exc_info=True)
+        return out
+    while display is not None:
+        display = win32com.client.Dispatch(display)
+        index += 1
+        entry = {"id": f"{view_name}#D{index}"}
+        try:
+            dimension = win32com.client.Dispatch(_com_member(display, "GetDimension2", 0))
+            value, unit = _read_dimension_value(dimension)
+            try:
+                dim_type = int(_com_member(display, "Type2"))
+            except Exception:
+                dim_type = None
+            entry.update({
+                "name": str(_com_member(dimension, "FullName")),
+                "type_code": dim_type,
+                "unit": unit,
+                "value_mm": value,
+                "driven": bool(_com_member(dimension, "DrivenState") == 1),
+            })
+        except Exception as exc:
+            entry["read_error"] = str(exc)
+            log.warning("Could not read dimension %s", entry["id"], exc_info=True)
+
+        # One try per concern: a failure reading the text position used to
+        # abandon the attachment read as well, and the attachment read is the
+        # one the coverage check depends on.
+        annotation = None
+        try:
+            annotation = win32com.client.Dispatch(_com_member(display, "GetAnnotation"))
+        except Exception as exc:
+            entry.setdefault("read_error", f"GetAnnotation: {exc}")
+
+        if annotation is not None:
+            try:
+                position = tuple(_com_member(annotation, "GetPosition") or ())
+                entry["text_position_mm"] = [ad.mm(c) for c in position[:2]]
+            except Exception as exc:
+                entry.setdefault("read_error", f"GetPosition: {exc}")
+
+            try:
+                attached = _com_member(annotation, "GetAttachedEntities3") or ()
+                types = _com_member(annotation, "GetAttachedEntityTypes") or ()
+                entry["attached"] = [_entity_id_of(e) for e in attached]
+                entry["attached_count"] = sum(1 for e in attached if e is not None)
+                # IAnnotation.GetAttachedEntityTypes: a dissociated annotation
+                # reports a null entity and swSelNOTHING for that slot.
+                entry["dangling"] = (
+                    any(e is None for e in attached)
+                    or (len(attached) == 0 and len(types) == 0)
+                )
+            except Exception as exc:
+                entry.setdefault("read_error", f"GetAttachedEntities3: {exc}")
+
+        entry.setdefault("attached", [])
+        entry.setdefault("attached_count", 0)
+        entry.setdefault("dangling", None)
+
+        out.append(entry)
+        try:
+            display = _com_member(display, "GetNext5")
+        except Exception:
+            break
+    return out
+
+
+def _entity_key(com_entity):
+    """A COMPARABLE -- not hashable -- key for a COM entity.
+
+    Comparing proxies by ``id()`` does not work: pywin32 builds a fresh
+    wrapper on every access, so the same edge gets a different ``id()`` each
+    time and no dimension would ever match a registered entity. The COM
+    identity of the underlying IUnknown is what is actually stable.
+
+    The returned PyIUnknown supports ``==`` but NOT ``hash()``. Using it as a
+    dict key raises "unhashable type: 'PyIUnknown'", which is exactly what
+    made every dimension report attached=[] and made verify_drawing flag
+    plainly dimensioned edges as having no dimension. Match with ``==`` over
+    a list of pairs instead; a drawing view has tens of entities, so the
+    linear scan costs nothing.
+    """
+    try:
+        return win32com.client.Dispatch(com_entity)._oleobj_.QueryInterface(
+            pythoncom.IID_IUnknown)
+    except Exception:
+        try:
+            return com_entity._oleobj_.QueryInterface(pythoncom.IID_IUnknown)
+        except Exception:
+            return id(com_entity)
+
+
+# ---------------------------------------------------------------------------
+# Drawing selection
+# ---------------------------------------------------------------------------
+
+
+def _find_view_for_point(doc, x_m: float, y_m: float):
+    """(view, view_name) of the view whose outline contains a sheet point.
+
+    This is the fix for the "dimension landed in the wrong view" class of
+    error. The previous code searched only the active view, so on a sheet
+    with front, top, side and iso views a point in the side view was matched
+    against the front view's edges -- yielding either "no edge found" or,
+    worse, a nearby edge of the wrong view with no error reported.
+    """
+    candidates = []
+    for _sheet_name, view in _all_drawing_views(doc):
+        try:
+            outline = _view_outline_m(view)
         except Exception:
             continue
-
-    if closest_edge is None or closest_distance_sq > tolerance_m ** 2:
+        if ad.point_in_box((x_m, y_m), outline):
+            candidates.append((view, _view_name(view), ad.box_size(outline)))
+    if not candidates:
+        names = [_view_name(v) for _s, v in _all_drawing_views(doc)]
         raise RuntimeError(
-            f"No edge found near ({x_m:.6f}, {y_m:.6f}) m on the sheet."
+            f"The point ({ad.mm(x_m)}, {ad.mm(y_m)}) mm is not inside any drawing "
+            f"view. Views on this drawing: {', '.join(names) if names else '(none)'}. "
+            f"Call get_drawing_layout for their outlines."
         )
+    # Nested outlines happen (a detail view drawn over its parent). The
+    # smallest containing view is the one the point is "in".
+    view, name, _size = min(candidates, key=lambda c: c[2][0] * c[2][1])
+    return view, name
 
-    doc.ClearSelection2(True)
-    if not source_view.SelectEntity(closest_edge, False):
-        raise RuntimeError("SolidWorks could not select the requested reference edge.")
-    return source_view
+
+def _select_drawing_edge_near(doc, x_m: float, y_m: float,
+                              tolerance_m: float = 0.002,
+                              append: bool = False,
+                              view=None, view_name: Optional[str] = None):
+    """Select the visible drawing edge a sheet point means.
+
+    ``SelectByID2`` does not reliably hit projected model edges in drawings,
+    so this enumerates the view's entities and selects the object -- the
+    approach the live test report found to be the only one that works.
+
+    Three things it does that the previous version did not: it looks in the
+    view that actually contains the point, it understands circles (clicking
+    inside a hole selects the hole), and it refuses an ambiguous point
+    instead of picking by enumeration order.
+
+    Returns (view, view_name, EdgeInfo).
+    """
+    if view is None:
+        view, view_name = _find_view_for_point(doc, x_m, y_m)
+    entities = _read_view_entities(doc, view, view_name)
+    if not entities:
+        raise RuntimeError(
+            f"View '{view_name}' reports no visible edges. If it is an assembly "
+            f"view, check that its components are resolved."
+        )
+    try:
+        edge, _distance = ad.pick_nearest_edge(entities, x_m, y_m,
+                                               tolerance_m=tolerance_m)
+    except ad.AmbiguousPick as exc:
+        raise RuntimeError(str(exc)) from exc
+    except LookupError as exc:
+        raise RuntimeError(f"{exc} (searched view '{view_name}')") from exc
+
+    item = _ENTITY_REGISTRY.resolve(_doc_title(doc), edge.id)
+    if not append:
+        doc.ClearSelection2(True)
+    if not view.SelectEntity(item["entity"], append):
+        raise RuntimeError(
+            f"SolidWorks refused to select {edge.id} in view '{view_name}'."
+        )
+    return view, view_name, edge
+
+
+def _layout_dict(doc, config: Optional["ad.SheetConfig"] = None) -> dict:
+    """The whole drawing as data: sheets, formats, views, outlines, issues.
+
+    Shared by get_drawing_layout and verify_drawing so the two can never
+    disagree about where a view is.
+    """
+    config = config or ad.SheetConfig()
+    sheets = []
+    for sheet_name in _sheet_names(doc):
+        sheet, views = _sheet_and_views(doc, sheet_name)
+        props = _sheet_properties(sheet)
+        width_mm, height_mm = ad.mm(props["width_m"]), ad.mm(props["height_m"])
+        usable = config.usable_area(width_mm, height_mm)
+        title_block = config.title_block_box(width_mm, height_mm)
+        view_dicts = []
+        for view in views:
+            name = _view_name(view)
+            try:
+                outline_m = _view_outline_m(view)
+            except Exception:
+                log.warning("No outline for view %r", name, exc_info=True)
+                continue
+            ratio = _view_scale_ratio(view)
+            entry = {
+                "name": name,
+                "outline_mm": [ad.mm(c) for c in outline_m],
+                "center_mm": [ad.mm(c) for c in _view_position_m(view)],
+                "scale": ad.format_scale(*ratio),
+                "scale_ratio": ratio,
+                "scale_is_normalized": ad.is_normalized_scale(*ratio),
+            }
+            size = ad.box_size(entry["outline_mm"])
+            entry["size_mm"] = [round(s, 3) for s in size]
+            for attribute, key in (("Type", "type"),
+                                   ("GetReferencedModelName", "model"),
+                                   ("ReferencedConfiguration", "configuration")):
+                try:
+                    entry[key] = _com_member(view, attribute)
+                    if entry[key] is not None and key != "type":
+                        entry[key] = str(entry[key])
+                except Exception:
+                    entry[key] = None
+            view_dicts.append(entry)
+        sheets.append({
+            "name": sheet_name,
+            "format": ad.identify_format(width_mm, height_mm),
+            "size_mm": [width_mm, height_mm],
+            "sheet_scale": ad.format_scale(*props["sheet_scale"]),
+            "projection": "first_angle" if props["first_angle"] else "third_angle",
+            "usable_area_mm": usable,
+            "title_block_mm": title_block,
+            "views": view_dicts,
+            "issues": ad.check_sheet_layout(view_dicts, usable, title_block, config),
+        })
+    return {"drawing": _doc_title(doc), "sheets": sheets}
+
+
+@mcp.tool()
+async def get_drawing_layout() -> dict:
+    """Describe every sheet of the active drawing as data.
+
+    Returns, per sheet: paper format and size in mm, sheet scale, projection
+    angle (first/third), the usable area inside the margins, the title-block
+    rectangle, and every view with its name, referenced model and
+    configuration, effective scale, centre and outline in mm. Layout problems
+    already found (views overlapping, a view outside the usable area or over
+    the title block, a scale that is not on the normalised series) come back
+    in each sheet's `issues`.
+
+    Call this BEFORE positioning a view or placing a dimension: the view
+    names it returns are what every other drawing tool takes, and the
+    outlines are what makes a sheet coordinate meaningful."""
+
+    def _impl():
+        return _layout_dict(_active_drawing())
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def get_view_entities(view_name: str, kinds: str = "line,circle,arc",
+                            min_length_mm: float = 0.0,
+                            max_results: int = 200) -> dict:
+    """List the visible edges of a drawing view, each with a stable ID.
+
+    kinds: comma-separated subset of line, circle, arc.
+    min_length_mm filters out detail edges (chamfer run-outs, fillet blends).
+
+    Every entity comes back with sheet coordinates (what a click would
+    target), the true MODEL length or diameter in mm (what a dimension will
+    read), its orientation, and an ID of the form "<view>#E<n>". Pass those
+    IDs to dimension_by_entity_ids instead of guessing sheet coordinates.
+
+    IDs stay valid until the drawing is rebuilt. If the drawing changes, call
+    this again -- an expired ID is refused, never silently resolved.
+
+    For a view with hundreds of edges, a summary is returned instead of the
+    full list once max_results is exceeded; narrow it with kinds and
+    min_length_mm."""
+
+    def _impl():
+        wanted = {k.strip().lower() for k in kinds.split(",") if k.strip()}
+        unknown = wanted - {"line", "circle", "arc"}
+        if unknown:
+            raise ValueError(
+                f"Unknown entity kind(s): {', '.join(sorted(unknown))}. "
+                f"Use line, circle and/or arc."
+            )
+        doc = _active_drawing()
+        view = _find_view(doc, view_name)
+        entities = _read_view_entities(doc, view, view_name)
+        selected = [
+            e for e in entities
+            if e.kind in wanted
+            and (e.model_length is None
+                 or ad.mm(e.model_length) >= min_length_mm)
+        ]
+        result = {
+            "view": view_name,
+            "total_visible": len(entities),
+            "matched": len(selected),
+            "ids_valid_until": "the next rebuild of this drawing",
+        }
+        counts: dict = {}
+        for e in selected:
+            counts[e.kind] = counts.get(e.kind, 0) + 1
+        result["counts_by_kind"] = counts
+        if len(selected) > max_results:
+            diameters = sorted({e.as_dict().get("diameter_model_mm")
+                                for e in selected if e.kind == "circle"})
+            result["truncated"] = True
+            result["summary"] = (
+                f"{len(selected)} entities matched, more than max_results="
+                f"{max_results}. Hole diameters present: "
+                f"{', '.join(f'{d:g}' for d in diameters) if diameters else 'none'}. "
+                f"Raise min_length_mm or narrow kinds."
+            )
+            result["entities"] = [e.as_dict() for e in selected[:max_results]]
+        else:
+            result["truncated"] = False
+            result["entities"] = [e.as_dict() for e in selected]
+        return result
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def get_view_dimensions(view_name: str) -> dict:
+    """List the dimensions already shown in a drawing view.
+
+    Each dimension comes back with its MEASURED value (mm, or degrees for an
+    angular one), its type code, whether it is driven, the sheet position of
+    its text, which registered entity IDs it is attached to, and whether it
+    has come adrift from the model (dangling).
+
+    Use it to find out what is already dimensioned before adding more, to
+    catch duplicates, and to confirm that a dimension measures what was
+    intended. Entity IDs resolve only for entities read by get_view_entities
+    in this session; others show as "unregistered"."""
+
+    def _impl():
+        doc = _active_drawing()
+        view = _find_view(doc, view_name)
+        dimensions = _read_view_dimensions(doc, view, view_name)
+        return {"view": view_name, "count": len(dimensions),
+                "dimensions": dimensions}
+
+    return await _run(_impl)
+
+
+def _add_dimension_at(doc, px_m: float, py_m: float):
+    """AddDimension2 with the modal value box disabled.
+
+    Left enabled, SolidWorks pops a "Modify" box on creation and the COM call
+    never returns -- the tool just times out. add_sketch_dimension already
+    guards this; the drawing path did not.
+    """
+    app = _connect()
+    original = None
+    try:
+        original = bool(app.GetUserPreferenceToggle(_INPUT_DIM_VAL_ON_CREATE))
+        app.SetUserPreferenceToggle(_INPUT_DIM_VAL_ON_CREATE, False)
+    except Exception:
+        log.warning("Could not disable swInputDimValOnCreate; a modal dialog "
+                    "may block this call", exc_info=True)
+    try:
+        return doc.AddDimension2(px_m, py_m, 0)
+    finally:
+        if original is not None:
+            try:
+                app.SetUserPreferenceToggle(_INPUT_DIM_VAL_ON_CREATE, original)
+            except Exception:
+                log.warning("Could not restore swInputDimValOnCreate",
+                            exc_info=True)
+
+
+def _measure_display_dimension(display, view_name: str, index_hint: int = 1) -> dict:
+    """Read back what a freshly created dimension actually measures."""
+    display = win32com.client.Dispatch(display)
+    out = {"id": f"{view_name}#D{index_hint}"}
+    dimension = win32com.client.Dispatch(_com_member(display, "GetDimension2", 0))
+    value, unit = _read_dimension_value(dimension)
+    try:
+        dim_type = int(_com_member(display, "Type2"))
+    except Exception:
+        dim_type = None
+    out.update({
+        "name": str(_com_member(dimension, "FullName")),
+        "type_code": dim_type,
+        "unit": unit,
+        "value": value,
+    })
+    try:
+        annotation = win32com.client.Dispatch(_com_member(display, "GetAnnotation"))
+        attached = _com_member(annotation, "GetAttachedEntities3") or ()
+        out["attached_count"] = sum(1 for e in attached if e is not None)
+        position = tuple(_com_member(annotation, "GetPosition") or ())
+        out["text_position_mm"] = [ad.mm(c) for c in position[:2]]
+    except Exception:
+        log.warning("Could not read the new dimension's attachments",
+                    exc_info=True)
+        out["attached_count"] = None
+    return out
+
+
+@mcp.tool()
+async def dimension_by_entity_ids(entity_ids: list[str], side: str = "auto",
+                                  expected_mm: Optional[float] = None,
+                                  tolerance_mm: float = 0.5,
+                                  place_x: Optional[float] = None,
+                                  place_y: Optional[float] = None,
+                                  unit: Optional[str] = None) -> dict:
+    """Dimension one or two entities by the IDs from get_view_entities.
+
+    One ID gives that entity's own measure (an edge's length, a circle's
+    diameter); two IDs give the distance between them. Both must be in the
+    same view.
+
+    side places the text outside the view: above, below, left, right, or
+    "auto" to follow drawing convention (horizontal measures above/below,
+    vertical ones left/right, each to the nearer outside). place_x/place_y
+    override it with explicit sheet coordinates.
+
+    expected_mm turns the call into an assertion. Pass the value the model is
+    supposed to have and the measured value is compared against it: if the
+    dimension landed on the wrong entity you get a critical E01 issue with
+    both numbers, instead of a success message. This is the single most
+    useful argument here -- use it whenever the intended value is known.
+
+    Returns the measured value, how many entities the dimension actually
+    attached to, where the text went, and an `issues` list."""
+
+    def _impl():
+        if not 1 <= len(entity_ids) <= 2:
+            raise ValueError(
+                f"Pass 1 or 2 entity IDs, got {len(entity_ids)}. One ID measures "
+                f"that entity; two measure the distance between them."
+            )
+        if side != "auto" and side not in ad.SIDES:
+            raise ValueError(
+                f"side must be 'auto' or one of {', '.join(ad.SIDES)}, got '{side}'."
+            )
+        doc = _active_drawing()
+        config = ad.SheetConfig()
+        doc_title = _doc_title(doc)
+        items = [_ENTITY_REGISTRY.resolve(doc_title, eid) for eid in entity_ids]
+        view_names = {item["view"] for item in items}
+        if len(view_names) > 1:
+            raise ValueError(
+                f"The entities are in different views ({', '.join(sorted(view_names))}); "
+                f"a dimension cannot span views."
+            )
+        view_name = items[0]["view"]
+        view = _find_view(doc, view_name)
+
+        try:
+            doc.ActivateView(view_name)
+        except Exception:
+            log.warning("ActivateView(%r) failed; continuing", view_name,
+                        exc_info=True)
+        doc.ClearSelection2(True)
+        for index, (entity_id, item) in enumerate(zip(entity_ids, items)):
+            if not view.SelectEntity(item["entity"], index > 0):
+                raise RuntimeError(
+                    f"SolidWorks refused to select {entity_id} in view "
+                    f"'{view_name}'. Re-read the view with get_view_entities."
+                )
+        # The bug this replaces: the second SelectByID2 was never checked, so
+        # a failed second pick silently became "length of the first edge"
+        # reported as "distance between two points".
+        selected_count = doc.SelectionManager.GetSelectedObjectCount2(-1)
+        if selected_count != len(items):
+            doc.ClearSelection2(True)
+            raise RuntimeError(
+                f"Selection is inconsistent: SolidWorks holds {selected_count} "
+                f"entities, {len(items)} were selected. Aborting rather than "
+                f"creating a dimension on the wrong geometry."
+            )
+
+        outline_m = _view_outline_m(view)
+        if place_x is not None and place_y is not None:
+            px_m, py_m = to_meters(place_x, unit), to_meters(place_y, unit)
+            chosen_side = "explicit"
+        else:
+            edges = _read_view_entities(doc, view, view_name, register=False)
+            reference = next((e for e in edges if e.kind == items[0]["kind"]), None)
+            chosen_side = side
+            if side == "auto":
+                chosen_side = (ad.side_for_edge(reference, outline_m)
+                               if reference is not None else "above")
+            px_m, py_m = ad.place_dimension_text(
+                outline_m, chosen_side, ad.to_m(config.dim_offset_mm))
+
+        display = _add_dimension_at(doc, px_m, py_m)
+        if display is None:
+            doc.ClearSelection2(True)
+            raise RuntimeError(
+                "AddDimension2 created no dimension for the selected entities. "
+                "The pair may not be dimensionable (for example two skew edges)."
+            )
+        measured = _measure_display_dimension(display, view_name)
+        doc.ClearSelection2(True)
+
+        issues = ad.check_measured_value(
+            measured["value"],
+            expected_mm=expected_mm,
+            tolerance_mm=tolerance_mm,
+            attached_count=measured.get("attached_count"),
+            expected_attachments=len(items),
+            ref=measured["id"],
+        )
+        return {
+            "ok": not any(i["severity"] == "critical" for i in issues),
+            "view": view_name,
+            "entity_ids": list(entity_ids),
+            "value": measured["value"],
+            "unit": measured["unit"],
+            "expected_mm": expected_mm,
+            "attached_count": measured.get("attached_count"),
+            "side": chosen_side,
+            "text_position_mm": measured.get(
+                "text_position_mm", [ad.mm(px_m), ad.mm(py_m)]),
+            "issues": issues,
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def verify_drawing(require_hole_dimensions: bool = True,
+                         require_overall_extents: bool = True,
+                         require_cut_angles: bool = True,
+                         min_edge_length_mm: float = 3.0) -> dict:
+    """Check the active drawing and return every problem found. Read-only.
+
+    Runs the full set of detectors: views overlapping (E06), a view outside
+    the usable area or over the title block (E07), a scale that is not on the
+    normalised series (E08), holes and overall extents with no dimension
+    (E02), duplicate dimensions (E03), dimension text at the sheet origin or
+    sitting on another view (E05), and dangling dimensions (E16).
+
+    Each issue carries a code, a severity (critical/warning/info), a message
+    and the view, entity or dimension IDs it refers to -- so a finding turns
+    straight into the next action.
+
+    Call this before telling anyone a drawing is finished. `status` is
+    "approved" only when nothing was found."""
+
+    def _impl():
+        doc = _active_drawing()
+        config = ad.SheetConfig()
+        rules = ad.CoverageRules(
+            require_overall_extents=require_overall_extents,
+            require_hole_diameters=require_hole_dimensions,
+            require_cut_angles=require_cut_angles,
+            min_edge_length_mm=min_edge_length_mm,
+        )
+        layout = _layout_dict(doc, config)
+        issues = [i for sheet in layout["sheets"] for i in sheet["issues"]]
+        checked_views = []
+        for sheet in layout["sheets"]:
+            text_check_views = []
+            for view_entry in sheet["views"]:
+                view_name = view_entry["name"]
+                try:
+                    view = _find_view(doc, view_name)
+                    edges = _read_view_entities(doc, view, view_name)
+                    dimensions = _read_view_dimensions(doc, view, view_name)
+                except Exception as exc:
+                    issues.append(ad.issue(
+                        "E02", "warning",
+                        f"could not inspect view {view_name}: {exc}", view_name))
+                    continue
+                issues.extend(ad.check_dimension_coverage(
+                    view_name, edges, dimensions, rules))
+                text_check_views.append({
+                    "name": view_name,
+                    "outline_mm": view_entry["outline_mm"],
+                    "usable_area_mm": sheet["usable_area_mm"],
+                    "dimensions": dimensions,
+                })
+                checked_views.append({
+                    "view": view_name,
+                    "visible_edges": len(edges),
+                    "dimensions": len(dimensions),
+                })
+            issues.extend(ad.check_text_positions(text_check_views, config))
+        return {
+            "status": ad.worst_status(issues),
+            "count": len(issues),
+            "critical": sum(1 for i in issues if i["severity"] == "critical"),
+            "warnings": sum(1 for i in issues if i["severity"] == "warning"),
+            "views_checked": checked_views,
+            "issues": issues,
+        }
+
+    return await _run(_impl)
 
 
 @mcp.tool()
@@ -5261,49 +6639,109 @@ async def insert_auxiliary_view(
 async def add_drawing_dimension(
     x1: float, y1: float,
     x2: Optional[float] = None, y2: Optional[float] = None,
-    place_x: float = 0, place_y: float = 0,
+    place_x: Optional[float] = None, place_y: Optional[float] = None,
+    expected_mm: Optional[float] = None,
+    tolerance_mm: float = 0.5,
     unit: Optional[str] = None,
 ) -> dict:
-    """Add a dimension to the active drawing between one or two selected entities.
+    """Add a dimension to the active drawing, picking entities by sheet point.
 
-    Select an entity (edge/vertex) near (x1,y1), optionally a second near (x2,y2),
-    then place the dimension text at (place_x, place_y). For a single edge, this
-    gives its length; for two entities, the distance between them.
+    Resolves (x1,y1) -- and (x2,y2) if given -- to real drawing entities in
+    the view that CONTAINS each point, selects them as objects, and returns
+    the value SolidWorks actually measured.
 
-    All coordinates are drawing-sheet coordinates."""
+    A point inside a hole selects that hole. An ambiguous point (two entities
+    equally close) is refused with the candidate IDs rather than resolved by
+    luck. If place_x/place_y are omitted the text goes just outside the view,
+    never to the sheet origin.
+
+    expected_mm turns the call into an assertion: pass the intended value and
+    a mismatch comes back as a critical E01 issue with both numbers.
+
+    Prefer dimension_by_entity_ids: get_view_entities gives IDs and true
+    model lengths, so there is nothing left to estimate. This tool stays for
+    the case where only a sheet position is known."""
 
     def _impl():
         doc = _active_drawing()
+        config = ad.SheetConfig()
         doc.ClearSelection2(True)
 
         x1_m, y1_m = to_meters(x1, unit), to_meters(y1, unit)
-        empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+        view, view_name, first_edge = _select_drawing_edge_near(doc, x1_m, y1_m)
+        picked = [first_edge]
 
-        selected = False
-        for seltype in ("EDGE", "VERTEX", "SILHOUETTE"):
-            if doc.Extension.SelectByID2("", seltype, x1_m, y1_m, 0, False, 0, empty, 0):
-                selected = True
-                break
-        if not selected:
-            raise RuntimeError(f"No dimensionable entity found near ({x1}, {y1}).")
-
+        if (x2 is None) != (y2 is None):
+            raise ValueError(
+                "Give both x2 and y2 for a two-entity dimension, or neither."
+            )
         if x2 is not None and y2 is not None:
             x2_m, y2_m = to_meters(x2, unit), to_meters(y2, unit)
-            for seltype in ("EDGE", "VERTEX", "SILHOUETTE"):
-                if doc.Extension.SelectByID2("", seltype, x2_m, y2_m, 0, True, 0, empty, 0):
-                    break
+            second_view, second_name = _find_view_for_point(doc, x2_m, y2_m)
+            if second_name != view_name:
+                doc.ClearSelection2(True)
+                raise RuntimeError(
+                    f"({x1}, {y1}) is in view '{view_name}' but ({x2}, {y2}) is in "
+                    f"'{second_name}'. A dimension cannot span two views."
+                )
+            # Appending, and checked -- the unchecked second selection is what
+            # used to turn "distance between two points" into "length of one
+            # edge" with a success message.
+            _view, _name, second_edge = _select_drawing_edge_near(
+                doc, x2_m, y2_m, append=True, view=view, view_name=view_name)
+            if second_edge.id == first_edge.id:
+                doc.ClearSelection2(True)
+                raise RuntimeError(
+                    f"Both points resolved to the same entity ({first_edge.id}). "
+                    f"For a distance, aim at two different entities."
+                )
+            picked.append(second_edge)
+            selected_count = doc.SelectionManager.GetSelectedObjectCount2(-1)
+            if selected_count != 2:
+                doc.ClearSelection2(True)
+                raise RuntimeError(
+                    f"SolidWorks holds {selected_count} entities after selecting 2. "
+                    f"Aborting rather than dimensioning the wrong geometry."
+                )
 
-        px_m, py_m = to_meters(place_x, unit), to_meters(place_y, unit)
-        dim = doc.AddDimension2(px_m, py_m, 0)
-        if dim is None:
-            raise RuntimeError("Failed to add drawing dimension. Check the selected entities.")
+        outline_m = _view_outline_m(view)
+        if place_x is not None and place_y is not None:
+            px_m, py_m = to_meters(place_x, unit), to_meters(place_y, unit)
+            chosen_side = "explicit"
+        else:
+            chosen_side = ad.side_for_edge(first_edge, outline_m)
+            px_m, py_m = ad.place_dimension_text(
+                outline_m, chosen_side, ad.to_m(config.dim_offset_mm))
 
+        display = _add_dimension_at(doc, px_m, py_m)
+        if display is None:
+            doc.ClearSelection2(True)
+            raise RuntimeError(
+                "AddDimension2 created no dimension for the selected entities."
+            )
+        measured = _measure_display_dimension(display, view_name)
         doc.ClearSelection2(True)
+
+        issues = ad.check_measured_value(
+            measured["value"],
+            expected_mm=expected_mm,
+            tolerance_mm=tolerance_mm,
+            attached_count=measured.get("attached_count"),
+            expected_attachments=len(picked),
+            ref=measured["id"],
+        )
         return {
-            "from": [x1, y1],
-            "to": [x2, y2] if x2 is not None else None,
-            "placed_at": [place_x, place_y],
-            "unit": unit or _default_unit,
+            "ok": not any(i["severity"] == "critical" for i in issues),
+            "view": view_name,
+            "entity_ids": [e.id for e in picked],
+            "value": measured["value"],
+            "unit": measured["unit"],
+            "expected_mm": expected_mm,
+            "attached_count": measured.get("attached_count"),
+            "side": chosen_side,
+            "text_position_mm": measured.get(
+                "text_position_mm", [ad.mm(px_m), ad.mm(py_m)]),
+            "issues": issues,
         }
 
     return await _run(_impl)
@@ -5434,7 +6872,7 @@ async def add_weld_symbol(
         if symbol is None:
             raise ValueError(f"Unsupported weld_type '{weld_type}'. Use: {', '.join(symbols)}.")
 
-        source_view = _select_drawing_edge_near(doc, x_m, y_m)
+        source_view, _sel_view_name, _sel_edge = _select_drawing_edge_near(doc, x_m, y_m)
         before = source_view.GetWeldSymbolCount
         if callable(before):
             before = before()
@@ -6411,6 +7849,145 @@ async def create_assembly_pattern(
 # Material & Appearance tools
 # ===========================================================================
 
+# SolidWorks stores a material library as XML with physical properties under
+# <physicalproperties>, keyed by the finite-element short names rather than by
+# readable labels: DENS is density in kg/m3, SIGYLD yield strength in Pa.
+_MATERIAL_PROPERTY_KEYS = {
+    "DENS": ("density_kg_m3", 1.0),
+    "EX": ("elastic_modulus_pa", 1.0),
+    "NUXY": ("poisson_ratio", 1.0),
+    "SIGYLD": ("yield_strength_pa", 1.0),
+    "SIGXT": ("tensile_strength_pa", 1.0),
+    "ALPX": ("thermal_expansion_per_k", 1.0),
+    "KX": ("thermal_conductivity_w_mk", 1.0),
+    "C": ("specific_heat_j_kgk", 1.0),
+}
+
+_material_library_cache: dict = {}
+
+
+def _read_material_library(database_path: str) -> dict:
+    """Parse a .sldmat into {material name: {property: value}}.
+
+    Reading the library directly is the only way this server can state a
+    density it has actually verified: IPartDoc.SetMaterialPropertyName2 is
+    silently ineffective on some builds (see set_material), and a mass that
+    is wrong without an error is the worst outcome for a BOM.
+    """
+    cached = _material_library_cache.get(database_path)
+    if cached is not None:
+        return cached
+    import xml.etree.ElementTree as ElementTree
+
+    try:
+        root = ElementTree.parse(database_path).getroot()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not read the material library {database_path}: {exc}"
+        ) from exc
+
+    materials: dict = {}
+    for element in root.iter("material"):
+        name = element.get("name")
+        if not name:
+            continue
+        entry: dict = {"name": name, "matid": element.get("matid")}
+        for properties in element.iter("physicalproperties"):
+            for child in properties:
+                mapped = _MATERIAL_PROPERTY_KEYS.get(child.tag.upper())
+                if mapped is None:
+                    continue
+                key, factor = mapped
+                try:
+                    entry[key] = float(child.get("value")) * factor
+                except (TypeError, ValueError):
+                    continue
+        materials[name] = entry
+    _material_library_cache[database_path] = materials
+    return materials
+
+
+def _library_density(material: str, database_path: str):
+    """Density of one material straight from the library file, or None."""
+    try:
+        entry = _read_material_library(database_path).get(material)
+    except Exception:
+        return None
+    return (entry or {}).get("density_kg_m3")
+
+
+def _document_density(doc):
+    """Density (kg/m3) the document is currently computing mass with.
+
+    Derived from mass/volume rather than read from a property, because that
+    is the number the BOM will actually use and it cannot be faked by a
+    material name that was stored without taking effect.
+    """
+    try:
+        status = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+        props = doc.Extension.GetMassProperties2(1, status, False)
+        if props and len(props) > 5 and props[3]:
+            return props[5] / props[3]
+    except Exception:
+        log.debug("Could not compute the document density", exc_info=True)
+    return None
+
+
+@mcp.tool()
+async def lookup_material_properties(material: str = "",
+                                     database: str = "SOLIDWORKS Materials",
+                                     search: str = "") -> dict:
+    """Read a material's real physical properties from the SolidWorks library.
+
+    Returns density (kg/m3), elastic modulus, Poisson's ratio, yield and
+    tensile strength, and thermal properties, parsed from the .sldmat file
+    itself -- so the numbers are the library's, not an estimate.
+
+    material: exact name, e.g. "Alloy Steel", "AISI 304", "6061 Alloy".
+    search: instead of an exact name, list every material whose name contains
+            this text. Use it to find the exact spelling.
+    database: library name ("SOLIDWORKS Materials") or a full .sldmat path.
+
+    Use this to compute a weight that does not depend on the part's assigned
+    material -- necessary while set_material cannot apply a density on this
+    SolidWorks build -- and for hand calculations (yield strength for a
+    stress check, density for a weight estimate). Read-only; it touches no
+    document."""
+
+    def _impl():
+        database_path = _resolve_material_database_path(database)
+        if not os.path.isfile(database_path):
+            raise RuntimeError(
+                f"Could not resolve material database '{database}' to a "
+                f".sldmat file (tried: {database_path})."
+            )
+        materials = _read_material_library(database_path)
+        if search:
+            needle = search.lower()
+            matches = sorted(n for n in materials if needle in n.lower())
+            return {"database": database_path, "search": search,
+                    "match_count": len(matches),
+                    "matches": [materials[n] for n in matches[:50]],
+                    "truncated": len(matches) > 50}
+        if not material:
+            return {"database": database_path,
+                    "material_count": len(materials),
+                    "names": sorted(materials)[:200],
+                    "hint": "pass material= for one material, or search= to filter"}
+        entry = materials.get(material)
+        if entry is None:
+            needle = material.lower()
+            close = sorted(n for n in materials if needle in n.lower())[:10]
+            raise ValueError(
+                f"No material named '{material}' in {os.path.basename(database_path)}. "
+                + (f"Did you mean: {', '.join(close)}?" if close
+                   else "Use search= to list candidates.")
+            )
+        return {"database": database_path, **entry}
+
+    return await _run(_impl)
+
+
 @mcp.tool()
 async def set_material(
     material: str = "AISI 1020",
@@ -6505,20 +8082,69 @@ async def set_material(
                     "the SolidWorks material library exactly (case-sensitive)."
                 )
 
-        # Belt-and-braces: read the material back and confirm it actually
-        # stuck, instead of trusting an API that is proven to accept wrong
-        # arguments without complaint. Density-based mass is the ultimate
-        # proof, but reading the name back is cheap and catches this class
-        # of bug immediately rather than only when someone cross-checks mass.
-        applied = _native_material_name(doc, config_name)
-        if applied != material:
+        # Verify by DENSITY, which is the number the BOM uses and the only
+        # witness that cannot be faked. The previous check compared the
+        # material NAME read back from GetMaterialPropertyName2; that is
+        # weaker, and on this build the name reads back as "" even when the
+        # call reported no error, so the message blamed the wrong thing.
+        expected_density = _library_density(material, resolved_database)
+        actual_density = _document_density(doc)
+        applied_name = _native_material_name(doc, config_name)
+
+        result = {
+            "material": material,
+            "database": resolved_database,
+            "expected_density_kg_m3": expected_density,
+            "document_density_kg_m3": (round(actual_density, 3)
+                                       if actual_density else None),
+            "material_name_read_back": applied_name,
+        }
+
+        if expected_density and actual_density:
+            if abs(actual_density - expected_density) <= max(1.0, expected_density * 0.01):
+                result["verified"] = "density matches the material library"
+                return result
+            # Exactly water means SolidWorks never picked up a density at all,
+            # which is the documented failure mode here -- distinguish it from
+            # "some other material is applied" so the message is actionable.
+            looks_like_water = abs(actual_density - 1000.0) < 1.0
             raise RuntimeError(
-                f"SetMaterialPropertyName2 reported no error, but the document's "
-                f"material reads back as {applied!r}, not {material!r}. The "
-                f"assignment did not actually take effect."
+                f"set_material did not take effect. SolidWorks raised no error, "
+                f"but the part still computes mass at "
+                f"{actual_density:.1f} kg/m3"
+                + (" (water, i.e. no material density at all)" if looks_like_water else "")
+                + f", while '{material}' is {expected_density:.1f} kg/m3 in "
+                f"{os.path.basename(resolved_database)}.\n\n"
+                f"IPartDoc.SetMaterialPropertyName2 has been confirmed silently "
+                f"ineffective on this SolidWorks build: five documented argument "
+                f"orders were tried live and none changed the density. Until that "
+                f"is resolved:\n"
+                f"  - apply the material by hand in SolidWorks (right-click "
+                f"Material in the feature tree, Edit Material), or\n"
+                f"  - compute weight as volume x density, taking the density "
+                f"from lookup_material_properties('{material}').\n"
+                f"Do NOT trust measure_body's mass_kg on a part whose material "
+                f"was set through this tool."
             )
 
-        return {"material": material, "database": resolved_database}
+        # Without a library density there is nothing to verify against, so say
+        # so rather than implying success.
+        if expected_density is None:
+            result["verified"] = (
+                f"could not find '{material}' in "
+                f"{os.path.basename(resolved_database)} to check its density; "
+                f"the assignment was not verified"
+            )
+        else:
+            result["verified"] = (
+                "could not read the document's density; the assignment was not "
+                "verified"
+            )
+        result["warning"] = (
+            "unverified material assignment -- check mass_kg against "
+            "lookup_material_properties before using it in a BOM"
+        )
+        return result
 
     return await _run(_impl)
 
@@ -8051,59 +9677,95 @@ def _measure_model_doc(doc, factor: float) -> dict:
     """
     result = {}
 
+    # CreateMassProperty was effectively dead code: dynamic IDispatch exposes
+    # it as an already-evaluated property, so `doc.Extension.CreateMassProperty()`
+    # raised DISP_E_MEMBERNOTFOUND every time and the GetMassProperties2
+    # fallback below did all the work -- confirmed live, 2026-10-04. Going
+    # through _com_member makes the primary path work, which matters because
+    # IMassProperty is the only one that reports Density.
     try:
-        mp = doc.Extension.CreateMassProperty()
+        mp = _com_member(doc.Extension, "CreateMassProperty")
         if mp is not None:
             mp = win32com.client.Dispatch(mp)
+            for member, key in (("Mass", "mass_kg"), ("Volume", "volume_m3"),
+                                ("SurfaceArea", "surface_area_m2"),
+                                ("Density", "density_kg_m3")):
+                try:
+                    result[key] = _com_member(mp, member)
+                except Exception:
+                    log.debug("IMassProperty.%s unavailable", member, exc_info=True)
             try:
-                result["mass_kg"] = mp.Mass
-            except Exception:
-                pass
-            try:
-                result["volume_m3"] = mp.Volume
-            except Exception:
-                pass
-            try:
-                result["surface_area_m2"] = mp.SurfaceArea
-            except Exception:
-                pass
-            try:
-                com = mp.CenterOfMass
+                com = _com_member(mp, "CenterOfMass")
                 if com:
                     result["center_of_mass_m"] = list(com)
             except Exception:
-                pass
+                log.debug("IMassProperty.CenterOfMass unavailable", exc_info=True)
     except Exception:
-        log.debug("CreateMassProperty failed, trying GetMassProperties")
+        log.debug("CreateMassProperty unavailable, using GetMassProperties2",
+                  exc_info=True)
+
+    if "mass_kg" not in result or "volume_m3" not in result:
         try:
             status = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
             props = doc.Extension.GetMassProperties2(1, status, False)
-            if props:
-                result["center_of_mass_m"] = [props[0], props[1], props[2]]
-                result["volume_m3"] = props[3]
-                result["surface_area_m2"] = props[4]
-                result["mass_kg"] = props[5]
+            if props and len(props) > 5:
+                result.setdefault("center_of_mass_m", [props[0], props[1], props[2]])
+                result.setdefault("volume_m3", props[3])
+                result.setdefault("surface_area_m2", props[4])
+                result.setdefault("mass_kg", props[5])
         except Exception:
-            pass
+            log.debug("GetMassProperties2 also failed", exc_info=True)
 
-    bodies = doc.GetBodies2(0, True)
-    if bodies:
+    # A part with no material computes mass at water density, and a mass that
+    # is wrong without an error is exactly what makes a BOM untrustworthy.
+    # Say so in the result instead of leaving the caller to notice.
+    mass, volume = result.get("mass_kg"), result.get("volume_m3")
+    if mass is not None and volume:
+        density = mass / volume
+        result["density_kg_m3"] = round(density, 3)
+        if abs(density - 1000.0) < 1.0:
+            result["density_warning"] = (
+                "mass is being computed at 1000 kg/m3 (water): this part has no "
+                "effective material density, so mass_kg is NOT a real weight. "
+                "Assign the material by hand in SolidWorks, or compute the "
+                "weight as volume_m3 x density from lookup_material_properties."
+            )
+
+    # Union the boxes of EVERY body, not just bodies[0]. A weldment -- the
+    # typical structural part -- is multibody by construction, so measuring
+    # the first body alone reported the size of one member as the size of the
+    # whole frame, and the error was invisible because the number looked
+    # plausible.
+    bodies = doc.GetBodies2(0, True) or ()
+    boxes = []
+    for raw_body in bodies:
         try:
-            body = win32com.client.Dispatch(bodies[0])
-            box = body.GetBodyBox()
-            if box:
-                result["bounding_box"] = {
-                    "min_m": [box[0], box[1], box[2]],
-                    "max_m": [box[3], box[4], box[5]],
-                    "size": {
-                        "x": round(abs(box[3] - box[0]) * factor, 4),
-                        "y": round(abs(box[4] - box[1]) * factor, 4),
-                        "z": round(abs(box[5] - box[2]) * factor, 4),
-                        "unit": _default_unit,
-                    },
-                }
+            box = win32com.client.Dispatch(raw_body).GetBodyBox()
+            if box and len(box) >= 6:
+                boxes.append(tuple(float(c) for c in box[:6]))
         except Exception:
-            pass
+            log.debug("GetBodyBox failed for one body; it is left out of the "
+                      "bounding box", exc_info=True)
+    if boxes:
+        low = [min(b[i] for b in boxes) for i in range(3)]
+        high = [max(b[i + 3] for b in boxes) for i in range(3)]
+        result["body_count"] = len(bodies)
+        result["bounding_box"] = {
+            "min_m": low,
+            "max_m": high,
+            "bodies_measured": len(boxes),
+            "size": {
+                "x": round(abs(high[0] - low[0]) * factor, 4),
+                "y": round(abs(high[1] - low[1]) * factor, 4),
+                "z": round(abs(high[2] - low[2]) * factor, 4),
+                "unit": _default_unit,
+            },
+        }
+        if len(boxes) != len(bodies):
+            result["bounding_box"]["warning"] = (
+                f"{len(bodies) - len(boxes)} of {len(bodies)} bodies did not "
+                f"report a bounding box; the extents below exclude them."
+            )
 
     if not result:
         raise RuntimeError(
@@ -8700,16 +10362,26 @@ async def list_equations() -> dict:
 
 @mcp.tool()
 async def add_equation(equation: str, solve: bool = True) -> dict:
-    """Add an equation or global variable, e.g. ``\"Length\" = 25mm``."""
+    """Add an equation or global variable, e.g. ``\"Length\" = 25mm``.
+
+    solve=False adds the equation without evaluating it, so several can be
+    added before one rebuild. Use list_equations or rebuild_model afterwards
+    to apply them."""
 
     def _impl():
         manager = _equation_manager(_active_doc())
         index = int(manager.Add2(-1, equation, bool(solve)))
         if index < 0:
             raise RuntimeError(f"SolidWorks rejected equation: {equation}")
-        if not solve:
-            _evaluate_equations(manager)
-        return {"index": index, "equation": manager.Equation(index), "solved": solve}
+        # IEquationMgr.Add2 already honours its third argument, so the only
+        # thing an extra EvaluateAll can do is evaluate when the caller asked
+        # NOT to. The condition here used to be `if not solve`, i.e. exactly
+        # backwards: solve=False added the equation and then evaluated it
+        # anyway, while the return still reported "solved": False.
+        evaluation_result = _evaluate_equations(manager) if solve else None
+        return {"index": index, "equation": manager.Equation(index),
+                "value": manager.Value(index), "solved": bool(solve),
+                "evaluation_result": evaluation_result}
 
     return await _run(_impl)
 
@@ -8884,14 +10556,54 @@ async def pack_and_go(
             os.path.dirname(destination_path) or ".",
             f".{os.path.splitext(os.path.basename(destination_path))[0]}_staging",
         )
+        # This fallback copies files with shutil; it does NOT rewrite the
+        # references inside an assembly. Renaming a part while the assembly
+        # still points at the old name produces a copy that opens with
+        # missing references -- worse than no copy at all, and the process
+        # rule is "always make a working copy". So refuse the rename here
+        # rather than produce a broken package.
+        if prefix or suffix:
+            raise RuntimeError(
+                "Native Pack and Go failed and the fallback cannot apply a "
+                f"prefix/suffix: renaming files without rewriting the "
+                f"assembly's internal references produces a copy with missing "
+                f"references. Retry without prefix/suffix, or fix the native "
+                f"Pack and Go error first: {native_error}"
+            )
+
         os.makedirs(staging_dir, exist_ok=True)
         copied = []
+        collisions = []
+        used_names: dict = {}
         for original in dependency_paths:
             filename = os.path.basename(original)
-            target_name = f"{prefix}{os.path.splitext(filename)[0]}{suffix}{os.path.splitext(filename)[1]}"
+            stem, extension = os.path.splitext(filename)
+            target_name = f"{stem}{extension}"
+            # Two parts of the same name from different folders used to
+            # overwrite each other silently, in both the flattened and the
+            # models/ layout, because the destination name was just the
+            # basename. Disambiguate instead.
+            key = target_name.lower()
+            if key in used_names:
+                index = 2
+                while f"{stem}_{index}{extension}".lower() in used_names:
+                    index += 1
+                target_name = f"{stem}_{index}{extension}"
+                collisions.append({
+                    "original": original,
+                    "clashed_with": used_names[key],
+                    "renamed_to": target_name,
+                })
+            used_names[target_name.lower()] = original
+
             relative_target = target_name if flatten_to_single_folder else os.path.join("models", target_name)
             target = os.path.join(staging_dir, relative_target)
             os.makedirs(os.path.dirname(target), exist_ok=True)
+            if os.path.exists(target):
+                raise RuntimeError(
+                    f"Refusing to overwrite an existing file in the package: "
+                    f"{target}. Choose an empty destination."
+                )
             shutil.copy2(original, target)
             copied.append(relative_target)
         if is_zip:
@@ -8901,14 +10613,30 @@ async def pack_and_go(
             shutil.rmtree(staging_dir, ignore_errors=True)
         if not copied or (is_zip and not os.path.isfile(destination_path)):
             raise RuntimeError("The managed packaging fallback did not create output files.")
-        return {
+        result = {
             "destination": destination_path,
             "format": "zip" if is_zip else "folder",
             "source_document_count": len(dependency_paths),
+            "copied_file_count": len(copied),
             "copied_files": copied,
             "backend": "managed_dependency_fallback",
             "native_pack_and_go_error": native_error,
         }
+        if len(copied) != len(dependency_paths):
+            raise RuntimeError(
+                f"Packaged {len(copied)} of {len(dependency_paths)} dependencies; "
+                f"the package is incomplete."
+            )
+        if collisions:
+            result["name_collisions"] = collisions
+            result["warning"] = (
+                f"{len(collisions)} file(s) shared a name with another and were "
+                f"renamed to avoid overwriting. The copied assembly will report "
+                f"those as missing references, because this fallback does not "
+                f"rewrite internal references. Open it and repair the paths, or "
+                f"re-run once native Pack and Go works."
+            )
+        return result
 
     return await _run(_impl)
 
