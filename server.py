@@ -34,6 +34,11 @@ from mcp.server.fastmcp import FastMCP, Image
 from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
 from pydantic import ConfigDict
 
+# Drawing geometry, selection policy and verification rules. Kept in a
+# COM-free module so the whole of it is testable under pytest without
+# SolidWorks open -- see tests/test_alfa_drawing.py.
+import alfa_drawing as ad
+
 # Reject unknown tool arguments instead of silently ignoring them. Without
 # this, FastMCP's default Pydantic config (extra="ignore") means a caller
 # that misspells a parameter name (e.g. "x_center" instead of "cx") gets no
@@ -434,15 +439,28 @@ def _save_doc3(doc, options: int = 0):
     return bool(succeeded), errors, warnings
 
 
-def _com_member(obj, name):
+def _com_member(obj, name, *args):
     """Read a COM member that typed and dynamic dispatch expose differently.
 
     The same SolidWorks member arrives as a bound method under dynamic
     IDispatch and as a plain value under the generated type library, so the
     inspection tools normalize both shapes through here.
+
+    Dynamic dispatch can also hand back an already-evaluated object that is
+    still ``callable``; invoking it then raises "member not found" even though
+    the value itself is what was wanted. For a no-argument member that raise
+    is recoverable, so fall back to the value. With arguments it is not --
+    falling back would silently drop them -- so the error propagates.
     """
     value = getattr(obj, name)
-    return value() if callable(value) else value
+    if not callable(value):
+        return value
+    try:
+        return value(*args)
+    except Exception:
+        if args:
+            raise
+        return value
 
 
 def _doc_title(doc) -> str:
@@ -972,8 +990,24 @@ async def insert_drawing_view(source_filepath: str, view_type: str = "front",
                                x: float = 150, y: float = 150,
                                scale: float = 1.0, unit: Optional[str] = None) -> dict:
     """Insert a standard model view into the active drawing.
+
     view_type: front, back, left, right, top, bottom, isometric, trimetric, dimetric.
-    x/y is the position on the drawing sheet. scale is the view scale (e.g. 2 = 2:1)."""
+
+    x/y is the GEOMETRIC CENTRE of the view on the sheet, not its corner --
+    a view placed at (150, 150) extends half its width either side.
+
+    scale is the decimal ratio: 1 for 1:1, 2 for 2:1, 0.05 for 1:20. It is NOT
+    the denominator, so scale=20 means 20:1.
+
+    Returns the view's name (needed by every other drawing tool), its real
+    outline, size and centre in mm, the sheet format and usable area, and the
+    scale SolidWorks ACTUALLY applied -- which can differ from the one asked
+    for. `issues` reports a refused scale, a scale that is not on the
+    normalised series, and a view that does not fit the usable area, with the
+    normalised scale that would fit.
+
+    Call get_drawing_layout first on a sheet that already has views: two
+    inserts without explicit positions stack both views on the same centre."""
 
     def _impl():
         doc = _active_doc()
@@ -1029,13 +1063,85 @@ async def insert_drawing_view(source_filepath: str, view_type: str = "front",
                 f"Failed to insert {view_type} view of '{model_name}'. "
                 "Ensure the source document exists and contains geometry."
             )
+        view = win32com.client.Dispatch(view)
+        view_name = _view_name(view)
+
+        # The scale assignment used to sit in `try: ... except: pass`, and the
+        # return value echoed the REQUESTED scale either way. A refused
+        # assignment therefore produced a view at the sheet scale while the
+        # tool reported the scale asked for -- and every sheet coordinate
+        # computed from that number was wrong. Now the assignment is reported,
+        # and what comes back is the scale SolidWorks actually holds.
+        scale_applied, scale_error = True, None
         try:
-            view = win32com.client.Dispatch(view)
             view.ScaleRatio = (scale, 1.0)
+            # The API help for IView.ScaleRatio says to rebuild after changing
+            # it; without this the outline read below can still be the old one.
+            doc.EditRebuild3()
+        except Exception as exc:
+            scale_applied, scale_error = False, str(exc)
+            log.warning("Could not set the scale of view %r to %s: %s",
+                        view_name, scale, exc)
+
+        effective_ratio = _view_scale_ratio(view)
+        result = {
+            "view_name": view_name,
+            "view_type": view_type,
+            "source": source_filepath,
+            "position": [x, y],
+            "requested_scale": scale,
+            "effective_scale": ad.format_scale(*effective_ratio),
+            "effective_scale_ratio": list(effective_ratio),
+            "scale_applied": scale_applied,
+            "unit": unit or _default_unit,
+            "issues": [],
+        }
+        if scale_error:
+            result["scale_error"] = scale_error
+            result["issues"].append(ad.issue(
+                "E08", "critical",
+                f"the requested scale {scale:g}:1 was refused; the view is at "
+                f"{result['effective_scale']}", view_name))
+        if not ad.is_normalized_scale(*effective_ratio):
+            nearest = ad.nearest_normalized_scale(effective_ratio[0] / effective_ratio[1])
+            result["issues"].append(ad.issue(
+                "E08", "warning",
+                f"{result['effective_scale']} is not on the normalised series; "
+                f"nearest is {nearest[0]}:{nearest[1]}", view_name))
+
+        # The outline is what makes a later dimension or view placement
+        # meaningful; the old return had no way to tell whether the view even
+        # landed on the paper.
+        try:
+            outline_m = _view_outline_m(view)
+            result["outline_mm"] = [ad.mm(c) for c in outline_m]
+            result["size_mm"] = [round(s, 3) for s in ad.box_size(result["outline_mm"])]
+            result["center_mm"] = [ad.mm(c) for c in _view_position_m(view)]
+            sheet = win32com.client.Dispatch(_com_member(doc, "GetCurrentSheet"))
+            props = _sheet_properties(sheet)
+            width_mm, height_mm = ad.mm(props["width_m"]), ad.mm(props["height_m"])
+            config = ad.SheetConfig()
+            result["sheet_format"] = ad.identify_format(width_mm, height_mm)
+            result["sheet_size_mm"] = [width_mm, height_mm]
+            usable = config.usable_area(width_mm, height_mm)
+            result["usable_area_mm"] = usable
+            if not ad.box_contains(usable, result["outline_mm"]):
+                fitting = ad.pick_scale_that_fits(
+                    [s / (effective_ratio[0] / effective_ratio[1]) for s in result["size_mm"]],
+                    (usable[2] - usable[0], usable[3] - usable[1]),
+                    margin_mm=config.dim_band_mm)
+                hint = (f"; {fitting[0]}:{fitting[1]} would fit"
+                        if fitting else "; no normalised scale fits this sheet")
+                result["issues"].append(ad.issue(
+                    "E07", "critical",
+                    f"view {view_name} is {result['size_mm'][0]:g} x "
+                    f"{result['size_mm'][1]:g} mm and does not fit the usable area "
+                    f"of the {result['sheet_format'] or 'sheet'}{hint}", view_name))
         except Exception:
-            pass
-        return {"view_type": view_type, "source": source_filepath,
-                "position": [x, y], "scale": scale, "unit": unit or _default_unit}
+            log.warning("Could not measure view %r after insertion", view_name,
+                        exc_info=True)
+        result["ok"] = not any(i["severity"] == "critical" for i in result["issues"])
+        return result
 
     return await _run(_impl)
 
@@ -4864,103 +4970,850 @@ def _active_drawing():
 
 
 def _get_selected_view(doc):
-    """Return the currently active/selected drawing view, or the first view."""
-    def _noarg_member(obj, name):
-        value = getattr(obj, name)
-        if callable(value):
-            try:
-                return value()
-            except Exception:
-                # Dynamic COM dispatch can expose an already-evaluated object
-                # as callable; in that case invoking it raises "member not
-                # found", while the original value is the desired object.
-                return value
-        return value
+    """Return the currently active/selected drawing view, or the first view.
 
+    Kept for the tools that genuinely act on "whatever the user selected".
+    Anything that places geometry or a dimension must NOT use this: on a sheet
+    with four views the active one is rarely the one the coordinates fall in.
+    Those callers go through ``_find_view_for_point`` instead.
+    """
     try:
-        view = _noarg_member(doc, "ActiveDrawingView")
+        view = _com_member(doc, "ActiveDrawingView")
         if view is not None:
             return win32com.client.Dispatch(view)
     except Exception:
-        pass
+        log.debug("ActiveDrawingView unavailable", exc_info=True)
     try:
-        views = _noarg_member(doc, "GetFirstView")  # sheet is first "view"
-        view = _noarg_member(win32com.client.Dispatch(views), "GetNextView")
+        views = _com_member(doc, "GetFirstView")  # sheet is first "view"
+        view = _com_member(win32com.client.Dispatch(views), "GetNextView")
         if view is not None:
             return win32com.client.Dispatch(view)
     except Exception:
-        pass
+        log.debug("GetFirstView/GetNextView unavailable", exc_info=True)
     return None
 
 
 _DRAWING_EDGE_IID = "{83A33D42-27C5-11CE-BFD4-00400513BB57}"
 
+# swViewEntityType_e: edges.
+_VIEW_ENTITY_EDGE = 1
 
-def _select_drawing_edge_near(doc, x_m: float, y_m: float, tolerance_m: float = 0.002):
-    """Select the visible drawing edge closest to a sheet-space point.
+# swDimensionType_e.swAngularDimension. Resolved from the installed type
+# library when available so the number is not hard-coded against one release;
+# the literal is the documented fallback and only decides whether a value is
+# reported in degrees or millimetres.
+_ANGULAR_DIM_TYPE_FALLBACK = 3
 
-    ``SelectByID2`` does not reliably hit projected model edges in drawings.
-    This uses the documented IView entity enumeration and selection APIs while
-    preserving the public MCP contract of accepting sheet coordinates.
+# swThisConfiguration, for IDimension.GetSystemValue3.
+_THIS_CONFIGURATION = 1
+
+# swUserPreferenceToggle_e.swInputDimValOnCreate. Left on, SolidWorks opens a
+# modal value box when a dimension is created and the COM call never returns
+# -- the same trap add_sketch_dimension already works around.
+_INPUT_DIM_VAL_ON_CREATE = 10
+
+# Stable short IDs for drawing entities, shared by the read and write tools.
+_ENTITY_REGISTRY = ad.EntityRegistry()
+
+
+def _angular_dim_type() -> int:
+    try:
+        return int(win32com.client.constants.swAngularDimension)
+    except Exception:
+        return _ANGULAR_DIM_TYPE_FALLBACK
+
+
+# ---------------------------------------------------------------------------
+# Drawing reads: sheets, views, entities, dimensions
+# ---------------------------------------------------------------------------
+
+
+def _sheet_names(doc) -> list:
+    names = _com_member(doc, "GetSheetNames") or ()
+    return [str(n) for n in names]
+
+
+def _sheet_and_views(doc, sheet_name: str):
+    """(ISheet, [IView]) for one sheet, excluding the sheet's own pseudo-view.
+
+    ISheet.GetViews returns the sheet itself as the first element -- a view
+    whose outline is the whole sheet. Including it makes every real view look
+    like it overlaps something, so it is dropped here once rather than
+    remembered at every call site.
     """
-    source_view = _get_selected_view(doc)
-    if source_view is None:
-        raise RuntimeError("No model view is available to select a drawing edge.")
+    sheet = win32com.client.Dispatch(doc.Sheet(sheet_name))
+    raw = _com_member(sheet, "GetViews") or ()
+    views = [win32com.client.Dispatch(v) for v in raw]
+    return sheet, views[1:] if views else []
 
+
+def _all_drawing_views(doc) -> list:
+    """Every real view of every sheet, as (sheet_name, view) pairs."""
+    out = []
+    for name in _sheet_names(doc):
+        try:
+            _sheet, views = _sheet_and_views(doc, name)
+        except Exception:
+            log.warning("Could not read views of sheet %r", name, exc_info=True)
+            continue
+        out.extend((name, v) for v in views)
+    return out
+
+
+def _view_name(view) -> str:
+    return str(_com_member(view, "Name"))
+
+
+def _find_view(doc, view_name: str):
+    """The view with this name, on any sheet.
+
+    Raises with the available names, because a wrong view name is the error
+    the model is most likely to make and the least able to recover from
+    without being told what exists.
+    """
+    available = []
+    for _sheet_name, view in _all_drawing_views(doc):
+        name = _view_name(view)
+        available.append(name)
+        if name == view_name:
+            return view
+    raise RuntimeError(
+        f"No drawing view named '{view_name}'. Available: "
+        f"{', '.join(available) if available else '(none)'}. "
+        f"Call get_drawing_layout to list them."
+    )
+
+
+def _view_outline_m(view) -> list:
+    return ad.normalize_box(tuple(_com_member(view, "GetOutline")))
+
+
+def _view_xform(view) -> tuple:
+    xform = tuple(_com_member(view, "GetViewXform"))
+    if len(xform) != 13:
+        raise RuntimeError(
+            f"SolidWorks returned a {len(xform)}-element view transform for "
+            f"'{_view_name(view)}'; 13 were expected."
+        )
+    return xform
+
+
+def _view_scale_ratio(view) -> tuple:
+    try:
+        ratio = tuple(view.ScaleRatio)
+        if len(ratio) >= 2 and ratio[1]:
+            return (float(ratio[0]), float(ratio[1]))
+    except Exception:
+        log.debug("ScaleRatio unreadable on %r", _view_name(view), exc_info=True)
+    return (1.0, 1.0)
+
+
+def _view_position_m(view) -> list:
+    try:
+        pos = tuple(view.Position)
+        return [float(pos[0]), float(pos[1])]
+    except Exception:
+        return ad.box_center(_view_outline_m(view))
+
+
+def _sheet_properties(sheet) -> dict:
+    """Paper size, scale and projection angle of a sheet.
+
+    ISheet.GetProperties2 returns
+    [paperSize, template, scale1, scale2, firstAngle, width, height, ...]
+    with width and height in metres.
+    """
+    props = tuple(_com_member(sheet, "GetProperties2") or ())
+    if len(props) < 7:
+        raise RuntimeError(
+            f"ISheet.GetProperties2 returned {len(props)} values; at least 7 were expected."
+        )
+    return {
+        "paper_size_code": int(props[0]),
+        "sheet_scale": (float(props[2]), float(props[3])),
+        "first_angle": bool(props[4]),
+        "width_m": float(props[5]),
+        "height_m": float(props[6]),
+    }
+
+
+def _view_edge_owners(view):
+    """[(component_name, component_variant)] whose edges to enumerate.
+
+    IView.GetVisibleEntities2 takes the component as its first argument. The
+    old code always passed a null variant, which works for a part view but
+    enumerates nothing for an assembly view -- exactly where balloons and
+    weld symbols are used. For an assembly, iterate the drawing components.
+    """
     empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
     try:
-        entities = source_view.GetVisibleEntities2(empty, 1) or ()  # swViewEntityType_Edge
-        xform = tuple(source_view.GetViewXform)
-        if len(xform) != 13:
-            raise RuntimeError("SolidWorks returned an invalid drawing-view transform.")
-    except Exception as exc:
-        raise RuntimeError("Could not enumerate visible edges in the selected drawing view.") from exc
-
-    def project(point):
-        x, y, z = point
-        # IView.GetViewXform: rotation [0:9], translation [9:12], and scale
-        # [12]. SolidWorks stores the rotation matrix by columns.
-        scale = xform[12]
-        return (
-            (xform[0] * x + xform[3] * y + xform[6] * z) * scale + xform[9],
-            (xform[1] * x + xform[4] * y + xform[7] * z) * scale + xform[10],
-        )
-
-    def distance_to_segment_sq(start, end):
-        sx, sy = start
-        ex, ey = end
-        dx, dy = ex - sx, ey - sy
-        length_sq = dx * dx + dy * dy
-        if length_sq == 0:
-            return (x_m - sx) ** 2 + (y_m - sy) ** 2
-        fraction = max(0.0, min(1.0, ((x_m - sx) * dx + (y_m - sy) * dy) / length_sq))
-        cx, cy = sx + fraction * dx, sy + fraction * dy
-        return (x_m - cx) ** 2 + (y_m - cy) ** 2
-
-    closest_edge = None
-    closest_distance_sq = float("inf")
-    for raw_entity in entities:
+        raw = _com_member(view, "GetVisibleDrawingComponents") or ()
+    except Exception:
+        raw = ()
+    owners = []
+    for item in raw:
         try:
-            edge = win32com.client.Dispatch(raw_entity, "IEdge", _DRAWING_EDGE_IID)
-            params = tuple(edge.GetCurveParams())
-            if len(params) < 6:
+            drawing_component = win32com.client.Dispatch(item)
+            component = _com_member(drawing_component, "Component")
+            if component is None:
                 continue
-            distance_sq = distance_to_segment_sq(project(params[:3]), project(params[3:6]))
-            if distance_sq < closest_distance_sq:
-                closest_edge = raw_entity
-                closest_distance_sq = distance_sq
+            component = win32com.client.Dispatch(component)
+            owners.append((str(_com_member(component, "Name2")), component))
+        except Exception:
+            log.debug("Skipping an unreadable drawing component", exc_info=True)
+    return owners or [(None, empty)]
+
+
+def _read_edge_geometry(view, raw_entity, xform):
+    """Classify one visible edge, reading only what COM can actually give.
+
+    A circle's radius lives on the underlying ICurve, not on the edge, so it
+    needs a second hop that the old code never made.
+    """
+    edge = win32com.client.Dispatch(raw_entity, "IEdge", _DRAWING_EDGE_IID)
+    params = tuple(_com_member(edge, "GetCurveParams"))
+    is_circle, circle_params = False, None
+    try:
+        curve = win32com.client.Dispatch(_com_member(edge, "GetCurve"))
+        is_circle = bool(_com_member(curve, "IsCircle"))
+        if is_circle:
+            circle_params = tuple(_com_member(curve, "CircleParams"))
+    except Exception:
+        log.debug("Curve type unreadable for an edge; treating it as a line",
+                  exc_info=True)
+        is_circle, circle_params = False, None
+    return ad.classify_edge(xform, params, circle_params=circle_params,
+                            is_circle=is_circle)
+
+
+def _read_view_entities(doc, view, view_name: str, register: bool = True) -> list:
+    """Every visible edge of a view as an ad.EdgeInfo with a stable ID."""
+    xform = _view_xform(view)
+    doc_title = _doc_title(doc)
+    entities, index = [], 0
+    for component_name, component in _view_edge_owners(view):
+        try:
+            raw_entities = _com_member(view, "GetVisibleEntities2",
+                                       component, _VIEW_ENTITY_EDGE) or ()
+        except Exception:
+            log.warning("GetVisibleEntities2 failed for view %r component %r",
+                        view_name, component_name, exc_info=True)
+            continue
+        for raw_entity in raw_entities:
+            try:
+                info = _read_edge_geometry(view, raw_entity, xform)
+            except Exception:
+                log.debug("Skipping an unclassifiable edge in %r", view_name,
+                          exc_info=True)
+                continue
+            index += 1
+            info.component = component_name
+            if register:
+                info.id = _ENTITY_REGISTRY.register(
+                    doc_title, view_name, index,
+                    {"entity": raw_entity, "component": component,
+                     "kind": info.kind},
+                )
+            else:
+                info.id = f"{view_name}#E{index}"
+            entities.append(info)
+    return entities
+
+
+def _read_view_dimensions(doc, view, view_name: str) -> list:
+    """Every dimension displayed in a view, with its measured value.
+
+    This is the read the old code never had: without it nothing can tell
+    whether a dimension landed on the right edge, is duplicated, or has come
+    adrift from the model.
+    """
+    angular_type = _angular_dim_type()
+    registry_ids = _ENTITY_REGISTRY.ids_for_view(_doc_title(doc), view_name)
+    known = {}
+    for entity_id in registry_ids:
+        try:
+            known[_entity_key(_ENTITY_REGISTRY.resolve(_doc_title(doc), entity_id)["entity"])] = entity_id
         except Exception:
             continue
 
-    if closest_edge is None or closest_distance_sq > tolerance_m ** 2:
-        raise RuntimeError(
-            f"No edge found near ({x_m:.6f}, {y_m:.6f}) m on the sheet."
-        )
+    out, index = [], 0
+    try:
+        display = _com_member(view, "GetFirstDisplayDimension5")
+    except Exception:
+        log.warning("GetFirstDisplayDimension5 failed on view %r", view_name,
+                    exc_info=True)
+        return out
+    while display is not None:
+        display = win32com.client.Dispatch(display)
+        index += 1
+        entry = {"id": f"{view_name}#D{index}"}
+        try:
+            dimension = win32com.client.Dispatch(_com_member(display, "GetDimension2", 0))
+            raw_value = _com_member(dimension, "GetSystemValue3",
+                                    _THIS_CONFIGURATION, None)
+            if isinstance(raw_value, (tuple, list)):
+                raw_value = raw_value[0]
+            dim_type = int(_com_member(display, "Type2"))
+            is_angular = dim_type == angular_type
+            entry.update({
+                "name": str(_com_member(dimension, "FullName")),
+                "type_code": dim_type,
+                "unit": "deg" if is_angular else "mm",
+                "value_mm": ad.deg(raw_value) if is_angular else ad.mm(raw_value),
+                "driven": bool(_com_member(dimension, "DrivenState") == 1),
+            })
+        except Exception as exc:
+            entry["read_error"] = str(exc)
+            log.warning("Could not read dimension %s", entry["id"], exc_info=True)
 
-    doc.ClearSelection2(True)
-    if not source_view.SelectEntity(closest_edge, False):
-        raise RuntimeError("SolidWorks could not select the requested reference edge.")
-    return source_view
+        try:
+            annotation = win32com.client.Dispatch(_com_member(display, "GetAnnotation"))
+            position = tuple(_com_member(annotation, "GetPosition") or ())
+            entry["text_position_mm"] = [ad.mm(c) for c in position[:2]]
+            attached = _com_member(annotation, "GetAttachedEntities3") or ()
+            types = _com_member(annotation, "GetAttachedEntityTypes") or ()
+            entry["attached"] = [
+                None if e is None else known.get(_entity_key(e), "unregistered")
+                for e in attached
+            ]
+            entry["attached_count"] = sum(1 for e in attached if e is not None)
+            # IAnnotation.GetAttachedEntityTypes: a dissociated annotation
+            # reports a null entity and swSelNOTHING for that slot.
+            entry["dangling"] = (
+                any(e is None for e in attached)
+                or (len(attached) == 0 and len(types) == 0)
+            )
+        except Exception as exc:
+            entry.setdefault("read_error", str(exc))
+            entry["attached"] = []
+            entry["attached_count"] = 0
+            entry["dangling"] = None
+
+        out.append(entry)
+        try:
+            display = _com_member(display, "GetNext5")
+        except Exception:
+            break
+    return out
+
+
+def _entity_key(com_entity):
+    """A comparable key for a COM entity.
+
+    Comparing proxies by ``id()`` does not work: pywin32 builds a fresh
+    wrapper on every access, so the same edge gets a different ``id()`` each
+    time and no dimension would ever match a registered entity. The COM
+    identity of the underlying IUnknown is the thing that is actually stable.
+    """
+    try:
+        return win32com.client.Dispatch(com_entity)._oleobj_.QueryInterface(
+            pythoncom.IID_IUnknown)
+    except Exception:
+        try:
+            return com_entity._oleobj_.QueryInterface(pythoncom.IID_IUnknown)
+        except Exception:
+            return id(com_entity)
+
+
+# ---------------------------------------------------------------------------
+# Drawing selection
+# ---------------------------------------------------------------------------
+
+
+def _find_view_for_point(doc, x_m: float, y_m: float):
+    """(view, view_name) of the view whose outline contains a sheet point.
+
+    This is the fix for the "dimension landed in the wrong view" class of
+    error. The previous code searched only the active view, so on a sheet
+    with front, top, side and iso views a point in the side view was matched
+    against the front view's edges -- yielding either "no edge found" or,
+    worse, a nearby edge of the wrong view with no error reported.
+    """
+    candidates = []
+    for _sheet_name, view in _all_drawing_views(doc):
+        try:
+            outline = _view_outline_m(view)
+        except Exception:
+            continue
+        if ad.point_in_box((x_m, y_m), outline):
+            candidates.append((view, _view_name(view), ad.box_size(outline)))
+    if not candidates:
+        names = [_view_name(v) for _s, v in _all_drawing_views(doc)]
+        raise RuntimeError(
+            f"The point ({ad.mm(x_m)}, {ad.mm(y_m)}) mm is not inside any drawing "
+            f"view. Views on this drawing: {', '.join(names) if names else '(none)'}. "
+            f"Call get_drawing_layout for their outlines."
+        )
+    # Nested outlines happen (a detail view drawn over its parent). The
+    # smallest containing view is the one the point is "in".
+    view, name, _size = min(candidates, key=lambda c: c[2][0] * c[2][1])
+    return view, name
+
+
+def _select_drawing_edge_near(doc, x_m: float, y_m: float,
+                              tolerance_m: float = 0.002,
+                              append: bool = False,
+                              view=None, view_name: Optional[str] = None):
+    """Select the visible drawing edge a sheet point means.
+
+    ``SelectByID2`` does not reliably hit projected model edges in drawings,
+    so this enumerates the view's entities and selects the object -- the
+    approach the live test report found to be the only one that works.
+
+    Three things it does that the previous version did not: it looks in the
+    view that actually contains the point, it understands circles (clicking
+    inside a hole selects the hole), and it refuses an ambiguous point
+    instead of picking by enumeration order.
+
+    Returns (view, view_name, EdgeInfo).
+    """
+    if view is None:
+        view, view_name = _find_view_for_point(doc, x_m, y_m)
+    entities = _read_view_entities(doc, view, view_name)
+    if not entities:
+        raise RuntimeError(
+            f"View '{view_name}' reports no visible edges. If it is an assembly "
+            f"view, check that its components are resolved."
+        )
+    try:
+        edge, _distance = ad.pick_nearest_edge(entities, x_m, y_m,
+                                               tolerance_m=tolerance_m)
+    except ad.AmbiguousPick as exc:
+        raise RuntimeError(str(exc)) from exc
+    except LookupError as exc:
+        raise RuntimeError(f"{exc} (searched view '{view_name}')") from exc
+
+    item = _ENTITY_REGISTRY.resolve(_doc_title(doc), edge.id)
+    if not append:
+        doc.ClearSelection2(True)
+    if not view.SelectEntity(item["entity"], append):
+        raise RuntimeError(
+            f"SolidWorks refused to select {edge.id} in view '{view_name}'."
+        )
+    return view, view_name, edge
+
+
+def _layout_dict(doc, config: Optional["ad.SheetConfig"] = None) -> dict:
+    """The whole drawing as data: sheets, formats, views, outlines, issues.
+
+    Shared by get_drawing_layout and verify_drawing so the two can never
+    disagree about where a view is.
+    """
+    config = config or ad.SheetConfig()
+    sheets = []
+    for sheet_name in _sheet_names(doc):
+        sheet, views = _sheet_and_views(doc, sheet_name)
+        props = _sheet_properties(sheet)
+        width_mm, height_mm = ad.mm(props["width_m"]), ad.mm(props["height_m"])
+        usable = config.usable_area(width_mm, height_mm)
+        title_block = config.title_block_box(width_mm, height_mm)
+        view_dicts = []
+        for view in views:
+            name = _view_name(view)
+            try:
+                outline_m = _view_outline_m(view)
+            except Exception:
+                log.warning("No outline for view %r", name, exc_info=True)
+                continue
+            ratio = _view_scale_ratio(view)
+            entry = {
+                "name": name,
+                "outline_mm": [ad.mm(c) for c in outline_m],
+                "center_mm": [ad.mm(c) for c in _view_position_m(view)],
+                "scale": ad.format_scale(*ratio),
+                "scale_ratio": ratio,
+                "scale_is_normalized": ad.is_normalized_scale(*ratio),
+            }
+            size = ad.box_size(entry["outline_mm"])
+            entry["size_mm"] = [round(s, 3) for s in size]
+            for attribute, key in (("Type", "type"),
+                                   ("GetReferencedModelName", "model"),
+                                   ("ReferencedConfiguration", "configuration")):
+                try:
+                    entry[key] = _com_member(view, attribute)
+                    if entry[key] is not None and key != "type":
+                        entry[key] = str(entry[key])
+                except Exception:
+                    entry[key] = None
+            view_dicts.append(entry)
+        sheets.append({
+            "name": sheet_name,
+            "format": ad.identify_format(width_mm, height_mm),
+            "size_mm": [width_mm, height_mm],
+            "sheet_scale": ad.format_scale(*props["sheet_scale"]),
+            "projection": "first_angle" if props["first_angle"] else "third_angle",
+            "usable_area_mm": usable,
+            "title_block_mm": title_block,
+            "views": view_dicts,
+            "issues": ad.check_sheet_layout(view_dicts, usable, title_block, config),
+        })
+    return {"drawing": _doc_title(doc), "sheets": sheets}
+
+
+@mcp.tool()
+async def get_drawing_layout() -> dict:
+    """Describe every sheet of the active drawing as data.
+
+    Returns, per sheet: paper format and size in mm, sheet scale, projection
+    angle (first/third), the usable area inside the margins, the title-block
+    rectangle, and every view with its name, referenced model and
+    configuration, effective scale, centre and outline in mm. Layout problems
+    already found (views overlapping, a view outside the usable area or over
+    the title block, a scale that is not on the normalised series) come back
+    in each sheet's `issues`.
+
+    Call this BEFORE positioning a view or placing a dimension: the view
+    names it returns are what every other drawing tool takes, and the
+    outlines are what makes a sheet coordinate meaningful."""
+
+    def _impl():
+        return _layout_dict(_active_drawing())
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def get_view_entities(view_name: str, kinds: str = "line,circle,arc",
+                            min_length_mm: float = 0.0,
+                            max_results: int = 200) -> dict:
+    """List the visible edges of a drawing view, each with a stable ID.
+
+    kinds: comma-separated subset of line, circle, arc.
+    min_length_mm filters out detail edges (chamfer run-outs, fillet blends).
+
+    Every entity comes back with sheet coordinates (what a click would
+    target), the true MODEL length or diameter in mm (what a dimension will
+    read), its orientation, and an ID of the form "<view>#E<n>". Pass those
+    IDs to dimension_by_entity_ids instead of guessing sheet coordinates.
+
+    IDs stay valid until the drawing is rebuilt. If the drawing changes, call
+    this again -- an expired ID is refused, never silently resolved.
+
+    For a view with hundreds of edges, a summary is returned instead of the
+    full list once max_results is exceeded; narrow it with kinds and
+    min_length_mm."""
+
+    def _impl():
+        doc = _active_drawing()
+        view = _find_view(doc, view_name)
+        wanted = {k.strip().lower() for k in kinds.split(",") if k.strip()}
+        unknown = wanted - {"line", "circle", "arc"}
+        if unknown:
+            raise ValueError(
+                f"Unknown entity kind(s): {', '.join(sorted(unknown))}. "
+                f"Use line, circle and/or arc."
+            )
+        entities = _read_view_entities(doc, view, view_name)
+        selected = [
+            e for e in entities
+            if e.kind in wanted
+            and (e.model_length is None
+                 or ad.mm(e.model_length) >= min_length_mm)
+        ]
+        result = {
+            "view": view_name,
+            "total_visible": len(entities),
+            "matched": len(selected),
+            "ids_valid_until": "the next rebuild of this drawing",
+        }
+        counts: dict = {}
+        for e in selected:
+            counts[e.kind] = counts.get(e.kind, 0) + 1
+        result["counts_by_kind"] = counts
+        if len(selected) > max_results:
+            diameters = sorted({e.as_dict().get("diameter_model_mm")
+                                for e in selected if e.kind == "circle"})
+            result["truncated"] = True
+            result["summary"] = (
+                f"{len(selected)} entities matched, more than max_results="
+                f"{max_results}. Hole diameters present: "
+                f"{', '.join(f'{d:g}' for d in diameters) if diameters else 'none'}. "
+                f"Raise min_length_mm or narrow kinds."
+            )
+            result["entities"] = [e.as_dict() for e in selected[:max_results]]
+        else:
+            result["truncated"] = False
+            result["entities"] = [e.as_dict() for e in selected]
+        return result
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def get_view_dimensions(view_name: str) -> dict:
+    """List the dimensions already shown in a drawing view.
+
+    Each dimension comes back with its MEASURED value (mm, or degrees for an
+    angular one), its type code, whether it is driven, the sheet position of
+    its text, which registered entity IDs it is attached to, and whether it
+    has come adrift from the model (dangling).
+
+    Use it to find out what is already dimensioned before adding more, to
+    catch duplicates, and to confirm that a dimension measures what was
+    intended. Entity IDs resolve only for entities read by get_view_entities
+    in this session; others show as "unregistered"."""
+
+    def _impl():
+        doc = _active_drawing()
+        view = _find_view(doc, view_name)
+        dimensions = _read_view_dimensions(doc, view, view_name)
+        return {"view": view_name, "count": len(dimensions),
+                "dimensions": dimensions}
+
+    return await _run(_impl)
+
+
+def _add_dimension_at(doc, px_m: float, py_m: float):
+    """AddDimension2 with the modal value box disabled.
+
+    Left enabled, SolidWorks pops a "Modify" box on creation and the COM call
+    never returns -- the tool just times out. add_sketch_dimension already
+    guards this; the drawing path did not.
+    """
+    app = _connect()
+    original = None
+    try:
+        original = bool(app.GetUserPreferenceToggle(_INPUT_DIM_VAL_ON_CREATE))
+        app.SetUserPreferenceToggle(_INPUT_DIM_VAL_ON_CREATE, False)
+    except Exception:
+        log.warning("Could not disable swInputDimValOnCreate; a modal dialog "
+                    "may block this call", exc_info=True)
+    try:
+        return doc.AddDimension2(px_m, py_m, 0)
+    finally:
+        if original is not None:
+            try:
+                app.SetUserPreferenceToggle(_INPUT_DIM_VAL_ON_CREATE, original)
+            except Exception:
+                log.warning("Could not restore swInputDimValOnCreate",
+                            exc_info=True)
+
+
+def _measure_display_dimension(display, view_name: str, index_hint: int = 1) -> dict:
+    """Read back what a freshly created dimension actually measures."""
+    angular_type = _angular_dim_type()
+    display = win32com.client.Dispatch(display)
+    out = {"id": f"{view_name}#D{index_hint}"}
+    dimension = win32com.client.Dispatch(_com_member(display, "GetDimension2", 0))
+    raw_value = _com_member(dimension, "GetSystemValue3", _THIS_CONFIGURATION, None)
+    if isinstance(raw_value, (tuple, list)):
+        raw_value = raw_value[0]
+    try:
+        dim_type = int(_com_member(display, "Type2"))
+    except Exception:
+        dim_type = -1
+    is_angular = dim_type == angular_type
+    out.update({
+        "name": str(_com_member(dimension, "FullName")),
+        "type_code": dim_type,
+        "unit": "deg" if is_angular else "mm",
+        "value": ad.deg(raw_value) if is_angular else ad.mm(raw_value),
+    })
+    try:
+        annotation = win32com.client.Dispatch(_com_member(display, "GetAnnotation"))
+        attached = _com_member(annotation, "GetAttachedEntities3") or ()
+        out["attached_count"] = sum(1 for e in attached if e is not None)
+        position = tuple(_com_member(annotation, "GetPosition") or ())
+        out["text_position_mm"] = [ad.mm(c) for c in position[:2]]
+    except Exception:
+        log.warning("Could not read the new dimension's attachments",
+                    exc_info=True)
+        out["attached_count"] = None
+    return out
+
+
+@mcp.tool()
+async def dimension_by_entity_ids(entity_ids: list[str], side: str = "auto",
+                                  expected_mm: Optional[float] = None,
+                                  tolerance_mm: float = 0.5,
+                                  place_x: Optional[float] = None,
+                                  place_y: Optional[float] = None,
+                                  unit: Optional[str] = None) -> dict:
+    """Dimension one or two entities by the IDs from get_view_entities.
+
+    One ID gives that entity's own measure (an edge's length, a circle's
+    diameter); two IDs give the distance between them. Both must be in the
+    same view.
+
+    side places the text outside the view: above, below, left, right, or
+    "auto" to follow drawing convention (horizontal measures above/below,
+    vertical ones left/right, each to the nearer outside). place_x/place_y
+    override it with explicit sheet coordinates.
+
+    expected_mm turns the call into an assertion. Pass the value the model is
+    supposed to have and the measured value is compared against it: if the
+    dimension landed on the wrong entity you get a critical E01 issue with
+    both numbers, instead of a success message. This is the single most
+    useful argument here -- use it whenever the intended value is known.
+
+    Returns the measured value, how many entities the dimension actually
+    attached to, where the text went, and an `issues` list."""
+
+    def _impl():
+        doc = _active_drawing()
+        config = ad.SheetConfig()
+        if not 1 <= len(entity_ids) <= 2:
+            raise ValueError(
+                f"Pass 1 or 2 entity IDs, got {len(entity_ids)}. One ID measures "
+                f"that entity; two measure the distance between them."
+            )
+        if side != "auto" and side not in ad.SIDES:
+            raise ValueError(
+                f"side must be 'auto' or one of {', '.join(ad.SIDES)}, got '{side}'."
+            )
+        doc_title = _doc_title(doc)
+        items = [_ENTITY_REGISTRY.resolve(doc_title, eid) for eid in entity_ids]
+        view_names = {item["view"] for item in items}
+        if len(view_names) > 1:
+            raise ValueError(
+                f"The entities are in different views ({', '.join(sorted(view_names))}); "
+                f"a dimension cannot span views."
+            )
+        view_name = items[0]["view"]
+        view = _find_view(doc, view_name)
+
+        try:
+            doc.ActivateView(view_name)
+        except Exception:
+            log.warning("ActivateView(%r) failed; continuing", view_name,
+                        exc_info=True)
+        doc.ClearSelection2(True)
+        for index, (entity_id, item) in enumerate(zip(entity_ids, items)):
+            if not view.SelectEntity(item["entity"], index > 0):
+                raise RuntimeError(
+                    f"SolidWorks refused to select {entity_id} in view "
+                    f"'{view_name}'. Re-read the view with get_view_entities."
+                )
+        # The bug this replaces: the second SelectByID2 was never checked, so
+        # a failed second pick silently became "length of the first edge"
+        # reported as "distance between two points".
+        selected_count = doc.SelectionManager.GetSelectedObjectCount2(-1)
+        if selected_count != len(items):
+            doc.ClearSelection2(True)
+            raise RuntimeError(
+                f"Selection is inconsistent: SolidWorks holds {selected_count} "
+                f"entities, {len(items)} were selected. Aborting rather than "
+                f"creating a dimension on the wrong geometry."
+            )
+
+        outline_m = _view_outline_m(view)
+        if place_x is not None and place_y is not None:
+            px_m, py_m = to_meters(place_x, unit), to_meters(place_y, unit)
+            chosen_side = "explicit"
+        else:
+            edges = _read_view_entities(doc, view, view_name, register=False)
+            reference = next((e for e in edges if e.kind == items[0]["kind"]), None)
+            chosen_side = side
+            if side == "auto":
+                chosen_side = (ad.side_for_edge(reference, outline_m)
+                               if reference is not None else "above")
+            px_m, py_m = ad.place_dimension_text(
+                outline_m, chosen_side, ad.to_m(config.dim_offset_mm))
+
+        display = _add_dimension_at(doc, px_m, py_m)
+        if display is None:
+            doc.ClearSelection2(True)
+            raise RuntimeError(
+                "AddDimension2 created no dimension for the selected entities. "
+                "The pair may not be dimensionable (for example two skew edges)."
+            )
+        measured = _measure_display_dimension(display, view_name)
+        doc.ClearSelection2(True)
+
+        issues = ad.check_measured_value(
+            measured["value"],
+            expected_mm=expected_mm,
+            tolerance_mm=tolerance_mm,
+            attached_count=measured.get("attached_count"),
+            expected_attachments=len(items),
+            ref=measured["id"],
+        )
+        return {
+            "ok": not any(i["severity"] == "critical" for i in issues),
+            "view": view_name,
+            "entity_ids": list(entity_ids),
+            "value": measured["value"],
+            "unit": measured["unit"],
+            "expected_mm": expected_mm,
+            "attached_count": measured.get("attached_count"),
+            "side": chosen_side,
+            "text_position_mm": measured.get(
+                "text_position_mm", [ad.mm(px_m), ad.mm(py_m)]),
+            "issues": issues,
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool()
+async def verify_drawing(require_hole_dimensions: bool = True,
+                         require_overall_extents: bool = True,
+                         require_cut_angles: bool = True,
+                         min_edge_length_mm: float = 3.0) -> dict:
+    """Check the active drawing and return every problem found. Read-only.
+
+    Runs the full set of detectors: views overlapping (E06), a view outside
+    the usable area or over the title block (E07), a scale that is not on the
+    normalised series (E08), holes and overall extents with no dimension
+    (E02), duplicate dimensions (E03), dimension text at the sheet origin or
+    sitting on another view (E05), and dangling dimensions (E16).
+
+    Each issue carries a code, a severity (critical/warning/info), a message
+    and the view, entity or dimension IDs it refers to -- so a finding turns
+    straight into the next action.
+
+    Call this before telling anyone a drawing is finished. `status` is
+    "approved" only when nothing was found."""
+
+    def _impl():
+        doc = _active_drawing()
+        config = ad.SheetConfig()
+        rules = ad.CoverageRules(
+            require_overall_extents=require_overall_extents,
+            require_hole_diameters=require_hole_dimensions,
+            require_cut_angles=require_cut_angles,
+            min_edge_length_mm=min_edge_length_mm,
+        )
+        layout = _layout_dict(doc, config)
+        issues = [i for sheet in layout["sheets"] for i in sheet["issues"]]
+        checked_views = []
+        for sheet in layout["sheets"]:
+            text_check_views = []
+            for view_entry in sheet["views"]:
+                view_name = view_entry["name"]
+                try:
+                    view = _find_view(doc, view_name)
+                    edges = _read_view_entities(doc, view, view_name)
+                    dimensions = _read_view_dimensions(doc, view, view_name)
+                except Exception as exc:
+                    issues.append(ad.issue(
+                        "E02", "warning",
+                        f"could not inspect view {view_name}: {exc}", view_name))
+                    continue
+                issues.extend(ad.check_dimension_coverage(
+                    view_name, edges, dimensions, rules))
+                text_check_views.append({
+                    "name": view_name,
+                    "outline_mm": view_entry["outline_mm"],
+                    "usable_area_mm": sheet["usable_area_mm"],
+                    "dimensions": dimensions,
+                })
+                checked_views.append({
+                    "view": view_name,
+                    "visible_edges": len(edges),
+                    "dimensions": len(dimensions),
+                })
+            issues.extend(ad.check_text_positions(text_check_views, config))
+        return {
+            "status": ad.worst_status(issues),
+            "count": len(issues),
+            "critical": sum(1 for i in issues if i["severity"] == "critical"),
+            "warnings": sum(1 for i in issues if i["severity"] == "warning"),
+            "views_checked": checked_views,
+            "issues": issues,
+        }
+
+    return await _run(_impl)
 
 
 @mcp.tool()
@@ -5261,49 +6114,109 @@ async def insert_auxiliary_view(
 async def add_drawing_dimension(
     x1: float, y1: float,
     x2: Optional[float] = None, y2: Optional[float] = None,
-    place_x: float = 0, place_y: float = 0,
+    place_x: Optional[float] = None, place_y: Optional[float] = None,
+    expected_mm: Optional[float] = None,
+    tolerance_mm: float = 0.5,
     unit: Optional[str] = None,
 ) -> dict:
-    """Add a dimension to the active drawing between one or two selected entities.
+    """Add a dimension to the active drawing, picking entities by sheet point.
 
-    Select an entity (edge/vertex) near (x1,y1), optionally a second near (x2,y2),
-    then place the dimension text at (place_x, place_y). For a single edge, this
-    gives its length; for two entities, the distance between them.
+    Resolves (x1,y1) -- and (x2,y2) if given -- to real drawing entities in
+    the view that CONTAINS each point, selects them as objects, and returns
+    the value SolidWorks actually measured.
 
-    All coordinates are drawing-sheet coordinates."""
+    A point inside a hole selects that hole. An ambiguous point (two entities
+    equally close) is refused with the candidate IDs rather than resolved by
+    luck. If place_x/place_y are omitted the text goes just outside the view,
+    never to the sheet origin.
+
+    expected_mm turns the call into an assertion: pass the intended value and
+    a mismatch comes back as a critical E01 issue with both numbers.
+
+    Prefer dimension_by_entity_ids: get_view_entities gives IDs and true
+    model lengths, so there is nothing left to estimate. This tool stays for
+    the case where only a sheet position is known."""
 
     def _impl():
         doc = _active_drawing()
+        config = ad.SheetConfig()
         doc.ClearSelection2(True)
 
         x1_m, y1_m = to_meters(x1, unit), to_meters(y1, unit)
-        empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+        view, view_name, first_edge = _select_drawing_edge_near(doc, x1_m, y1_m)
+        picked = [first_edge]
 
-        selected = False
-        for seltype in ("EDGE", "VERTEX", "SILHOUETTE"):
-            if doc.Extension.SelectByID2("", seltype, x1_m, y1_m, 0, False, 0, empty, 0):
-                selected = True
-                break
-        if not selected:
-            raise RuntimeError(f"No dimensionable entity found near ({x1}, {y1}).")
-
+        if (x2 is None) != (y2 is None):
+            raise ValueError(
+                "Give both x2 and y2 for a two-entity dimension, or neither."
+            )
         if x2 is not None and y2 is not None:
             x2_m, y2_m = to_meters(x2, unit), to_meters(y2, unit)
-            for seltype in ("EDGE", "VERTEX", "SILHOUETTE"):
-                if doc.Extension.SelectByID2("", seltype, x2_m, y2_m, 0, True, 0, empty, 0):
-                    break
+            second_view, second_name = _find_view_for_point(doc, x2_m, y2_m)
+            if second_name != view_name:
+                doc.ClearSelection2(True)
+                raise RuntimeError(
+                    f"({x1}, {y1}) is in view '{view_name}' but ({x2}, {y2}) is in "
+                    f"'{second_name}'. A dimension cannot span two views."
+                )
+            # Appending, and checked -- the unchecked second selection is what
+            # used to turn "distance between two points" into "length of one
+            # edge" with a success message.
+            _view, _name, second_edge = _select_drawing_edge_near(
+                doc, x2_m, y2_m, append=True, view=view, view_name=view_name)
+            if second_edge.id == first_edge.id:
+                doc.ClearSelection2(True)
+                raise RuntimeError(
+                    f"Both points resolved to the same entity ({first_edge.id}). "
+                    f"For a distance, aim at two different entities."
+                )
+            picked.append(second_edge)
+            selected_count = doc.SelectionManager.GetSelectedObjectCount2(-1)
+            if selected_count != 2:
+                doc.ClearSelection2(True)
+                raise RuntimeError(
+                    f"SolidWorks holds {selected_count} entities after selecting 2. "
+                    f"Aborting rather than dimensioning the wrong geometry."
+                )
 
-        px_m, py_m = to_meters(place_x, unit), to_meters(place_y, unit)
-        dim = doc.AddDimension2(px_m, py_m, 0)
-        if dim is None:
-            raise RuntimeError("Failed to add drawing dimension. Check the selected entities.")
+        outline_m = _view_outline_m(view)
+        if place_x is not None and place_y is not None:
+            px_m, py_m = to_meters(place_x, unit), to_meters(place_y, unit)
+            chosen_side = "explicit"
+        else:
+            chosen_side = ad.side_for_edge(first_edge, outline_m)
+            px_m, py_m = ad.place_dimension_text(
+                outline_m, chosen_side, ad.to_m(config.dim_offset_mm))
 
+        display = _add_dimension_at(doc, px_m, py_m)
+        if display is None:
+            doc.ClearSelection2(True)
+            raise RuntimeError(
+                "AddDimension2 created no dimension for the selected entities."
+            )
+        measured = _measure_display_dimension(display, view_name)
         doc.ClearSelection2(True)
+
+        issues = ad.check_measured_value(
+            measured["value"],
+            expected_mm=expected_mm,
+            tolerance_mm=tolerance_mm,
+            attached_count=measured.get("attached_count"),
+            expected_attachments=len(picked),
+            ref=measured["id"],
+        )
         return {
-            "from": [x1, y1],
-            "to": [x2, y2] if x2 is not None else None,
-            "placed_at": [place_x, place_y],
-            "unit": unit or _default_unit,
+            "ok": not any(i["severity"] == "critical" for i in issues),
+            "view": view_name,
+            "entity_ids": [e.id for e in picked],
+            "value": measured["value"],
+            "unit": measured["unit"],
+            "expected_mm": expected_mm,
+            "attached_count": measured.get("attached_count"),
+            "side": chosen_side,
+            "text_position_mm": measured.get(
+                "text_position_mm", [ad.mm(px_m), ad.mm(py_m)]),
+            "issues": issues,
         }
 
     return await _run(_impl)
@@ -5434,7 +6347,7 @@ async def add_weld_symbol(
         if symbol is None:
             raise ValueError(f"Unsupported weld_type '{weld_type}'. Use: {', '.join(symbols)}.")
 
-        source_view = _select_drawing_edge_near(doc, x_m, y_m)
+        source_view, _sel_view_name, _sel_edge = _select_drawing_edge_near(doc, x_m, y_m)
         before = source_view.GetWeldSymbolCount
         if callable(before):
             before = before()
@@ -8086,24 +8999,41 @@ def _measure_model_doc(doc, factor: float) -> dict:
         except Exception:
             pass
 
-    bodies = doc.GetBodies2(0, True)
-    if bodies:
+    # Union the boxes of EVERY body, not just bodies[0]. A weldment -- the
+    # typical structural part -- is multibody by construction, so measuring
+    # the first body alone reported the size of one member as the size of the
+    # whole frame, and the error was invisible because the number looked
+    # plausible.
+    bodies = doc.GetBodies2(0, True) or ()
+    boxes = []
+    for raw_body in bodies:
         try:
-            body = win32com.client.Dispatch(bodies[0])
-            box = body.GetBodyBox()
-            if box:
-                result["bounding_box"] = {
-                    "min_m": [box[0], box[1], box[2]],
-                    "max_m": [box[3], box[4], box[5]],
-                    "size": {
-                        "x": round(abs(box[3] - box[0]) * factor, 4),
-                        "y": round(abs(box[4] - box[1]) * factor, 4),
-                        "z": round(abs(box[5] - box[2]) * factor, 4),
-                        "unit": _default_unit,
-                    },
-                }
+            box = win32com.client.Dispatch(raw_body).GetBodyBox()
+            if box and len(box) >= 6:
+                boxes.append(tuple(float(c) for c in box[:6]))
         except Exception:
-            pass
+            log.debug("GetBodyBox failed for one body; it is left out of the "
+                      "bounding box", exc_info=True)
+    if boxes:
+        low = [min(b[i] for b in boxes) for i in range(3)]
+        high = [max(b[i + 3] for b in boxes) for i in range(3)]
+        result["body_count"] = len(bodies)
+        result["bounding_box"] = {
+            "min_m": low,
+            "max_m": high,
+            "bodies_measured": len(boxes),
+            "size": {
+                "x": round(abs(high[0] - low[0]) * factor, 4),
+                "y": round(abs(high[1] - low[1]) * factor, 4),
+                "z": round(abs(high[2] - low[2]) * factor, 4),
+                "unit": _default_unit,
+            },
+        }
+        if len(boxes) != len(bodies):
+            result["bounding_box"]["warning"] = (
+                f"{len(bodies) - len(boxes)} of {len(bodies)} bodies did not "
+                f"report a bounding box; the extents below exclude them."
+            )
 
     if not result:
         raise RuntimeError(
