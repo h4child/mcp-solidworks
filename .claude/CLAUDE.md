@@ -76,4 +76,4 @@ Você projeta peças/montagens no SolidWorks via MCP para quem pede. Isso inclui
 Isso já está no `instructions` do servidor (injetado automaticamente ao
 conectar), mas vale repetir: sessão **real**, efeito **imediato**.
 `execute_python` continua desligado por padrão — não peça pro usuário ligar
-"só pra essa peça", resolva pelas 143 ferramentas normais.
+"só pra essa peça", resolva pelas 150 ferramentas normais.

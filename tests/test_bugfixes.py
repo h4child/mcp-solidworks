@@ -1,0 +1,503 @@
+"""
+Regression tests for the bug briefing B01-B12.
+
+Each test names the bug it pins. These run WITHOUT SolidWorks: they cover the
+argument validation, the material-library parsing and the pure policy that
+each fix introduced. The parts that genuinely need a live COM session are
+marked in the module docstring of tests/run_*_live_test.py instead, and the
+live findings are recorded in the comments of the code they explain.
+
+Run with:  python -m pytest tests/test_bugfixes.py -q
+"""
+
+import asyncio
+import inspect
+import io
+import os
+import sys
+import textwrap
+import tokenize
+
+import pytest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+pytest.importorskip("win32com.client",
+                    reason="the server module needs pywin32 (Windows only)")
+
+import server  # noqa: E402
+
+TOOLS = server.mcp._tool_manager._tools
+
+
+def call(name, **kwargs):
+    """Invoke a tool's coroutine and return its result."""
+    return asyncio.run(TOOLS[name].fn(**kwargs))
+
+
+def source_of(name):
+    return inspect.getsource(TOOLS[name].fn)
+
+
+def strip_prose(source: str) -> str:
+    """Executable code only: comments, docstrings and literals removed.
+
+    A test that asserts `"bodies[0]" not in source` is satisfied by the code
+    and broken by the COMMENT explaining that bodies[0] was the bug. The
+    proof and the explanation live in the same file, so the scan has to be
+    able to tell them apart -- otherwise documenting a fix breaks its test,
+    which teaches exactly the wrong lesson.
+    """
+    lines = source.splitlines(keepends=True)
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
+    except tokenize.TokenError:
+        return source
+    # Blank the comment and string ranges IN PLACE, so that everything else
+    # keeps its exact spelling: a scan for "bodies[0]" has to still see
+    # "bodies[0]" and not a re-spaced "bodies [ 0 ]".
+    for token in tokens:
+        if token.type not in (tokenize.COMMENT, tokenize.STRING):
+            continue
+        (start_row, start_col), (end_row, end_col) = token.start, token.end
+        for row in range(start_row, end_row + 1):
+            index = row - 1
+            if index >= len(lines):
+                break
+            line = lines[index].rstrip("\n")
+            begin = start_col if row == start_row else 0
+            finish = end_col if row == end_row else len(line)
+            lines[index] = (line[:begin] + " " * max(0, finish - begin)
+                            + line[finish:] + "\n")
+    return "".join(lines)
+
+
+def code_of(name):
+    """A tool's source with its prose stripped out."""
+    return strip_prose(source_of(name))
+
+
+# ---------------------------------------------------------------------------
+# B01 -- set_material silently left mass at water density
+# ---------------------------------------------------------------------------
+
+SAMPLE_SLDMAT = textwrap.dedent("""\
+    <?xml version="1.0" encoding="utf-8"?>
+    <mstns:materials xmlns:mstns="http://www.solidworks.com/sldmaterials">
+      <classification name="Steel">
+        <material name="Alloy Steel" matid="3">
+          <physicalproperties>
+            <EX displayname="Elastic Modulus" value="0.21E+12"/>
+            <NUXY displayname="Poisson's Ratio" value="0.28"/>
+            <DENS displayname="Density" value="0.77E+04"/>
+            <SIGYLD displayname="Yield Strength" value="6.20422E+8"/>
+          </physicalproperties>
+        </material>
+        <material name="ASTM A36 Steel" matid="9">
+          <physicalproperties>
+            <DENS displayname="Density" value="7850"/>
+            <SIGYLD displayname="Yield Strength" value="2.5E+8"/>
+          </physicalproperties>
+        </material>
+      </classification>
+      <classification name="Aluminium">
+        <material name="6061 Alloy" matid="12">
+          <physicalproperties>
+            <DENS displayname="Density" value="2700"/>
+          </physicalproperties>
+        </material>
+      </classification>
+    </mstns:materials>
+    """)
+
+
+@pytest.fixture
+def sample_library(tmp_path):
+    path = tmp_path / "sample materials.sldmat"
+    path.write_text(SAMPLE_SLDMAT, encoding="utf-8")
+    server._material_library_cache.clear()
+    yield str(path)
+    server._material_library_cache.clear()
+
+
+def test_the_material_library_is_parsed_from_the_sldmat_file(sample_library):
+    """The density has to come from somewhere verifiable.
+
+    SetMaterialPropertyName2 was confirmed live to store a material name
+    while leaving the density at water, so a name proves nothing. Reading the
+    library file gives a number that can be checked.
+    """
+    materials = server._read_material_library(sample_library)
+    assert set(materials) == {"Alloy Steel", "ASTM A36 Steel", "6061 Alloy"}
+    assert materials["Alloy Steel"]["density_kg_m3"] == pytest.approx(7700.0)
+
+
+def test_density_is_read_from_the_DENS_tag_not_a_tag_called_density(sample_library):
+    """A .sldmat names its properties by finite-element short code.
+
+    Density is <DENS value="0.77E+04"/>, not <density>. Looking for the
+    readable name finds nothing and silently yields no density at all -- the
+    first attempt at this parser did exactly that.
+    """
+    assert server._library_density("Alloy Steel", sample_library) == pytest.approx(7700.0)
+    assert server._library_density("6061 Alloy", sample_library) == pytest.approx(2700.0)
+
+
+def test_scientific_notation_in_the_library_is_parsed(sample_library):
+    """0.77E+04 is 7700, and 6.20422E+8 is 620 MPa."""
+    entry = server._read_material_library(sample_library)["Alloy Steel"]
+    assert entry["elastic_modulus_pa"] == pytest.approx(2.1e11)
+    assert entry["yield_strength_pa"] == pytest.approx(6.20422e8)
+    assert entry["poisson_ratio"] == pytest.approx(0.28)
+
+
+def test_an_unknown_material_has_no_density_rather_than_a_wrong_one(sample_library):
+    assert server._library_density("Unobtainium", sample_library) is None
+
+
+def test_the_library_is_cached_per_file(sample_library):
+    server._read_material_library(sample_library)
+    assert sample_library in server._material_library_cache
+
+
+def test_a_missing_library_file_fails_loudly(tmp_path):
+    server._material_library_cache.clear()
+    with pytest.raises(RuntimeError, match="Could not read the material library"):
+        server._read_material_library(str(tmp_path / "nope.sldmat"))
+
+
+def test_lookup_material_properties_exists_and_is_read_only():
+    """The tool that lets a caller compute a correct weight while the
+    material assignment itself is broken."""
+    assert "lookup_material_properties" in TOOLS
+    description = TOOLS["lookup_material_properties"].description.lower()
+    assert "read-only" in description
+    assert "density" in description
+
+
+def test_set_material_verifies_by_density_not_by_name():
+    """The old check compared the material NAME read back from
+    GetMaterialPropertyName2. On this build that reads back as "" even when
+    the call reports no error, so the check blamed the wrong thing while the
+    real symptom -- the density -- went untested."""
+    source = source_of("set_material")
+    assert "_library_density" in source
+    assert "_document_density" in source
+    assert "expected_density_kg_m3" in source
+
+
+def test_measure_body_warns_when_mass_is_computed_at_water_density():
+    """A wrong mass with no error is the worst outcome for a BOM."""
+    source = inspect.getsource(server._measure_model_doc)
+    assert "density_warning" in source
+    assert "1000" in source
+
+
+def test_create_mass_property_goes_through_the_dispatch_helper():
+    """doc.Extension.CreateMassProperty() raised DISP_E_MEMBERNOTFOUND every
+    time under dynamic dispatch, so the primary mass path was dead code and
+    the GetMassProperties2 fallback did all the work -- which is also why
+    Density was never available. Confirmed live, 2026-10-04."""
+    source = inspect.getsource(server._measure_model_doc)
+    assert '_com_member(doc.Extension, "CreateMassProperty")' in source
+    assert "doc.Extension.CreateMassProperty()" not in strip_prose(source)
+
+
+# ---------------------------------------------------------------------------
+# B02 -- only the first assembly level was read
+# ---------------------------------------------------------------------------
+
+
+def test_extract_assembly_bom_exists():
+    assert "extract_assembly_bom" in TOOLS
+
+
+def test_list_components_defaults_to_every_level():
+    """GetComponents(True) means "top level only".
+
+    Passing True unconditionally hid every part inside a subassembly -- in an
+    assembly built from subassemblies, most of the parts.
+    """
+    parameters = inspect.signature(TOOLS["list_components"].fn).parameters
+    assert "top_level_only" in parameters
+    assert parameters["top_level_only"].default is False
+
+
+def test_the_bom_groups_by_path_and_configuration():
+    """Keying on the file path alone summed two configurations of one file
+    into a single row -- the same plate in 2 mm and 3 mm became one item."""
+    source = source_of("extract_assembly_bom")
+    assert 'entry["configuration"]' in source
+    assert "key = (entry[\"path\"] or entry[\"name\"], entry[\"configuration\"] or \"\")" in source
+
+
+def test_components_excluded_from_the_bom_are_not_counted():
+    source = source_of("extract_assembly_bom")
+    assert "excluded_from_bom" in source
+
+
+def test_the_old_extract_assembly_data_is_left_intact_but_marked():
+    """Callers depend on its exact shape, so it keeps its signature; the
+    docstring is what redirects new work."""
+    parameters = inspect.signature(TOOLS["extract_assembly_data"].fn).parameters
+    assert list(parameters) == ["config"]
+    assert "SUPERSEDED" in TOOLS["extract_assembly_data"].description
+
+
+def test_the_assembly_walk_cannot_recurse_for_ever():
+    """A broken assembly can contain a circular reference, and SolidWorks
+    lets it exist."""
+    source = inspect.getsource(server._walk_assembly)
+    assert "visited" in source
+    assert "max_depth" in source
+
+
+def test_the_assembly_walk_is_depth_limited_in_the_tool_signature():
+    parameters = inspect.signature(TOOLS["extract_assembly_bom"].fn).parameters
+    assert parameters["max_depth"].default == 10
+
+
+# ---------------------------------------------------------------------------
+# B03 -- bounding box of the first body only
+# ---------------------------------------------------------------------------
+
+
+def test_the_bounding_box_unions_every_body():
+    """A weldment is multibody by construction, so measuring bodies[0] alone
+    reported one member's size as the whole frame's."""
+    source = inspect.getsource(server._measure_model_doc)
+    assert "bodies[0]" not in strip_prose(source)
+    assert "bodies_measured" in source
+    assert "body_count" in source
+
+
+# ---------------------------------------------------------------------------
+# B06 -- add_gusset legs were hard-coded in the caller's unit
+# ---------------------------------------------------------------------------
+
+
+def test_add_gusset_takes_its_legs_as_parameters():
+    """to_meters(50, unit) with unit="m" built a 50-METRE gusset, and there
+    was no way to ask for the size the structure needs."""
+    parameters = inspect.signature(TOOLS["add_gusset"].fn).parameters
+    for name in ("leg1", "leg2", "leg3", "profile_angle"):
+        assert name in parameters, f"add_gusset lacks '{name}'"
+    assert parameters["leg1"].default == 50
+    assert "to_meters(50, unit)" not in code_of("add_gusset")
+
+
+@pytest.mark.parametrize("kwargs,message", [
+    ({"leg1": 0}, "leg1 must be positive"),
+    ({"leg2": -5}, "leg2 must be positive"),
+    ({"profile_angle": 0}, "profile_angle must be between"),
+    ({"profile_angle": 180}, "profile_angle must be between"),
+    ({"thickness": 0}, "Thickness must be positive"),
+])
+def test_add_gusset_rejects_impossible_geometry_before_touching_solidworks(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        call("add_gusset", **kwargs)
+
+
+def test_a_flat_gusset_needs_a_third_leg():
+    with pytest.raises(ValueError, match="positive leg3"):
+        call("add_gusset", profile="flat", leg3=0)
+
+
+def test_the_gusset_reports_the_legs_it_used():
+    source = source_of("add_gusset")
+    assert '"leg1": leg1' in source and '"leg2": leg2' in source
+
+
+# ---------------------------------------------------------------------------
+# B07 -- create_reference_plane ignored the angle
+# ---------------------------------------------------------------------------
+
+
+def test_the_plane_constraint_is_chosen_before_the_com_call():
+    """Distance was always tried first and Angle only as a fallback for when
+    Distance returned None. Distance nearly always succeeds, so angle=30
+    silently produced a plane PARALLEL to the reference while the return
+    value still reported "angle": 30."""
+    source = source_of("create_reference_plane")
+    assert "if angle == 0:" in source
+    assert "constraint, value = 16, angle_rad" in source
+    # The giveaway of the old shape: an angle attempt guarded by a failed
+    # distance attempt.
+    assert "if feat is None and angle != 0" not in code_of("create_reference_plane")
+
+
+def test_an_angled_plane_can_name_the_axis_to_rotate_about():
+    parameters = inspect.signature(TOOLS["create_reference_plane"].fn).parameters
+    assert "angle_about" in parameters
+    assert parameters["angle_about"].default is None
+
+
+def test_the_plane_reports_the_constraint_it_actually_used():
+    source = source_of("create_reference_plane")
+    assert '"constraint": "angle" if constraint == 16 else "distance"' in source
+
+
+def test_the_plane_reads_its_own_position_back():
+    """flip=True with reference='right' has been seen to land the plane at
+    X=0 instead of the requested offset. Reporting the real origin turns
+    that from a silent wrong answer into something checkable."""
+    source = source_of("create_reference_plane")
+    assert '"origin"' in source and "GetSpecificFeature2" in source
+
+
+# ---------------------------------------------------------------------------
+# B08 -- the pack_and_go fallback broke references and overwrote files
+# ---------------------------------------------------------------------------
+
+
+def test_the_packaging_fallback_refuses_to_rename_without_fixing_references():
+    """Renaming a part while the assembly still points at the old name
+    produces a copy that opens with missing references -- worse than no copy,
+    and the process rule is "always make a working copy"."""
+    source = source_of("pack_and_go")
+    assert "if prefix or suffix:" in source
+    assert "missing" in source
+
+
+def test_the_packaging_fallback_disambiguates_colliding_names():
+    """Two parts of the same name from different folders used to overwrite
+    each other silently, in both the flattened and the models/ layout."""
+    source = source_of("pack_and_go")
+    assert "collisions" in source
+    assert "used_names" in source
+
+
+def test_the_packaging_fallback_never_overwrites_an_existing_file():
+    source = source_of("pack_and_go")
+    assert "Refusing to overwrite an existing file" in source
+
+
+def test_an_incomplete_package_is_an_error_not_a_warning():
+    source = source_of("pack_and_go")
+    assert "the package is incomplete" in source
+
+
+# ---------------------------------------------------------------------------
+# B09 -- export_document could not write DWG
+# ---------------------------------------------------------------------------
+
+
+def test_dwg_is_an_accepted_export_format():
+    """Structural-steel offices exchange DWG with AutoCAD constantly, and the
+    drawing-only export_flat_pattern_dxf already accepted it."""
+    source = source_of("export_document")
+    assert '".dwg"' in source
+    assert "dwg" in TOOLS["export_document"].description.lower()
+
+
+def test_an_unknown_export_format_is_rejected_with_the_valid_list():
+    with pytest.raises(ValueError, match="Unsupported export format"):
+        call("export_document", filepath="C:/tmp/thing.bogus")
+
+
+def test_the_drawing_only_formats_are_named_together():
+    """PDF had its own one-off check; DWG needed the same rule, so both now
+    come from one set rather than two copies that can drift."""
+    source = source_of("export_document")
+    assert "drawing_only" in source
+
+
+def test_the_export_confirms_a_file_was_actually_written():
+    """SaveAs has been seen to report success without producing a file."""
+    source = source_of("export_document")
+    assert "no file was written" in source
+
+
+# ---------------------------------------------------------------------------
+# B10 -- add_equation ignored solve=False
+# ---------------------------------------------------------------------------
+
+
+def test_add_equation_only_evaluates_when_asked_to():
+    """The condition was `if not solve: _evaluate_equations(...)`, i.e.
+    exactly backwards: solve=False added the equation and then evaluated it
+    anyway, while the return still reported "solved": False."""
+    assert "if solve else None" in code_of("add_equation")
+    assert "if not solve:" not in code_of("add_equation")
+
+
+def test_add_equation_and_set_equation_agree_on_what_solve_means():
+    """They disagreed, which is how the bug stayed invisible: set_equation
+    was right all along."""
+    for name in ("add_equation", "set_equation"):
+        assert "_evaluate_equations" in source_of(name)
+        assert "if not solve" not in code_of(name)
+
+
+# ---------------------------------------------------------------------------
+# B11 -- flatten_sheet_metal toggled instead of ensuring a state
+# ---------------------------------------------------------------------------
+
+
+def test_flatten_sheet_metal_defaults_to_ensuring_the_flat_state():
+    """It worked as a switch: calling a tool named "flatten" twice FOLDED the
+    part. An agent that retries after a timeout silently undid its own
+    work."""
+    parameters = inspect.signature(TOOLS["flatten_sheet_metal"].fn).parameters
+    assert "state" in parameters
+    assert parameters["state"].default == "flat"
+
+
+def test_flatten_sheet_metal_rejects_an_unknown_state_without_solidworks():
+    with pytest.raises(ValueError, match="state must be"):
+        call("flatten_sheet_metal", state="banana")
+
+
+@pytest.mark.parametrize("state", ["flat", "folded", "toggle"])
+def test_the_three_documented_states_are_accepted(state):
+    """They must get past validation; what happens next needs a document, so
+    the failure here has to be about the document, not the argument."""
+    try:
+        call("flatten_sheet_metal", state=state)
+    except ValueError as exc:
+        assert "state must be" not in str(exc), f"'{state}' was rejected"
+    except Exception:
+        pass  # no SolidWorks / no part: not what this test is about
+
+
+def test_flatten_reports_whether_it_changed_anything():
+    """Idempotence is only useful if the caller can see it happened."""
+    source = source_of("flatten_sheet_metal")
+    assert '"changed": False' in source and '"changed": True' in source
+
+
+def test_asking_for_folded_does_not_create_a_flat_pattern():
+    """A part with no Flat-Pattern feature is already folded; creating one
+    would be a change nobody asked for."""
+    source = source_of("flatten_sheet_metal")
+    assert 'if wanted == "folded":' in source
+    assert "no flat-pattern exists" in source
+
+
+# ---------------------------------------------------------------------------
+# Cross-cutting: arguments are validated before COM is touched
+# ---------------------------------------------------------------------------
+
+VALIDATE_FIRST = ["flatten_sheet_metal", "add_gusset", "dimension_by_entity_ids",
+                  "get_view_entities"]
+
+
+@pytest.mark.parametrize("name", VALIDATE_FIRST)
+def test_argument_validation_comes_before_the_first_com_call(name):
+    """Rejecting a typo should not need a SolidWorks connection.
+
+    It also makes the rule testable: with COM first, every validation test
+    fails on "no active document" instead of on the thing being tested.
+    """
+    source = source_of(name)
+    body = source[source.index("def _impl():"):]
+    first_raise = body.find("raise ValueError")
+    first_com = min((i for i in (body.find("_active_doc()"),
+                                 body.find("_active_drawing()"),
+                                 body.find("_active_assembly()"))
+                     if i != -1), default=-1)
+    assert first_raise != -1, f"{name} validates nothing"
+    assert first_com == -1 or first_raise < first_com, (
+        f"{name} connects to SolidWorks before validating its arguments"
+    )

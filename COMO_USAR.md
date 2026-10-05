@@ -46,7 +46,7 @@ mais.
 
 ## Passo 2 — Instalar o programa
 
-1. Dê **dois cliques** no arquivo `solidworks-mcp-5.9.2.mcpb`
+1. Dê **dois cliques** no arquivo `solidworks-mcp-5.12.0.mcpb`
 2. O Claude Desktop vai abrir e mostrar uma tela de instalação
 3. Clique em **Instalar**
 4. **Feche o Claude Desktop completamente** e abra de novo
@@ -127,7 +127,7 @@ Depois disso ele acerta muito mais nos pedidos seguintes.
 
 ## O que ele sabe fazer
 
-São 143 comandos. Em resumo:
+São 150 comandos. Em resumo:
 
 - **Peças** — esboços, extrusão, corte, revolução, furos, arredondamentos, chanfros, roscas, nervuras
 - **Montagens** — inserir componentes, posicionar, criar acoplamentos (mates), engrenagens, cames, vista explodida
