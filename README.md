@@ -38,7 +38,7 @@ Python e dependencias sozinho a partir do `pyproject.toml` -- necessario porque
 forma portatil.
 
 ```bash
-npx mcpb pack . solidworks-mcp-5.5.0.mcpb
+npx mcpb pack . solidworks-mcp-5.9.2.mcpb
 ```
 
 Abra o SolidWorks (opcional -- o servidor consegue abrir sozinho) e peca para o
@@ -103,7 +103,13 @@ dialogo de confirmacao do SolidWorks, que travaria a chamada COM.
 
 ### Operacoes de corpo / referencia
 `mirror_feature` (OK), `mirror_body` (OK), `move_copy_body` (OK),
-`create_reference_plane` (OK), `set_material` (OK), `set_appearance` (OK),
+`create_reference_plane` (OK), `set_appearance` (OK),
+`set_material` (EXP -- o nome do material e aplicado e lido de volta, mas a
+densidade continua em 1000 kg/m3 (agua): confirmado ao vivo em 05/10/2026,
+mesmo com o `.sldmat` resolvido, ordem de argumentos corrigida e nome da
+configuracao ativa. Massa de `measure_body`/`extract_assembly_data` fica
+errada ate a causa ser encontrada -- ver comentario em `set_material` no
+`server.py`),
 `create_reference_axis` (EXP -- InsertAxis2 depende de selecao valida),
 `combine_bodies` (EXP -- corpos precisam se tocar/interseccionar),
 `split_body` (EXP -- fluxo Pre/PostSplitBody), `add_rib` (EXP)
@@ -274,7 +280,7 @@ fato, e o mesmo padrao de no-op foi corrigido no rebuild de `shell_body`.
 - Late binding (dispatch dinamico) -- igual ao ambiente do Claude Desktop.
 
 ### Camada de metodologia (design-sandbox): instructions, resource e prompt
-As 141 ferramentas sao primitivas; sozinhas nao ensinam a IA a projetar bem.
+As 143 ferramentas sao primitivas; sozinhas nao ensinam a IA a projetar bem.
 O servidor expoe as outras duas primitivas do protocolo MCP para cobrir essa
 lacuna, codificando o metodo ja validado nas replicas de engenharia deste
 projeto (ver `RELATORIO_TESTES.md`) em vez de depender de disciplina manual
@@ -300,7 +306,8 @@ arquivos agora sao expostos tambem como resources
 `solidworks://knowledge/index` + `solidworks://knowledge/<topico>` (materiais,
 tolerancias-e-ajustes, gdt, elementos-de-maquina, chapa-metalica,
 soldas-e-perfis-estruturais, processos-de-fabricacao, verificacao-e-qa,
-roteiro-projetista) -- mesma fonte, lida ao vivo, para os dois clientes
+roteiro-projetista, montagens-mecanicas-reais -- este ultimo adicionado em
+04/10/2026) -- mesma fonte, lida ao vivo, para os dois clientes
 nunca divergirem. Cobrem o que a IA precisa saber pra projetar como um
 projetista/engenheiro de verdade (nao so "como chamar a ferramenta"):
 material certo por aplicacao, ajuste ISO entre furo e eixo, GD&T, dimensao
@@ -322,9 +329,19 @@ de resistencia (nao ha FEA neste MCP; ver `verificacao-e-qa`).
 - Distancias/raios sao convertidos para metros antes de qualquer chamada COM.
 
 ### Proximos passos para "producao completa"
-As ferramentas EXP sao os proximos alvos. As mais impactantes:
-1. `insert_drawing_view` (desbloqueia toda a prancha de desenho -- categoria E).
-2. `create_weldment_profile` (estruturas de plataformas/tanques).
-3. `create_base_flange` (tanques de chapa).
+As ferramentas EXP sao os proximos alvos.
+
+Alvos da lista original, ja concluidos (validados ao vivo, hoje OK):
+1. ~~`insert_drawing_view`~~ (desbloqueia toda a prancha de desenho -- categoria E).
+2. ~~`create_weldment_profile`~~ (estruturas de plataformas/tanques).
+3. ~~`create_base_flange`~~ (tanques de chapa).
+
+Alvos atuais (v5.9.2), por impacto:
+1. `set_material` -- densidade nao aplicada (afeta peso de toda BOM).
+2. Desenho tecnico EXP -- `add_drawing_dimension`, `insert_section_view`,
+   `insert_detail_view`, `add_balloon`, `insert_bom_table`,
+   `insert_cut_list_table`.
+3. `add_end_cap` e `create_helix` -- retornam `None` via COM no SolidWorks 2025
+   (defeito do lado do SolidWorks; investigar alternativa).
 Recomenda-se validar cada fluxo gravando uma macro VBA na versao alvo e
 espelhando a sequencia exata de selecao/chamada COM.
