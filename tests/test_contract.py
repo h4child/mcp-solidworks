@@ -226,6 +226,50 @@ def test_tool_names_are_snake_case():
 
 
 # ---------------------------------------------------------------------------
+# ToolAnnotations (readOnlyHint / destructiveHint / idempotentHint)
+# ---------------------------------------------------------------------------
+#
+# Before this, a client had no way to tell measure_body (safe to auto-approve)
+# from delete_feature (ask first) or run_macro (unpredictable by definition)
+# apart from parsing the docstring -- the MCP spec's own guard-rail for this
+# (ToolAnnotations) was declared on zero of the 150 tools. These tests freeze
+# that classification the same way test_no_tool_disappeared freezes names: a
+# new tool with no annotations, or one whose read-only/destructive claim
+# contradicts its own name, fails loudly instead of silently shipping
+# unannotated.
+
+
+@pytest.mark.parametrize("name", sorted(TOOLS))
+def test_every_tool_declares_annotations(name):
+    assert TOOLS[name].annotations is not None, (
+        f"'{name}' has no ToolAnnotations -- a client can't tell whether it's "
+        f"safe to auto-approve or needs confirmation"
+    )
+
+
+@pytest.mark.parametrize("name", sorted(n for n in TOOLS if n.startswith(("get_", "list_"))))
+def test_get_and_list_tools_are_read_only(name):
+    assert TOOLS[name].annotations.readOnlyHint is True, (
+        f"'{name}' looks like a read tool by name but is not annotated readOnlyHint=True"
+    )
+
+
+@pytest.mark.parametrize("name", sorted(n for n in TOOLS if n.startswith("delete_")))
+def test_delete_tools_are_destructive_and_not_read_only(name):
+    annotations = TOOLS[name].annotations
+    assert annotations.readOnlyHint is not True
+    assert annotations.destructiveHint is True
+
+
+def test_run_macro_and_execute_python_are_the_only_open_world_tools():
+    """Every other tool's effect is confined to the local SolidWorks session
+    and the project folder -- a closed world. These two run arbitrary,
+    unreviewed code/macro bodies, which is open-world by definition."""
+    open_world = {n for n in TOOLS if TOOLS[n].annotations.openWorldHint}
+    assert open_world == {"run_macro", "execute_python"}
+
+
+# ---------------------------------------------------------------------------
 # The drawing layer specifically
 # ---------------------------------------------------------------------------
 

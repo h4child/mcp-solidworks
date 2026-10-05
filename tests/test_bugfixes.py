@@ -13,6 +13,7 @@ Run with:  python -m pytest tests/test_bugfixes.py -q
 import asyncio
 import inspect
 import io
+import logging
 import os
 import sys
 import textwrap
@@ -501,3 +502,273 @@ def test_argument_validation_comes_before_the_first_com_call(name):
     assert first_com == -1 or first_raise < first_com, (
         f"{name} connects to SolidWorks before validating its arguments"
     )
+
+
+# ---------------------------------------------------------------------------
+# R3.20 -- structured call log (one JSON line per tool call)
+# ---------------------------------------------------------------------------
+
+
+def test_every_call_is_logged_as_one_json_object_regardless_of_outcome():
+    """The log has to come from one place all 150 tools pass through.
+
+    Every tool defines its own `_impl` closure, so the existing human debug
+    log always prints "COM call: _impl" -- useless for telling which tool
+    was actually called. This logs through ToolManager.call_tool instead
+    (patched once in _install_call_logging), so it can't go stale just
+    because a new tool's _impl is named the same as everyone else's.
+    """
+    import json
+
+    records = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(json.loads(record.getMessage()))
+
+    handler = _Capture()
+    server.log_calls.addHandler(handler)
+    try:
+        asyncio.run(server.mcp._tool_manager.call_tool("set_units", {"unit": "mm"}))
+        with pytest.raises(Exception):
+            asyncio.run(server.mcp._tool_manager.call_tool(
+                "set_units", {"unit": "not-a-unit"}))
+    finally:
+        server.log_calls.removeHandler(handler)
+
+    assert len(records) == 2
+    ok_record, failed_record = records
+    assert ok_record["tool"] == "set_units"
+    assert ok_record["arguments"] == {"unit": "mm"}
+    assert ok_record["ok"] is True
+    assert "error" not in ok_record
+    assert isinstance(ok_record["duration_ms"], (int, float))
+
+    assert failed_record["ok"] is False
+    assert "error" in failed_record and failed_record["error"]
+
+
+def test_long_argument_values_are_summarized_not_dropped_or_unbounded():
+    """A full macro body or an embedded image in the log would make it
+    unreadable; dropping the argument entirely would make it useless for
+    telling two calls to the same tool apart."""
+    long_value = "x" * 5000
+    summary = server._summarize_call_argument(long_value)
+    assert isinstance(summary, str)
+    assert len(summary) < len(long_value)
+    assert "5000 chars" in summary
+
+
+# ---------------------------------------------------------------------------
+# R3.22 -- path policy by project root (writes only)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def project_root(tmp_path, monkeypatch):
+    """A configured allowlist of exactly one root, cleaned up afterwards so
+    it can never leak into a test that runs after this one."""
+    monkeypatch.setenv(server.PROJECT_ROOTS_ENV, str(tmp_path))
+    yield tmp_path
+
+
+def test_with_no_roots_configured_resolution_is_unrestricted(monkeypatch):
+    """A single engineer driving their own already-open SolidWorks needs no
+    extra configuration for save_document/export_document/pack_and_go to
+    keep working exactly as before this existed."""
+    monkeypatch.delenv(server.PROJECT_ROOTS_ENV, raising=False)
+    resolved = server._resolve_write_path("relative/out.step")
+    assert resolved == os.path.abspath("relative/out.step")
+
+
+def test_a_path_outside_the_configured_root_is_refused(project_root):
+    outside = os.path.join(str(project_root.parent), "elsewhere.step")
+    with pytest.raises(PermissionError, match="outside the configured project root"):
+        server._resolve_write_path(outside)
+
+
+def test_a_path_inside_the_configured_root_is_allowed(project_root):
+    inside = os.path.join(str(project_root), "sub", "part.step")
+    assert server._resolve_write_path(inside) == os.path.abspath(inside)
+
+
+WRITE_TOOLS_WITH_A_DESTINATION = [
+    "save_document", "export_document", "export_flat_pattern_dxf",
+    "pack_and_go", "capture_standard_views", "capture_viewport",
+]
+
+
+@pytest.mark.parametrize("name", WRITE_TOOLS_WITH_A_DESTINATION)
+def test_every_write_destination_tool_uses_the_shared_resolver(name):
+    """A write tool that calls bare os.path.abspath instead of
+    _resolve_write_path silently bypasses the allowlist for itself alone --
+    exactly the kind of one-tool regression freezing the surface is for."""
+    source = source_of(name)
+    assert "_resolve_write_path(" in source, (
+        f"'{name}' takes a write destination but does not route it through "
+        f"_resolve_write_path -- it would bypass {server.PROJECT_ROOTS_ENV}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# R3.23 -- macros only from a trusted folder
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def macro_file(tmp_path):
+    path = tmp_path / "demo.swp"
+    path.write_bytes(b"not a real macro, just needs to exist")
+    return path
+
+
+def test_with_no_macro_roots_configured_any_macro_path_resolves(macro_file, monkeypatch):
+    """Unchanged from before this existed, for anyone who hasn't configured
+    a macro folder: any existing .swp/.swb/.dll by path."""
+    monkeypatch.delenv(server.MACRO_ROOTS_ENV, raising=False)
+    assert server._resolve_macro_path(str(macro_file)) == os.path.abspath(str(macro_file))
+
+
+def test_a_macro_outside_the_configured_root_is_refused(macro_file, monkeypatch, tmp_path_factory):
+    other_root = tmp_path_factory.mktemp("trusted_macros")
+    monkeypatch.setenv(server.MACRO_ROOTS_ENV, str(other_root))
+    with pytest.raises(PermissionError, match="outside the configured macro root"):
+        server._resolve_macro_path(str(macro_file))
+
+
+def test_a_macro_inside_the_configured_root_is_allowed(macro_file, monkeypatch):
+    monkeypatch.setenv(server.MACRO_ROOTS_ENV, str(macro_file.parent))
+    assert server._resolve_macro_path(str(macro_file)) == os.path.abspath(str(macro_file))
+
+
+def test_the_macro_allowlist_is_separate_from_the_write_path_allowlist():
+    """Being allowed to write a BOM export into a project folder says
+    nothing about whether code dropped in that same folder should be
+    allowed to run -- these must be two different environment variables."""
+    assert server.MACRO_ROOTS_ENV != server.PROJECT_ROOTS_ENV
+
+
+# ---------------------------------------------------------------------------
+# R3.24 -- execute_python is registered only when explicitly enabled
+# ---------------------------------------------------------------------------
+#
+# These import a FRESH `server` module in a subprocess, deliberately not
+# through tests/conftest.py's fake-COM import (which, for every other test
+# in this suite, defaults SOLIDWORKS_MCP_ENABLE_EXECUTE_PYTHON to "1" so the
+# full 150-tool catalog -- including this test file's own
+# test_run_macro_and_execute_python_are_the_only_open_world_tools in
+# test_contract.py -- is there to test against). Checking the real default
+# needs a process that never applies that convenience.
+
+_CHECK_REGISTERED = (
+    "import sys; sys.path.insert(0, '.'); "
+    "from unittest.mock import MagicMock; "
+    "sys.modules.setdefault('pythoncom', MagicMock()); "
+    "sys.modules.setdefault('win32com', MagicMock()); "
+    "sys.modules.setdefault('win32com.client', MagicMock()); "
+    "import server; "
+    "print('execute_python' in server.mcp._tool_manager._tools)"
+)
+
+
+def _is_execute_python_registered(env_value):
+    import subprocess
+    env = dict(os.environ)
+    if env_value is None:
+        env.pop("SOLIDWORKS_MCP_ENABLE_EXECUTE_PYTHON", None)
+    else:
+        env["SOLIDWORKS_MCP_ENABLE_EXECUTE_PYTHON"] = env_value
+    result = subprocess.run([sys.executable, "-c", _CHECK_REGISTERED], cwd=ROOT,
+                            env=env, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip().splitlines()[-1] == "True"
+
+
+def test_execute_python_is_not_registered_by_default():
+    """Not 'registered but rejects the call' -- genuinely absent from the
+    catalog, so a model never even sees it costs it no context tokens."""
+    assert _is_execute_python_registered(None) is False
+
+
+def test_execute_python_is_registered_when_explicitly_enabled():
+    assert _is_execute_python_registered("1") is True
+
+
+@pytest.mark.parametrize("off_value", ["0", "false", "", "no"])
+def test_execute_python_stays_unregistered_for_every_falsy_spelling(off_value):
+    assert _is_execute_python_registered(off_value) is False
+
+
+# ---------------------------------------------------------------------------
+# R3.4 -- per-tool timeout budget instead of one flat 120s
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _restore_com_timeout():
+    """Several tests below intentionally change the module-level override;
+    leaving it changed would make every OTHER test in the suite (and every
+    other test file importing the same `server` module in this process)
+    silently run under a different budget than it was written against."""
+    original = server.COM_TIMEOUT_SECONDS
+    yield
+    server.COM_TIMEOUT_SECONDS = original
+
+
+@pytest.mark.parametrize("name,expected", [
+    ("get_document_info", 15),       # simple read
+    ("measure_body", 15),
+    ("extract_assembly_bom", 300),   # assembly-scale read
+    ("list_components", 300),
+    ("export_document", 900),        # batch export
+    ("pack_and_go", 900),
+    ("connect_solidworks", 240),     # cold launch
+    ("add_mate", 60),                # ordinary feature/setter
+    ("set_material", 60),
+])
+def test_each_category_gets_its_own_timeout_budget(name, expected):
+    assert server._timeout_budget_for(name) == expected
+
+
+def test_an_unregistered_name_falls_back_to_the_feature_budget():
+    """Not found in the tool registry at all (renamed, or called from
+    outside any real tool invocation) can't be proven read-only, so it gets
+    the ordinary feature/setter budget rather than being trusted with the
+    tight 15s read budget."""
+    assert server._timeout_budget_for("not_a_real_tool") == server._FEATURE_TIMEOUT_SECONDS
+
+
+def test_no_current_tool_falls_back_to_the_plain_default():
+    """_run can be reached with no tool name in context at all (nothing has
+    called through ToolManager.call_tool yet) -- that case gets the original
+    flat default, not a guess."""
+    assert server._timeout_budget_for(None) == server._DEFAULT_COM_TIMEOUT_SECONDS
+
+
+def test_raising_the_global_override_widens_every_category_not_just_the_default():
+    """tests/run_live_test_project.py sets server.COM_TIMEOUT_SECONDS directly
+    to give a whole live run more room -- that has to keep working, and has
+    to apply to every tool it then calls, not just the ones that would
+    otherwise fall back to the plain default."""
+    server.COM_TIMEOUT_SECONDS = 600
+    assert server._timeout_budget_for("get_document_info") == 600
+    assert server._timeout_budget_for("export_document") == 600
+
+
+def test_connect_solidworks_budget_exceeds_its_own_internal_launch_wait():
+    """_connect()'s cold-launch retry loop is itself bounded at 120s; the
+    outer budget has to be strictly larger, or asyncio.wait_for can fire
+    first with a confusing timeout message while the launch is still
+    legitimately in progress."""
+    # connect_solidworks itself just calls _connect(); the 120s bound lives
+    # in _connect's own source.
+    connect_source = inspect.getsource(server._connect)
+    assert "120" in connect_source
+    assert server.TIMEOUT_BUDGET_OVERRIDES["connect_solidworks"] > 120
+
+
+def test_every_tool_name_used_in_the_assembly_or_batch_sets_actually_exists():
+    """A renamed tool left in one of these sets would silently stop getting
+    its intended budget and fall through to the generic one instead."""
+    for name in server.ASSEMBLY_SCALE_TOOLS | server.BATCH_EXPORT_TOOLS | set(server.TIMEOUT_BUDGET_OVERRIDES):
+        assert name in TOOLS, f"'{name}' is in a timeout-budget set but is not a registered tool"

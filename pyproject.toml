@@ -16,6 +16,34 @@ dependencies = [
 [project.license]
 text = "MIT"
 
+[dependency-groups]
+# Everything here runs on any OS: tests/conftest.py fakes win32com/pythoncom
+# when the real pywin32 is not importable, so `uv sync --group dev` and
+# `pytest` work the same on a Linux CI runner as on a Windows dev machine --
+# no SolidWorks license or install required for this group.
+dev = [
+    "pytest>=8.0",
+    # A regression that turns a "wait for the document to reach a state"
+    # loop into an infinite one (see B11-era bugs) must fail the test that
+    # exercises it, not hang the run -- a bare `pytest tests/` without this
+    # would otherwise stall CI until the job's outer timeout kills it with
+    # no indication of which test was responsible.
+    "pytest-timeout>=2.3",
+    "ruff>=0.6",
+]
+
+[tool.ruff.lint]
+# The standard conservative baseline (real errors, not style opinions):
+# E9 (syntax), E4/E7 (import/statement correctness) and F (pyflakes --
+# unused imports/variables, undefined names). A newer ruff's bare default
+# pulls in extra categories (blind-except, try-except-pass, pyupgrade...)
+# that would fail on hundreds of pre-existing, deliberate patterns this
+# codebase documents at length elsewhere (e.g. the many `except Exception:
+# pass` blocks around optional COM properties) -- flagging those is a
+# separate, much larger decision, not something to smuggle in via a CI
+# bring-up.
+select = ["E4", "E7", "E9", "F"]
+
 [tool.pytest.ini_options]
 # Collect ONLY test_*.py. The run_*_live_test.py scripts in tests/ match
 # pytest's default "*_test.py" pattern, and they are not tests: they are
@@ -24,3 +52,10 @@ text = "MIT"
 # geometry and then abort the whole run with an INTERNALERROR.
 python_files = ["test_*.py"]
 testpaths = ["tests"]
+# Belt-and-suspenders alongside the fake COM layer: if a future "poll until
+# the document reaches a state" loop (see tests/conftest.py's docstring)
+# ever again spins forever against a mock that never matches, the one test
+# exercising it times out instead of hanging every test queued behind it on
+# the single COM worker thread.
+timeout = 30
+timeout_method = "thread"

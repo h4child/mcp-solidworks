@@ -221,10 +221,10 @@ async def main():
     lengths = sorted({e.get("length_model_mm") for e in entities
                       if e.get("length_model_mm")}, reverse=True)
     check("the 2400 mm edge is found with its MODEL length, not its sheet length",
-          any(abs((l or 0) - LENGTH_MM) < 1 for l in lengths),
+          any(abs((length_mm or 0) - LENGTH_MM) < 1 for length_mm in lengths),
           f"longest lengths found: {lengths[:4]}")
     check("the 150 mm edge is also found",
-          any(abs((l or 0) - HEIGHT_MM) < 1 for l in lengths),
+          any(abs((length_mm or 0) - HEIGHT_MM) < 1 for length_mm in lengths),
           f"lengths: {lengths[:6]}")
 
     circles = [e for e in entities if e["kind"] == "circle"]

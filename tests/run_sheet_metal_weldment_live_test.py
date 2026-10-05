@@ -18,7 +18,6 @@ import argparse
 import asyncio
 import json
 import math
-import os
 import sys
 from datetime import datetime
 from pathlib import Path

@@ -24,6 +24,7 @@ import logging
 import tempfile
 import functools
 import contextlib
+import contextvars
 import concurrent.futures
 from typing import Optional
 
@@ -32,6 +33,7 @@ import pythoncom
 
 from mcp.server.fastmcp import FastMCP, Image
 from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
+from mcp.types import ToolAnnotations
 from pydantic import ConfigDict
 
 # Drawing geometry, selection policy and verification rules. Kept in a
@@ -52,6 +54,76 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("solidworks-mcp")
+
+# ---------------------------------------------------------------------------
+# Structured call log (one JSON line per tool call)
+# ---------------------------------------------------------------------------
+# The log above is for a human watching the console. It is useless for
+# reconstructing what an agent actually called after the fact -- every tool's
+# COM work runs through a locally-defined `_impl` closure, so the existing
+# "COM call: %s" debug line always prints the same literal name ("_impl"),
+# never the tool's. This is a second, independent, append-only log: one JSON
+# object per call (tool, a truncated view of its arguments, duration, and
+# whether it raised), written by _log_tool_call via the single place every
+# call already passes through regardless of which of the 150 tools it is --
+# ToolManager.call_tool (patched onto `mcp` once below) -- rather than by
+# touching each tool function.
+CALL_LOG_PATH = os.environ.get(
+    "SOLIDWORKS_MCP_CALL_LOG",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "calls.jsonl"),
+)
+log_calls = logging.getLogger("solidworks-mcp.calls")
+log_calls.setLevel(logging.INFO)
+log_calls.propagate = False  # this is a data file, not console chatter
+try:
+    _calls_handler = logging.FileHandler(CALL_LOG_PATH, encoding="utf-8")
+    _calls_handler.setFormatter(logging.Formatter("%(message)s"))
+    log_calls.addHandler(_calls_handler)
+except OSError as exc:
+    # A read-only install directory or a locked-down profile folder shouldn't
+    # take the whole server down over an audit trail it can live without.
+    log.warning("Could not open call log at %s (%s); call logging disabled",
+                CALL_LOG_PATH, exc)
+
+# Argument values can be long (a filepath, a macro's full source) or bulky
+# (an embedded image). The call log is for "what was called, with roughly
+# what, how long did it take, did it fail" -- not a faithful replay record --
+# so each value is summarized rather than stored in full.
+_CALL_LOG_MAX_VALUE_LEN = 200
+
+
+def _summarize_call_argument(value):
+    if isinstance(value, str):
+        return value if len(value) <= _CALL_LOG_MAX_VALUE_LEN else (
+            f"{value[:_CALL_LOG_MAX_VALUE_LEN]}... ({len(value)} chars)")
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return {str(k): _summarize_call_argument(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        shown = [_summarize_call_argument(v) for v in value[:20]]
+        if len(value) > 20:
+            shown.append(f"... ({len(value)} items total)")
+        return shown
+    return repr(value)[:_CALL_LOG_MAX_VALUE_LEN]
+
+
+def _log_tool_call(name: str, arguments: dict, duration_ms: float,
+                    ok: bool, error: Optional[str]) -> None:
+    import json as _json  # local import: this module is logging-only, not a hot path
+    record = {
+        "ts": time.time(),
+        "tool": name,
+        "arguments": {k: _summarize_call_argument(v) for k, v in (arguments or {}).items()},
+        "duration_ms": duration_ms,
+        "ok": ok,
+    }
+    if error is not None:
+        record["error"] = error[:_CALL_LOG_MAX_VALUE_LEN]
+    try:
+        log_calls.info(_json.dumps(record, default=str))
+    except Exception:
+        log.debug("Failed to write structured call log entry", exc_info=True)
 
 SERVER_INSTRUCTIONS = """\
 Este servidor controla uma sessao REAL e ja aberta do SolidWorks via COM: \
@@ -97,6 +169,39 @@ SOLIDWORKS_MCP_ENABLE_EXECUTE_PYTHON=1 ja configurado.
 
 mcp = FastMCP("solidworks-mcp", instructions=SERVER_INSTRUCTIONS)
 
+
+def _install_call_instrumentation(server: FastMCP) -> None:
+    """Wrap the one place every tool call passes through regardless of which
+    of the 150 tools it is: a structured log entry (see CALL_LOG_PATH above)
+    and the per-tool timeout budget (see _timeout_budget_for below), neither
+    of which _run can tell on its own -- every tool's COM work runs through
+    a locally-defined `_impl` closure, so by the time a call reaches _run,
+    the one piece of identifying information already available to
+    ToolManager.call_tool (the tool's name) has been lost."""
+    tool_manager = server._tool_manager
+    original_call_tool = tool_manager.call_tool
+
+    async def instrumented_call_tool(name, arguments, *args, **kwargs):
+        token = _current_tool_name.set(name)
+        start = time.monotonic()
+        try:
+            result = await original_call_tool(name, arguments, *args, **kwargs)
+        except Exception as exc:
+            _log_tool_call(name, arguments, round((time.monotonic() - start) * 1000, 1),
+                            ok=False, error=f"{type(exc).__name__}: {exc}")
+            raise
+        else:
+            _log_tool_call(name, arguments, round((time.monotonic() - start) * 1000, 1),
+                            ok=True, error=None)
+            return result
+        finally:
+            _current_tool_name.reset(token)
+
+    tool_manager.call_tool = instrumented_call_tool
+
+
+_install_call_instrumentation(mcp)
+
 # ---------------------------------------------------------------------------
 # Single-threaded COM executor
 # ---------------------------------------------------------------------------
@@ -107,7 +212,72 @@ mcp = FastMCP("solidworks-mcp", instructions=SERVER_INSTRUCTIONS)
 
 _executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="sw-com")
 
-COM_TIMEOUT_SECONDS = 120
+# A single flat timeout punished every tool the same: a get_document_info
+# that hangs is indistinguishable from a 400-component BOM that is
+# legitimately still working, for up to the same 120s either way. Below,
+# _timeout_budget_for gives each tool a budget sized to what it actually
+# does; COM_TIMEOUT_SECONDS remains exactly what it always was -- the
+# fallback for anything not otherwise categorized, AND (unchanged) a knob
+# tests/run_live_test_project.py already pokes directly to widen it for a
+# whole live run. The sentinel comparison below is what keeps that working:
+# raising COM_TIMEOUT_SECONDS above its own default overrides every
+# category's budget rather than being floored by them, which is what that
+# script actually wants ("give the live run more room"), not a 15s cap on
+# every read tool it then calls.
+_DEFAULT_COM_TIMEOUT_SECONDS = 120
+COM_TIMEOUT_SECONDS = _DEFAULT_COM_TIMEOUT_SECONDS
+
+# Sizes from the PDF's own R3.4: simple read 15s; ordinary feature/setter
+# 60s; assembly/BOM-scale read 300s; batch file export 900s;
+# connect_solidworks with a cold SolidWorks launch 240s (its own internal
+# wait loop in _connect() is itself bounded at 120s -- this has to be larger
+# than that, not equal to it, or the outer timeout can fire first with a
+# more confusing message while the launch is still legitimately in progress).
+_READ_SIMPLE_TIMEOUT_SECONDS = 15
+_FEATURE_TIMEOUT_SECONDS = 60
+_ASSEMBLY_SCALE_TIMEOUT_SECONDS = 300
+_BATCH_EXPORT_TIMEOUT_SECONDS = 900
+
+# Per-tool overrides, checked first. Everything else falls back to either
+# the assembly-scale or the plain read/feature budget below.
+TIMEOUT_BUDGET_OVERRIDES = {
+    "connect_solidworks": 240,
+}
+
+# Reading the whole assembly tree, cross-component interference or a
+# component/feature/mate listing legitimately scales with model size --
+# these are reads, but not the "stuck in under 15s or something is wrong"
+# kind get_document_info or measure_body are.
+ASSEMBLY_SCALE_TOOLS = frozenset({
+    "extract_assembly_bom", "extract_assembly_data", "interference_check",
+    "list_components", "list_mates", "list_features", "list_faces",
+    "list_configurations", "list_display_states", "list_motion_studies",
+})
+
+BATCH_EXPORT_TOOLS = frozenset({"export_document", "export_flat_pattern_dxf", "pack_and_go"})
+
+# Set by _install_call_instrumentation's wrapper around ToolManager.call_tool
+# (the one place that knows which of the 150 tools is running) and read by
+# _run, several `await`s deeper in the same task -- a plain module-level
+# variable would race under concurrent calls, but a contextvar is scoped to
+# the call that set it regardless of how many other calls are in flight.
+_current_tool_name = contextvars.ContextVar("current_tool_name", default=None)
+
+
+def _timeout_budget_for(tool_name: Optional[str]) -> float:
+    if COM_TIMEOUT_SECONDS != _DEFAULT_COM_TIMEOUT_SECONDS:
+        return COM_TIMEOUT_SECONDS  # explicit override in effect; see above
+    if tool_name is None:
+        return _DEFAULT_COM_TIMEOUT_SECONDS
+    if tool_name in TIMEOUT_BUDGET_OVERRIDES:
+        return TIMEOUT_BUDGET_OVERRIDES[tool_name]
+    if tool_name in BATCH_EXPORT_TOOLS:
+        return _BATCH_EXPORT_TIMEOUT_SECONDS
+    if tool_name in ASSEMBLY_SCALE_TOOLS:
+        return _ASSEMBLY_SCALE_TIMEOUT_SECONDS
+    tool = mcp._tool_manager._tools.get(tool_name)
+    read_only = bool(tool is not None and tool.annotations and tool.annotations.readOnlyHint)
+    return _READ_SIMPLE_TIMEOUT_SECONDS if read_only else _FEATURE_TIMEOUT_SECONDS
 
 
 def _init_com_thread():
@@ -140,17 +310,18 @@ atexit.register(_shutdown)
 
 async def _run(fn, *args, **kwargs):
     fn_name = fn.__name__ if hasattr(fn, "__name__") else str(fn)
-    log.debug("COM call: %s", fn_name)
+    timeout = _timeout_budget_for(_current_tool_name.get())
+    log.debug("COM call: %s (timeout budget %ss)", fn_name, timeout)
     loop = asyncio.get_event_loop()
     future = loop.run_in_executor(_executor, functools.partial(fn, *args, **kwargs))
     try:
-        result = await asyncio.wait_for(future, timeout=COM_TIMEOUT_SECONDS)
+        result = await asyncio.wait_for(future, timeout=timeout)
         log.debug("COM call OK: %s", fn_name)
         return result
     except asyncio.TimeoutError:
-        log.error("COM operation timed out after %ds: %s", COM_TIMEOUT_SECONDS, fn_name)
+        log.error("COM operation timed out after %ds: %s", timeout, fn_name)
         raise RuntimeError(
-            f"SolidWorks operation timed out after {COM_TIMEOUT_SECONDS}s. "
+            f"SolidWorks operation timed out after {timeout}s. "
             "The application may be blocked by a dialog or heavy computation. "
             "Close any open dialogs and retry."
         )
@@ -182,6 +353,48 @@ def to_meters(value: float, unit: Optional[str]) -> float:
     if u not in UNIT_TO_METERS:
         raise ValueError(f"Unknown unit '{unit}'. Use one of: {', '.join(UNIT_TO_METERS)}")
     return value * UNIT_TO_METERS[u]
+
+
+# ---------------------------------------------------------------------------
+# Project-root path policy (writes only)
+# ---------------------------------------------------------------------------
+# Opt-in. A single engineer driving their own, already-open SolidWorks needs
+# no restriction to save or export into their own project tree -- so with
+# nothing configured this is exactly the os.path.abspath every write call
+# already did. Set SOLIDWORKS_MCP_PROJECT_ROOTS (one or more absolute
+# directories, separated by os.pathsep) when this server runs on someone
+# else's behalf against a managed folder -- the Alfa Detail AI backend
+# driving a shared project tree is exactly this case -- so a wrong or
+# model-generated path can't write or overwrite anything outside it.
+PROJECT_ROOTS_ENV = "SOLIDWORKS_MCP_PROJECT_ROOTS"
+
+
+def _configured_project_roots() -> list:
+    raw = os.environ.get(PROJECT_ROOTS_ENV, "")
+    return [os.path.abspath(p) for p in raw.split(os.pathsep) if p.strip()]
+
+
+def _resolve_write_path(path: str) -> str:
+    """Resolve a tool-supplied output path for a WRITE, enforcing the
+    project-root allowlist when PROJECT_ROOTS_ENV is set.
+
+    Every tool that creates or overwrites a file on disk (save_document,
+    export_document, export_flat_pattern_dxf, pack_and_go,
+    capture_standard_views, capture_viewport) must resolve its destination
+    through this, not a bare os.path.abspath, or a configured allowlist is
+    silently bypassed for that one tool."""
+    abs_path = os.path.abspath(path)
+    roots = _configured_project_roots()
+    if roots and not any(
+        abs_path == root or abs_path.startswith(root + os.sep) for root in roots
+    ):
+        raise PermissionError(
+            f"Refusing to write to '{abs_path}': it is outside the configured "
+            f"project root(s) ({PROJECT_ROOTS_ENV}="
+            f"{os.environ.get(PROJECT_ROOTS_ENV)!r}). Pass a path inside one "
+            f"of those roots, or reconfigure {PROJECT_ROOTS_ENV}."
+        )
+    return abs_path
 
 
 # ---------------------------------------------------------------------------
@@ -894,7 +1107,7 @@ def _select_component(assy, name: str):
 # Connection tools
 # ===========================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def connect_solidworks() -> dict:
     """Connect to a running SolidWorks instance, launching it if it isn't open yet."""
 
@@ -908,7 +1121,7 @@ async def connect_solidworks() -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def get_solidworks_info() -> dict:
     """Get the connected SolidWorks application's version and visibility state."""
 
@@ -926,7 +1139,7 @@ async def get_solidworks_info() -> dict:
 # Document tools
 # ===========================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def create_new_part() -> dict:
     """Create a new part document from the default part template."""
 
@@ -946,7 +1159,7 @@ async def create_new_part() -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def create_new_assembly() -> dict:
     """Create a new assembly document from the default assembly template."""
 
@@ -961,7 +1174,7 @@ async def create_new_assembly() -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def create_new_drawing() -> dict:
     """Create a new drawing document from the default drawing template."""
 
@@ -985,7 +1198,7 @@ async def create_new_drawing() -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def insert_drawing_view(source_filepath: str, view_type: str = "front",
                                x: float = 150, y: float = 150,
                                scale: float = 1.0, unit: Optional[str] = None) -> dict:
@@ -1146,7 +1359,7 @@ async def insert_drawing_view(source_filepath: str, view_type: str = "front",
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def open_document(filepath: str) -> dict:
     """Open an existing SolidWorks file (.sldprt, .sldasm, or .slddrw)."""
 
@@ -1170,7 +1383,7 @@ async def open_document(filepath: str) -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False))
 async def close_document(save: bool = False) -> dict:
     """Close the active document, optionally saving it first."""
 
@@ -1190,14 +1403,14 @@ async def close_document(save: bool = False) -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False))
 async def save_document(filepath: Optional[str] = None) -> dict:
     """Save the active document. Omit filepath to save in place."""
 
     def _impl():
         doc = _active_doc()
         if filepath:
-            abs_path = os.path.abspath(filepath)
+            abs_path = _resolve_write_path(filepath)
             os.makedirs(os.path.dirname(abs_path), exist_ok=True)
             ok = False
             try:
@@ -1221,7 +1434,7 @@ async def save_document(filepath: Optional[str] = None) -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def get_document_info() -> dict:
     """Get the active document's title, path, and document type."""
 
@@ -1237,7 +1450,7 @@ async def get_document_info() -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def list_open_documents() -> dict:
     """List every SolidWorks document currently open."""
 
@@ -1262,7 +1475,7 @@ async def list_open_documents() -> dict:
 # Assembly tools
 # ===========================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def insert_component(filepath: str, x: float = 0, y: float = 0, z: float = 0,
                             unit: Optional[str] = None) -> dict:
     """Insert an existing part or sub-assembly file into the active assembly at a position.
@@ -1283,7 +1496,7 @@ async def insert_component(filepath: str, x: float = 0, y: float = 0, z: float =
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def list_components(top_level_only: bool = False) -> dict:
     """List the components of the active assembly, at every level by default.
 
@@ -1345,7 +1558,7 @@ async def list_components(top_level_only: bool = False) -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def extract_assembly_data(config: str = "") -> dict:
     """Walk every TOP-LEVEL component of the active assembly and return name,
     material/custom properties, and mass/dimensions for each one in a single call.
@@ -1578,7 +1791,7 @@ def _walk_assembly(comp, level: int, parent: Optional[str], out: list,
         _walk_assembly(child, level + 1, flags["name"], out, max_depth, visited)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def extract_assembly_bom(config: str = "",
                                include_subassemblies: bool = True,
                                include_suppressed: bool = False,
@@ -1727,7 +1940,7 @@ async def extract_assembly_bom(config: str = "",
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def get_component_transform(name: str, unit: Optional[str] = None) -> dict:
     """Read an assembly component's exact position and orientation.
 
@@ -1767,7 +1980,7 @@ async def get_component_transform(name: str, unit: Optional[str] = None) -> dict
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def set_component_transform(
     name: str,
     x: float = 0,
@@ -1841,7 +2054,7 @@ async def set_component_transform(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def capture_standard_views(output_dir: str = "tests/output", prefix: str = "model") -> dict:
     """Export front, back, top, bottom, and isometric PNG views of the active model.
 
@@ -1854,7 +2067,7 @@ async def capture_standard_views(output_dir: str = "tests/output", prefix: str =
         if not prefix or any(char in prefix for char in '\\/:*?"<>|'):
             raise ValueError("prefix must be a non-empty filename stem without path characters.")
         doc = _active_doc()
-        target_dir = os.path.abspath(output_dir)
+        target_dir = _resolve_write_path(output_dir)
         os.makedirs(target_dir, exist_ok=True)
         views = (
             ("front", "*Front", 1), ("back", "*Back", 2),
@@ -1877,7 +2090,7 @@ async def capture_standard_views(output_dir: str = "tests/output", prefix: str =
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def fix_component(name: str) -> dict:
     """Fix a component in place (removes its remaining degrees of freedom)."""
 
@@ -1890,7 +2103,7 @@ async def fix_component(name: str) -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def float_component(name: str) -> dict:
     """Float a previously fixed component, giving it back its degrees of freedom."""
 
@@ -1903,7 +2116,7 @@ async def float_component(name: str) -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False))
 async def delete_component(name: str) -> dict:
     """Remove a component from the active assembly."""
 
@@ -1917,7 +2130,7 @@ async def delete_component(name: str) -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def suppress_component(name: str) -> dict:
     """Suppress a component in the active assembly (hides it and excludes from calculations)."""
 
@@ -1935,7 +2148,7 @@ async def suppress_component(name: str) -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def unsuppress_component(name: str) -> dict:
     """Unsuppress a previously suppressed component in the active assembly."""
 
@@ -1953,7 +2166,7 @@ async def unsuppress_component(name: str) -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def add_mate(mate_type: str, point1: dict, point2: dict) -> dict:
     """Mate two faces/planes, each chosen by a point that
     lies on it, e.g. point1={"x":0,"y":0,"z":0,"unit":"mm"}. Supported mate_type
@@ -1996,7 +2209,7 @@ async def add_mate(mate_type: str, point1: dict, point2: dict) -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def list_mates() -> dict:
     """List every mate (constraint) in the active assembly."""
 
@@ -2028,7 +2241,7 @@ async def list_mates() -> dict:
 # Motion Study tools
 # ===========================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def list_motion_studies() -> dict:
     """List native SolidWorks Motion Studies in the active assembly or part.
 
@@ -2048,7 +2261,7 @@ async def list_motion_studies() -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def create_motion_study(name: Optional[str] = None, activate: bool = True) -> dict:
     """Create and optionally activate a native SolidWorks Animation study.
 
@@ -2087,7 +2300,7 @@ async def create_motion_study(name: Optional[str] = None, activate: bool = True)
 # Export tools
 # ===========================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False))
 async def export_document(filepath: str) -> dict:
     """Export the active document to STEP, STL, IGES, PDF, DWG, DXF or Parasolid.
 
@@ -2101,7 +2314,7 @@ async def export_document(filepath: str) -> dict:
     extra files are not named by the caller."""
 
     def _impl():
-        abs_path = os.path.abspath(filepath)
+        abs_path = _resolve_write_path(filepath)
         ext = os.path.splitext(abs_path)[1].lower()
         valid = {".step", ".stp", ".stl", ".igs", ".iges", ".pdf", ".dwg", ".dxf",
                  ".x_t", ".x_b", ".sat", ".3mf"}
@@ -2164,7 +2377,7 @@ async def export_document(filepath: str) -> dict:
 # Sketch tools
 # ===========================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def create_sketch(plane: str = "front") -> dict:
     """Create a sketch on a standard plane or a named reference plane.
 
@@ -2189,7 +2402,7 @@ async def create_sketch(plane: str = "front") -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def create_sketch_on_face(x: float = 0, y: float = 0, z: float = 0, unit: Optional[str] = None) -> dict:
     """Create a sketch on an existing body face, chosen by a point known to lie on it.
 
@@ -2250,7 +2463,7 @@ async def create_sketch_on_face(x: float = 0, y: float = 0, z: float = 0, unit: 
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def close_sketch() -> dict:
     """Exit the currently active sketch."""
 
@@ -2279,7 +2492,7 @@ async def close_sketch() -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def get_sketch_status() -> dict:
     """Report whether a sketch is currently active, and its name if so."""
 
@@ -2297,7 +2510,7 @@ async def get_sketch_status() -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def draw_line(x1: float = 0, y1: float = 0, x2: float = 100, y2: float = 0, unit: Optional[str] = None) -> dict:
     """Draw a line in the active sketch from (x1, y1) to (x2, y2)."""
 
@@ -2316,7 +2529,7 @@ async def draw_line(x1: float = 0, y1: float = 0, x2: float = 100, y2: float = 0
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def draw_centerline(x1: float = 0, y1: float = 0, x2: float = 0, y2: float = 100,
                            unit: Optional[str] = None) -> dict:
     """Draw a centerline (construction geometry) in the active PART/ASSEMBLY sketch.
@@ -2345,7 +2558,7 @@ async def draw_centerline(x1: float = 0, y1: float = 0, x2: float = 0, y2: float
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def draw_circle(x: float = 0, y: float = 0, radius: float = 25, unit: Optional[str] = None) -> dict:
     """Draw a circle in the active sketch given its center and radius."""
 
@@ -2362,7 +2575,7 @@ async def draw_circle(x: float = 0, y: float = 0, radius: float = 25, unit: Opti
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def draw_rectangle(x1: float = -50, y1: float = -25, x2: float = 50, y2: float = 25, unit: Optional[str] = None) -> dict:
     """Draw a rectangle in the active sketch given two opposite corners."""
 
@@ -2381,7 +2594,7 @@ async def draw_rectangle(x1: float = -50, y1: float = -25, x2: float = 50, y2: f
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def draw_arc(cx: float = 0, cy: float = 0, radius: float = 25,
                     start_angle: float = 0, end_angle: float = 90, unit: Optional[str] = None) -> dict:
     """Draw an arc in the active sketch given center, radius, and start/end angles (degrees)."""
@@ -2405,7 +2618,7 @@ async def draw_arc(cx: float = 0, cy: float = 0, radius: float = 25,
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def draw_spline(points: list[list[float]], natural_ends: bool = True,
                       unit: Optional[str] = None) -> dict:
     """Draw a 2D B-spline through two or more [x, y] control points.
@@ -2462,7 +2675,7 @@ async def draw_spline(points: list[list[float]], natural_ends: bool = True,
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def draw_polygon(cx: float = 0, cy: float = 0, radius: float = 25, sides: int = 6, unit: Optional[str] = None) -> dict:
     """Draw a regular, circumscribed polygon in the active sketch."""
 
@@ -2481,7 +2694,7 @@ async def draw_polygon(cx: float = 0, cy: float = 0, radius: float = 25, sides: 
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def add_sketch_dimension(x1: float, y1: float,
                                 x2: Optional[float] = None, y2: Optional[float] = None,
                                 dim_x: float = 0, dim_y: float = 50,
@@ -2540,7 +2753,7 @@ async def add_sketch_dimension(x1: float, y1: float,
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def add_sketch_relation(relation: str, x1: float, y1: float,
                                 x2: Optional[float] = None, y2: Optional[float] = None,
                                 unit: Optional[str] = None) -> dict:
@@ -2587,7 +2800,7 @@ async def add_sketch_relation(relation: str, x1: float, y1: float,
 # Feature tools
 # ===========================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def extrude_sketch(depth: float = 10, both_directions: bool = False,
                          merge: bool = True, unit: Optional[str] = None) -> dict:
     """Boss-extrude the last sketch drawn; set merge=False to keep a separate body."""
@@ -2613,7 +2826,7 @@ async def extrude_sketch(depth: float = 10, both_directions: bool = False,
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def cut_extrude(depth: float = 10, through_all: bool = False,
                        both_directions: bool = False, unit: Optional[str] = None) -> dict:
     """Cut-extrude the last sketch drawn, removing material from the body."""
@@ -2649,7 +2862,7 @@ async def cut_extrude(depth: float = 10, through_all: bool = False,
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def revolve_sketch(angle: float = 360, both_directions: bool = False,
                           cut: bool = False, reverse: bool = False,
                           unit: Optional[str] = None) -> dict:
@@ -2702,7 +2915,7 @@ async def revolve_sketch(angle: float = 360, both_directions: bool = False,
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def sweep_sketch(profile_sketch: str, path_sketch: str) -> dict:
     """Sweep a closed profile sketch along a path sketch to create a solid.
     Both sketches must already exist. The profile must be a closed contour.
@@ -2738,7 +2951,7 @@ async def sweep_sketch(profile_sketch: str, path_sketch: str) -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def loft_sketches(sketch_names: list) -> dict:
     """Loft between two or more closed profile sketches to create a solid.
     Each sketch must be on a different plane. Provide at least 2 sketch names."""
@@ -2788,7 +3001,7 @@ _BEND_FILLET_CHAMFER_WARNING = (
 )
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def fillet_edges(radius: float = 2, unit: Optional[str] = None, force: bool = False) -> dict:
     """Apply a constant-radius fillet to every edge of the solid body/bodies.
 
@@ -2815,7 +3028,7 @@ async def fillet_edges(radius: float = 2, unit: Optional[str] = None, force: boo
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def chamfer_edges(distance: float = 2, angle: float = 45, unit: Optional[str] = None, force: bool = False) -> dict:
     """Apply a distance/angle chamfer to every edge of the solid body/bodies.
 
@@ -2843,7 +3056,7 @@ async def chamfer_edges(distance: float = 2, angle: float = 45, unit: Optional[s
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def shell_body(thickness: float = 2, remove_face_at_x: Optional[float] = None,
                       remove_face_at_y: Optional[float] = None,
                       remove_face_at_z: Optional[float] = None,
@@ -2894,7 +3107,7 @@ async def shell_body(thickness: float = 2, remove_face_at_x: Optional[float] = N
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def linear_pattern(feature_name: str, direction: str = "x",
                           count: int = 2, spacing: float = 20,
                           count2: int = 1, spacing2: float = 20,
@@ -2967,7 +3180,7 @@ async def linear_pattern(feature_name: str, direction: str = "x",
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def circular_pattern(feature_name: str, axis: str = "z",
                              count: int = 4, angle: float = 360) -> dict:
     """Repeat a feature in a circular pattern around an axis.
@@ -2998,7 +3211,6 @@ async def circular_pattern(feature_name: str, axis: str = "z",
             raise RuntimeError(f"Could not select feature '{feature_name}'.")
 
         angle_rad = math.radians(angle)
-        equal_spacing = abs(angle - 360) < 0.01
 
         feat = doc.FeatureManager.FeatureCircularPattern4(
             count, angle_rad, False,
@@ -3014,7 +3226,7 @@ async def circular_pattern(feature_name: str, axis: str = "z",
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def hole_wizard(face_x: float, face_y: float, face_z: float,
                        hole_x: float, hole_y: float,
                        hole_type: str = "simple",
@@ -3273,7 +3485,7 @@ def _get_weldment_profile_path(standard: str, profile_type: str) -> str:
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def create_weldment_profile(
     standard: str,
     profile_type: str,
@@ -3403,7 +3615,7 @@ async def create_weldment_profile(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def trim_extend_structural(
     body_to_trim: str,
     trim_boundary: str,
@@ -3478,7 +3690,7 @@ async def trim_extend_structural(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def add_gusset(
     thickness: float = 5,
     x1: float = 0, y1: float = 0, z1: float = 0,
@@ -3597,7 +3809,7 @@ async def add_gusset(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def add_end_cap(
     face_x: float = 0, face_y: float = 0, face_z: float = 0,
     thickness: float = 2,
@@ -3715,7 +3927,7 @@ async def add_end_cap(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def create_3d_sketch() -> dict:
     """Open a new 3D sketch.
 
@@ -3747,7 +3959,7 @@ async def create_3d_sketch() -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def draw_line_3d(
     x1: float = 0, y1: float = 0, z1: float = 0,
     x2: float = 100, y2: float = 0, z2: float = 0,
@@ -3784,7 +3996,7 @@ async def draw_line_3d(
 # Sheet Metal tools
 # ===========================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def create_base_flange(
     thickness: float = 2,
     depth: float = 100,
@@ -3878,7 +4090,7 @@ async def create_base_flange(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def add_sheet_metal_bend(
     face_x: float = 0, face_y: float = 0, face_z: float = 0,
     bend_radius: float = 1,
@@ -3949,7 +4161,7 @@ async def add_sheet_metal_bend(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def add_sheet_metal_edge_flange(
     edge_x: float = 0, edge_y: float = 0, edge_z: float = 0,
     flange_length: float = 20,
@@ -4125,7 +4337,7 @@ async def add_sheet_metal_edge_flange(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def flatten_sheet_metal(state: str = "flat") -> dict:
     """Put a sheet metal part into its flat or folded state.
 
@@ -4223,7 +4435,7 @@ async def flatten_sheet_metal(state: str = "flat") -> dict:
 # Threads / Machining tools
 # ===========================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def create_helix(
     diameter: float = 10,
     pitch: float = 1.5,
@@ -4328,7 +4540,7 @@ async def create_helix(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def add_thread_feature(
     edge_x: float = 0, edge_y: float = 0, edge_z: float = 0,
     thread_type: str = "metric",
@@ -4415,7 +4627,7 @@ async def add_thread_feature(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def add_cosmetic_thread(
     edge_x: float = 0, edge_y: float = 0, edge_z: float = 0,
     minor_diameter: float = 5.0,
@@ -4498,7 +4710,7 @@ async def add_cosmetic_thread(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def create_knurl(
     face_x: float = 0, face_y: float = 0, face_z: float = 0,
     pattern: str = "diamond",
@@ -4632,7 +4844,7 @@ async def create_knurl(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def add_rib(
     thickness: float = 3,
     direction: str = "parallel",
@@ -4791,7 +5003,7 @@ def _ensure_pattern_axis(doc, direction: str) -> str:
     return axis_name
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def mirror_feature(
     feature_name: str,
     plane: str = "front",
@@ -4840,7 +5052,7 @@ async def mirror_feature(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def mirror_body(
     body_name: str,
     plane: str = "front",
@@ -4892,7 +5104,7 @@ async def mirror_body(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def move_copy_body(
     body_name: str,
     dx: float = 0, dy: float = 0, dz: float = 0,
@@ -4973,7 +5185,7 @@ async def move_copy_body(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False))
 async def combine_bodies(
     operation: str = "add",
     main_body: Optional[str] = None,
@@ -5083,7 +5295,7 @@ async def combine_bodies(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def create_reference_plane(
     reference: str = "front",
     offset: float = 50,
@@ -5212,7 +5424,7 @@ async def create_reference_plane(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def create_reference_axis(
     method: str = "two_planes",
     ref1: str = "front",
@@ -5285,7 +5497,7 @@ async def create_reference_axis(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False))
 async def split_body(
     tool_type: str = "plane",
     plane: str = "front",
@@ -5979,7 +6191,7 @@ def _layout_dict(doc, config: Optional["ad.SheetConfig"] = None) -> dict:
     return {"drawing": _doc_title(doc), "sheets": sheets}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def get_drawing_layout() -> dict:
     """Describe every sheet of the active drawing as data.
 
@@ -6001,7 +6213,7 @@ async def get_drawing_layout() -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def get_view_entities(view_name: str, kinds: str = "line,circle,arc",
                             min_length_mm: float = 0.0,
                             max_results: int = 200) -> dict:
@@ -6068,7 +6280,7 @@ async def get_view_entities(view_name: str, kinds: str = "line,circle,arc",
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def get_view_dimensions(view_name: str) -> dict:
     """List the dimensions already shown in a drawing view.
 
@@ -6147,7 +6359,7 @@ def _measure_display_dimension(display, view_name: str, index_hint: int = 1) -> 
     return out
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def dimension_by_entity_ids(entity_ids: list[str], side: str = "auto",
                                   expected_mm: Optional[float] = None,
                                   tolerance_mm: float = 0.5,
@@ -6270,7 +6482,7 @@ async def dimension_by_entity_ids(entity_ids: list[str], side: str = "auto",
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def verify_drawing(require_hole_dimensions: bool = True,
                          require_overall_extents: bool = True,
                          require_cut_angles: bool = True,
@@ -6341,7 +6553,7 @@ async def verify_drawing(require_hole_dimensions: bool = True,
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def insert_section_view(
     x1: float, y1: float, x2: float, y2: float,
     place_x: float = 250, place_y: float = 150,
@@ -6402,7 +6614,7 @@ async def insert_section_view(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def insert_detail_view(
     center_x: float, center_y: float, radius: float,
     place_x: float = 300, place_y: float = 150,
@@ -6478,7 +6690,7 @@ async def insert_detail_view(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def insert_broken_view(
     break_position1: float, break_position2: float,
     orientation: str = "vertical",
@@ -6589,7 +6801,7 @@ async def insert_broken_view(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def insert_auxiliary_view(
     edge_x: float, edge_y: float,
     place_x: float = 300, place_y: float = 200,
@@ -6635,7 +6847,7 @@ async def insert_auxiliary_view(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def add_drawing_dimension(
     x1: float, y1: float,
     x2: Optional[float] = None, y2: Optional[float] = None,
@@ -6747,7 +6959,7 @@ async def add_drawing_dimension(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def add_drawing_annotation(
     text: str,
     x: float = 100, y: float = 100,
@@ -6796,7 +7008,7 @@ async def add_drawing_annotation(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def add_centerline(
     x1: float, y1: float, x2: float, y2: float,
     unit: Optional[str] = None,
@@ -6839,7 +7051,7 @@ async def add_centerline(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def add_weld_symbol(
     x: float, y: float,
     weld_type: str = "fillet",
@@ -6892,7 +7104,7 @@ async def add_weld_symbol(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def add_surface_finish(
     x: float, y: float,
     ra_value: float = 3.2,
@@ -6947,7 +7159,7 @@ async def add_surface_finish(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def add_gdt_symbol(
     x: float, y: float,
     symbol: str = "position",
@@ -7016,7 +7228,7 @@ async def add_gdt_symbol(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def add_balloon(
     x: float, y: float,
     unit: Optional[str] = None,
@@ -7068,7 +7280,7 @@ async def add_balloon(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def insert_bom_table(
     x: float = 300, y: float = 200,
     template: str = "",
@@ -7166,7 +7378,7 @@ async def insert_bom_table(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def insert_cut_list_table(
     x: float = 300, y: float = 200,
     template: str = "",
@@ -7212,7 +7424,7 @@ async def insert_cut_list_table(
 # Advanced Assembly tools
 # ===========================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def create_exploded_view(
     explode_distance: float = 100,
     direction: str = "y",
@@ -7305,7 +7517,7 @@ async def create_exploded_view(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False))
 async def delete_mate(name: str) -> dict:
     """Delete a named assembly mate and verify it no longer exists."""
 
@@ -7340,7 +7552,7 @@ async def delete_mate(name: str) -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def add_advanced_mate(
     mate_type: str,
     x1: float, y1: float, z1: float,
@@ -7420,7 +7632,7 @@ async def add_advanced_mate(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def add_cam_follower_mate(
     cam_ray_origin: list[float],
     cam_ray_direction: list[float],
@@ -7515,7 +7727,7 @@ async def add_cam_follower_mate(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def add_screw_mate(
     first_ray_origin: list[float],
     first_ray_direction: list[float],
@@ -7602,7 +7814,7 @@ async def add_screw_mate(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def add_rack_pinion_mate(
     rack_ray_origin: list[float],
     rack_ray_direction: list[float],
@@ -7686,7 +7898,7 @@ async def add_rack_pinion_mate(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def interference_check() -> dict:
     """Check the active assembly for interferences (parts overlapping in space).
 
@@ -7737,7 +7949,7 @@ async def interference_check() -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def create_assembly_pattern(
     component_name: str,
     pattern_type: str = "linear",
@@ -7933,7 +8145,7 @@ def _document_density(doc):
     return None
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def lookup_material_properties(material: str = "",
                                      database: str = "SOLIDWORKS Materials",
                                      search: str = "") -> dict:
@@ -7988,7 +8200,7 @@ async def lookup_material_properties(material: str = "",
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def set_material(
     material: str = "AISI 1020",
     database: str = "SOLIDWORKS Materials",
@@ -8190,7 +8402,7 @@ def _resolve_material_database_path(database: str) -> str:
     return database  # nothing found -- let SetMaterialPropertyName2 fail on its own
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def set_appearance(
     red: int = 255, green: int = 255, blue: int = 0,
     target: str = "body",
@@ -8295,7 +8507,7 @@ async def set_appearance(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def get_appearance_properties() -> dict:
     """Read the active document's RGB, reflection, transparency, and emission.
 
@@ -8331,7 +8543,7 @@ async def get_appearance_properties() -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def set_appearance_properties(
     red: int = 210, green: int = 215, blue: int = 220,
     ambient: float = 0.35, diffuse: float = 0.85,
@@ -8393,7 +8605,7 @@ async def set_appearance_properties(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def apply_texture(
     texture_path: str,
     scale: float = 1.0,
@@ -8449,7 +8661,7 @@ async def apply_texture(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def remove_texture(
     target: str = "model",
     face_x: float = 0, face_y: float = 0, face_z: float = 0,
@@ -8482,7 +8694,7 @@ async def remove_texture(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def apply_metal_finish(
     finish: str = "chrome",
     target: str = "body",
@@ -8571,7 +8783,7 @@ async def apply_metal_finish(
 # Native P2M appearance tools
 # ===========================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def list_p2m_appearances(scope: str = "this") -> dict:
     """List native P2M/render appearances linked to the active display state.
 
@@ -8599,7 +8811,7 @@ async def list_p2m_appearances(scope: str = "this") -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def apply_p2m_appearance(
     appearance_path: str,
     scope: str = "this",
@@ -8666,7 +8878,7 @@ async def apply_p2m_appearance(
 # Parametric example tools
 # ===========================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def create_automotive_piston(
     bore_diameter: float = 86,
     height: float = 75,
@@ -8794,7 +9006,7 @@ async def create_automotive_piston(
         ) from exc
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def create_automotive_piston_assembly(
     bore_diameter: float = 86,
     piston_height: float = 75,
@@ -8990,7 +9202,7 @@ async def create_automotive_piston_assembly(
         ) from exc
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def create_automotive_piston_with_connecting_rod(
     bore_diameter: float = 86,
     piston_height: float = 75,
@@ -9180,7 +9392,7 @@ async def create_automotive_piston_with_connecting_rod(
         ) from exc
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def create_pedestal_fan_propeller(
     blade_radius: float = 190,
     hub_radius: float = 32,
@@ -9376,7 +9588,7 @@ async def create_pedestal_fan_propeller(
 # Configuration tools
 # ===========================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def create_configuration(
     name: str,
     comment: str = "",
@@ -9412,7 +9624,7 @@ async def create_configuration(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def switch_configuration(name: str) -> dict:
     """Switch the active document to a named configuration.
 
@@ -9454,7 +9666,7 @@ async def switch_configuration(name: str) -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def list_features() -> dict:
     """List every feature in the active document's feature tree.
 
@@ -9489,7 +9701,7 @@ async def list_features() -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False))
 async def delete_feature(name: str, delete_children: bool = True) -> dict:
     """Delete a named feature from the active part/assembly's FeatureManager tree.
 
@@ -9622,7 +9834,7 @@ def _read_custom_properties(cpm) -> dict:
     return props
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def get_custom_properties(config: str = "") -> dict:
     """Read all custom properties from the active document.
     config: configuration name (empty string = document-level properties)."""
@@ -9636,7 +9848,7 @@ async def get_custom_properties(config: str = "") -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def set_custom_property(name: str, value: str, config: str = "") -> dict:
     """Set a custom property on the active document. Creates it if it doesn't exist.
     name: property name (e.g. 'Material', 'Description', 'PartNumber').
@@ -9775,7 +9987,7 @@ def _measure_model_doc(doc, factor: float) -> dict:
     return result
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def measure_body() -> dict:
     """Measure the active document's solid body: mass, volume, surface area,
     center of mass, and bounding box. Returns values in SI units (kg, m, m^2, m^3).
@@ -9825,7 +10037,7 @@ def _classify_surface(surface) -> str:
     return "other"
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def capture_viewport(output_path: Optional[str] = None) -> Image:
     """Return the SolidWorks viewport exactly as it currently appears on screen.
 
@@ -9842,7 +10054,7 @@ async def capture_viewport(output_path: Optional[str] = None) -> Image:
         doc = _active_doc()
         keep = bool(output_path)
         if keep:
-            path = os.path.abspath(output_path)
+            path = _resolve_write_path(output_path)
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         else:
             handle, path = tempfile.mkstemp(prefix="sw_viewport_", suffix=".png")
@@ -9866,7 +10078,7 @@ async def capture_viewport(output_path: Optional[str] = None) -> Image:
     return Image(data=await _run(_impl), format="png")
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def get_selection(unit: Optional[str] = None) -> dict:
     """Read what is currently selected in SolidWorks.
 
@@ -9918,7 +10130,7 @@ async def get_selection(unit: Optional[str] = None) -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def list_faces(
     surface_type: Optional[str] = None,
     min_area: float = 0.0,
@@ -10068,7 +10280,7 @@ async def list_faces(
 # Utility tools
 # ===========================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def rebuild_model(force: bool = True, top_only: bool = False) -> dict:
     """Rebuild the active document and report whether SolidWorks accepted it.
 
@@ -10095,7 +10307,7 @@ async def rebuild_model(force: bool = True, top_only: bool = False) -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def validate_model() -> dict:
     """Rebuild and inspect the feature tree for SolidWorks errors and warnings.
 
@@ -10147,7 +10359,7 @@ async def validate_model() -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def get_document_dependencies(
     traverse_all: bool = True,
     search_paths: bool = True,
@@ -10196,7 +10408,7 @@ async def get_document_dependencies(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def get_persistent_reference(
     entity_type: str,
     x: float, y: float, z: float,
@@ -10239,7 +10451,7 @@ async def get_persistent_reference(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def resolve_persistent_reference(reference: str, select: bool = True) -> dict:
     """Resolve a base64 persistent ID and optionally select its current entity."""
 
@@ -10279,7 +10491,7 @@ async def resolve_persistent_reference(reference: str, select: bool = True) -> d
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def list_configurations() -> dict:
     """List all configurations, their descriptions, and the active configuration."""
 
@@ -10303,7 +10515,7 @@ async def list_configurations() -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False))
 async def delete_configuration(name: str) -> dict:
     """Delete a non-active configuration from the active model."""
 
@@ -10339,7 +10551,7 @@ def _evaluate_equations(manager):
     return result() if callable(result) else result
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def list_equations() -> dict:
     """List equations and global variables in the active document."""
 
@@ -10360,7 +10572,7 @@ async def list_equations() -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def add_equation(equation: str, solve: bool = True) -> dict:
     """Add an equation or global variable, e.g. ``\"Length\" = 25mm``.
 
@@ -10386,7 +10598,7 @@ async def add_equation(equation: str, solve: bool = True) -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def set_equation(index: int, equation: str, solve: bool = True) -> dict:
     """Replace an equation by index and optionally evaluate it immediately."""
 
@@ -10409,7 +10621,7 @@ async def set_equation(index: int, equation: str, solve: bool = True) -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False))
 async def delete_equation(index: int) -> dict:
     """Delete an equation or global variable by zero-based index."""
 
@@ -10432,7 +10644,7 @@ async def delete_equation(index: int) -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False))
 async def export_flat_pattern_dxf(
     filepath: str,
     include_hidden_edges: bool = False,
@@ -10446,7 +10658,7 @@ async def export_flat_pattern_dxf(
         doc = _active_doc()
         if _doc_type(doc) != 1:
             raise RuntimeError("Flat-pattern DXF export requires an active part document.")
-        abs_path = os.path.abspath(filepath)
+        abs_path = _resolve_write_path(filepath)
         if os.path.splitext(abs_path)[1].lower() not in {".dxf", ".dwg"}:
             raise ValueError("filepath must end in .dxf or .dwg.")
         os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
@@ -10470,7 +10682,7 @@ async def export_flat_pattern_dxf(
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False))
 async def pack_and_go(
     destination: str,
     include_drawings: bool = True,
@@ -10493,7 +10705,7 @@ async def pack_and_go(
         source_path = _doc_path(doc)
         if not source_path or not os.path.isfile(source_path):
             raise RuntimeError("Save the active document before running Pack and Go.")
-        destination_path = os.path.abspath(destination)
+        destination_path = _resolve_write_path(destination)
         is_zip = destination_path.lower().endswith(".zip")
         if is_zip:
             os.makedirs(os.path.dirname(destination_path) or ".", exist_ok=True)
@@ -10651,7 +10863,7 @@ def _configuration_by_name(doc, name: str):
     return configuration
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def list_display_states(configuration: str = "") -> dict:
     """List display states for a configuration (or the active configuration)."""
 
@@ -10665,7 +10877,7 @@ async def list_display_states(configuration: str = "") -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def create_display_state(name: str, configuration: str = "", activate: bool = False) -> dict:
     """Create a named display state, optionally applying it immediately."""
 
@@ -10688,7 +10900,7 @@ async def create_display_state(name: str, configuration: str = "", activate: boo
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def apply_display_state(name: str, configuration: str = "") -> dict:
     """Apply an existing display state in the requested configuration."""
 
@@ -10708,7 +10920,7 @@ async def apply_display_state(name: str, configuration: str = "") -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def rename_display_state(old_name: str, new_name: str, configuration: str = "") -> dict:
     """Rename one display state without changing its appearance data."""
 
@@ -10725,7 +10937,7 @@ async def rename_display_state(old_name: str, new_name: str, configuration: str 
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False))
 async def delete_display_state(name: str, configuration: str = "") -> dict:
     """Delete a display state after confirming it belongs to the configuration."""
 
@@ -10745,7 +10957,7 @@ async def delete_display_state(name: str, configuration: str = "") -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def set_units(unit: str) -> dict:
     """Set the default unit (mm, cm, m, in, or ft) used by tools when 'unit' is omitted."""
     global _default_unit
@@ -10756,7 +10968,7 @@ async def set_units(unit: str) -> dict:
     return {"default_unit": _default_unit}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def set_view(view_name: str = "isometric") -> dict:
     """Set the camera view orientation.
     Options: front, back, left, right, top, bottom, isometric, trimetric, dimetric."""
@@ -10781,7 +10993,7 @@ async def set_view(view_name: str = "isometric") -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def zoom_to_fit() -> dict:
     """Zoom the view to fit the entire model in the viewport."""
 
@@ -10793,7 +11005,7 @@ async def zoom_to_fit() -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def zoom_to_area(x1: float, y1: float, x2: float, y2: float, unit: Optional[str] = None) -> dict:
     """Zoom into a rectangular area defined by two corner points (screen-mapped to model)."""
 
@@ -10838,7 +11050,7 @@ def _closest_named_view(matrix: list) -> Optional[str]:
     return best_name if best_distance is not None and best_distance <= _NAMED_VIEW_MATCH_TOLERANCE else None
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def get_view_state() -> dict:
     """Read the camera state the user is actually looking at right now.
 
@@ -10891,6 +11103,15 @@ _MACRO_METHODS_WITHOUT_ARGS = 1
 _MACRO_METHODS_WITH_ARGS = 2
 _MACRO_SUFFIXES = {".swp", ".swb", ".dll"}
 
+# Opt-in, and deliberately a SEPARATE allowlist from PROJECT_ROOTS_ENV: being
+# allowed to write a BOM export into a project folder says nothing about
+# whether code dropped in that same folder should be allowed to RUN.
+# run_macro executes a VBA/.NET macro body with the same access as the
+# SolidWorks session itself (server.py never runs a macro's body, by
+# design -- see list_macro_methods' docstring); unset, behaviour is
+# unchanged from before this existed (any .swp/.swb/.dll by path).
+MACRO_ROOTS_ENV = "SOLIDWORKS_MCP_MACRO_ROOTS"
+
 
 def _resolve_macro_path(path: str):
     macro_path = os.path.abspath(os.path.expanduser(path.strip()))
@@ -10901,6 +11122,17 @@ def _resolve_macro_path(path: str):
         raise ValueError(
             f"'{suffix or macro_path}' is not a SolidWorks macro. "
             f"Expected one of: {', '.join(sorted(_MACRO_SUFFIXES))}"
+        )
+    roots = [os.path.abspath(p) for p in
+             os.environ.get(MACRO_ROOTS_ENV, "").split(os.pathsep) if p.strip()]
+    if roots and not any(
+        macro_path == root or macro_path.startswith(root + os.sep) for root in roots
+    ):
+        raise PermissionError(
+            f"Refusing to run macro '{macro_path}': it is outside the "
+            f"configured macro root(s) ({MACRO_ROOTS_ENV}="
+            f"{os.environ.get(MACRO_ROOTS_ENV)!r}). Move it into one of "
+            f"those folders, or reconfigure {MACRO_ROOTS_ENV}."
         )
     return macro_path
 
@@ -10928,7 +11160,7 @@ _RUN_MACRO_ERROR_NAMES = {
 }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def list_macro_methods(path: str) -> dict:
     """List the entry points inside a SolidWorks macro WITHOUT executing it.
 
@@ -10957,7 +11189,7 @@ async def list_macro_methods(path: str) -> dict:
     return await _run(_impl)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True))
 async def run_macro(
     path: str,
     module: str = "",
@@ -11031,39 +11263,44 @@ _SAFE_BUILTINS = {k: v for k, v in vars(builtins).items() if k not in _BLOCKED_B
 EXECUTE_PYTHON_ENV = "SOLIDWORKS_MCP_ENABLE_EXECUTE_PYTHON"
 
 
-@mcp.tool()
-async def execute_python(code: str) -> dict:
-    """Run privileged Python with 'sw' and 'doc' in scope when explicitly enabled.
+def _execute_python_enabled() -> bool:
+    return os.environ.get(EXECUTE_PYTHON_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
-    This tool is disabled by default because the COM objects can change the
-    active SolidWorks session. Set SOLIDWORKS_MCP_ENABLE_EXECUTE_PYTHON=1 only
-    for trusted local debugging sessions.
-    """
 
-    enabled = os.environ.get(EXECUTE_PYTHON_ENV, "").strip().lower()
-    if enabled not in {"1", "true", "yes", "on"}:
-        raise PermissionError(
-            f"execute_python is disabled by default. Set {EXECUTE_PYTHON_ENV}=1 "
-            "only in trusted local development sessions."
-        )
+# Registered only when explicitly enabled, not registered-then-rejecting.
+# Left always-registered, it would sit in the catalog handed to every
+# client/model regardless of whether this install ever turns it on --
+# costing context tokens for a tool that only ever answers "disabled" is
+# worse than not advertising it at all, and the previous behaviour (always
+# registered, raising PermissionError when called) did exactly that.
+if _execute_python_enabled():
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True))
+    async def execute_python(code: str) -> dict:
+        """Run privileged Python with 'sw' and 'doc' in scope.
 
-    def _impl():
-        app = _connect()
-        try:
-            doc = app.ActiveDoc
-        except Exception:
-            doc = None
-        buf = io.StringIO()
-        exec_globals = {
-            "__builtins__": _SAFE_BUILTINS,
-            "sw": app, "doc": doc,
-            "win32com": win32com, "pythoncom": pythoncom, "math": math,
-        }
-        with contextlib.redirect_stdout(buf):
-            exec(code, exec_globals)
-        return {"stdout": buf.getvalue()}
+        Only registered when SOLIDWORKS_MCP_ENABLE_EXECUTE_PYTHON=1 was set
+        before the server started -- it does not appear in the tool list at
+        all otherwise. Enable it only for trusted local debugging sessions:
+        the COM objects in scope can change the active SolidWorks session.
+        """
 
-    return await _run(_impl)
+        def _impl():
+            app = _connect()
+            try:
+                doc = app.ActiveDoc
+            except Exception:
+                doc = None
+            buf = io.StringIO()
+            exec_globals = {
+                "__builtins__": _SAFE_BUILTINS,
+                "sw": app, "doc": doc,
+                "win32com": win32com, "pythoncom": pythoncom, "math": math,
+            }
+            with contextlib.redirect_stdout(buf):
+                exec(code, exec_globals)
+            return {"stdout": buf.getvalue()}
+
+        return await _run(_impl)
 
 
 # ---------------------------------------------------------------------------

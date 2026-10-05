@@ -1,3 +1,7 @@
 # mcp 2.x removed mcp.server.fastmcp, which server.py is built on.
 mcp>=1.0.0,<2
-pywin32>=306
+# pywin32 ships compiled extensions and only exists on Windows -- unmarked,
+# `pip install -r requirements.txt` hard-fails on Linux/macOS, which also
+# blocks the COM-free parts of the test suite (tests/conftest.py fakes
+# win32com/pythoncom so they run anywhere) from being set up with this file.
+pywin32>=306; sys_platform == "win32"
