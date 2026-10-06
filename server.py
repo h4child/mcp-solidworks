@@ -2912,6 +2912,163 @@ MATE_DOF_LEFT = {
 MATE_ALIGN = {"aligned": 0, "anti_aligned": 1, "closest": 2}
 
 
+# ---------------------------------------------------------------------------
+# A mate is solved by MOVING components, so every mate tool has to report it
+# ---------------------------------------------------------------------------
+# This matters most for mechanism mates (advanced, cam-follower, screw,
+# rack-and-pinion). A static assembly is built of mates that fully locate
+# everything, so "did it move" is answered by the drawing. A mechanism is built
+# of mates that deliberately leave a degree of freedom free, and when one of
+# them solves, SolidWorks drags whatever is still free into the configuration
+# the mate allows. That drag is correct behaviour and it is also exactly where
+# "I asked for movement and it came out crooked" comes from: the geometry is now
+# somewhere nobody chose, and a tool that returns its own arguments cannot say
+# so.
+#
+# add_mate keeps its own inline copy of this logic because it captures the
+# picked FACES in the same pass, for its geometry_check. It has been validated
+# live; these helpers have not, so it is deliberately left alone rather than
+# refactored onto them.
+
+
+def _capture_picked_components(assy, factor: float):
+    """The components owning the current selection, with their poses.
+
+    Must be called while the selection is still live -- i.e. after the
+    SelectByID2/SelectByRay calls and BEFORE the mate is created, since creating
+    it consumes the selection. The IComponent2 objects stay valid across the
+    mate, so the same objects give both the before and the after pose.
+    """
+    picked = []
+    for index in (1, 2):
+        try:
+            raw_component = assy.SelectionManager.GetSelectedObjectsComponent4(index, -1)
+            if raw_component is None:
+                continue
+            component = win32com.client.Dispatch(raw_component)
+            picked.append((str(component.Name2), component))
+        except Exception:
+            continue
+    before = {}
+    for name, component in picked:
+        try:
+            before[name] = _component_pose(component, factor)
+        except Exception:
+            before[name] = None
+    return picked, before
+
+
+def _report_component_movement(picked, before, factor: float, active_unit: str, what: str):
+    """Where the picked components ended up, and how far the solve moved them.
+
+    Returns (components, warnings). ``moved.distance`` is the measured
+    displacement of each component's origin caused by the mate solving -- not a
+    deviation from anything requested, because a mate is not asked for a
+    position: it is asked for a relationship, and the position is the
+    consequence. Reporting it is what lets a caller notice that adding a gear
+    mate quietly relocated the part it was supposed to drive.
+    """
+    components, warnings = [], []
+    for name, component in picked:
+        entry = {"name": name}
+        start = before.get(name)
+        entry["position_before"] = (dict(start["translation"], unit=active_unit)
+                                    if start else None)
+        try:
+            end = _component_pose(component, factor)
+        except Exception as exc:
+            entry["position_after"] = None
+            entry["moved"] = None
+            components.append(entry)
+            warnings.append(
+                f"{what} was created but '{name}' position could not be read back "
+                f"({exc}), so its resulting position is UNVERIFIED")
+            continue
+        entry["position_after"] = dict(end["translation"], unit=active_unit)
+        entry["rotation_matrix_after"] = end["rotation_matrix"]
+        entry["rotation_convention"] = end["rotation_convention"]
+        if start:
+            delta = _deviation(
+                (start["translation"]["x"], start["translation"]["y"],
+                 start["translation"]["z"]),
+                end["translation"], 0.0)
+            entry["moved"] = {
+                "dx": delta["dx"], "dy": delta["dy"], "dz": delta["dz"],
+                "distance": delta["distance"], "unit": active_unit,
+            }
+        else:
+            entry["moved"] = None
+        components.append(entry)
+    if not picked:
+        warnings.append(
+            f"{what} was created but neither picked entity could be traced back to a "
+            f"component, so no position was verified -- check the result with "
+            f"verify_assembly_positions")
+    return components, warnings
+
+
+def _mechanism_pose_reminder(what: str) -> str:
+    """The one thing a caller building a mechanism has to be told.
+
+    A mechanism's moving parts are under-constrained on purpose, so the pose it
+    is in after a mate solves is one of infinitely many valid ones, and the next
+    drag, rebuild or motion study overwrites it with no record of what it was.
+    No mate can prevent that -- the free degree of freedom IS the movement.
+    """
+    return (
+        f"{what} leaves the mechanism free to move, which is the point. The "
+        f"positions above are therefore where things happen to sit now, not "
+        f"positions this mate holds: the next drag, rebuild or motion study "
+        f"replaces them. Once the mechanism is in a pose worth keeping, record "
+        f"it with capture_assembly_pose and put it back with "
+        f"restore_assembly_pose -- that, not another mate, is what makes a "
+        f"mechanism position reproducible."
+    )
+
+
+def _component_positions(doc, factor: float) -> dict:
+    """name -> translation for every top-level component, or {} if there are none.
+
+    Deliberately tolerant: a part document has no components, and a component
+    that will not report a pose (suppressed, lightweight, not loaded) is left
+    out rather than recorded as being at the origin -- which is a real position,
+    and the wrong one.
+    """
+    positions = {}
+    try:
+        raw_list = doc.GetComponents(True) or ()
+    except Exception:
+        return positions
+    for raw_component in raw_list:
+        try:
+            component = win32com.client.Dispatch(raw_component)
+            positions[str(component.Name2)] = _component_pose(
+                component, factor)["translation"]
+        except Exception:
+            continue
+    return positions
+
+
+def _moved_components(before: dict, after: dict, tolerance: float, active_unit: str):
+    """Which components changed position between two snapshots, and by how much."""
+    moved = []
+    for name, start in before.items():
+        end = after.get(name)
+        if end is None:
+            continue
+        delta = _deviation((start["x"], start["y"], start["z"]), end, tolerance)
+        if not delta["within_tolerance"]:
+            moved.append({
+                "name": name,
+                "dx": delta["dx"], "dy": delta["dy"], "dz": delta["dz"],
+                "distance": delta["distance"], "unit": active_unit,
+                "position_before": dict(start, unit=active_unit),
+                "position_after": dict(end, unit=active_unit),
+            })
+    moved.sort(key=lambda entry: entry["distance"], reverse=True)
+    return moved
+
+
 def _entity_direction_local(entity):
     """A single direction vector for a FACE, in its OWN part's coordinates:
     the face normal for a planar face, the axis for a cylindrical one.
@@ -3816,16 +3973,34 @@ async def list_motion_studies() -> dict:
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
-async def create_motion_study(name: Optional[str] = None, activate: bool = True) -> dict:
+async def create_motion_study(name: Optional[str] = None, activate: bool = True,
+                              unit: Optional[str] = None,
+                              tolerance: float = 0.01) -> dict:
     """Create and optionally activate a native SolidWorks Animation study.
 
     The created study is a container for MotionManager animation data. It does
     not add a motor or solve a physical analysis; use mechanical mates to
     constrain the assembly's movement.
+
+    ACTIVATING A STUDY CAN MOVE THE ASSEMBLY, and that is measured here.
+    MotionManager switches the assembly to the activated study's own state, so
+    every component that is free to move may be somewhere else the moment this
+    returns -- and a mechanism's components are free to move by definition.
+    ``components_moved`` lists each one that changed position by more than
+    ``tolerance``, worst first, with where it was and where it is now.
+
+    This is the single most likely way to lose a mechanism pose that took work
+    to reach: nothing in SolidWorks records what the assembly looked like before
+    the switch. Call capture_assembly_pose with a ``filepath`` BEFORE creating a
+    study, and restore_assembly_pose afterwards if this reports movement you did
+    not want.
     """
 
     def _impl():
         doc = _active_doc()
+        active_unit, factor = _unit_factor(unit)
+        # Measured before the study exists, so there is something to compare to.
+        positions_before = _component_positions(doc, factor)
         manager = _motion_study_manager(doc)
         raw_study = _invoke_motion_manager(manager, "CreateMotionStudy", (9, 0))
         if raw_study is None:
@@ -3844,8 +4019,33 @@ async def create_motion_study(name: Optional[str] = None, activate: bool = True)
             if not activated:
                 raise RuntimeError(f"Motion Study '{study_name}' was created but could not be activated.")
         count = int(_invoke_motion_manager(manager, "GetMotionStudyCount", (3, 0)))
+
+        positions_after = _component_positions(doc, factor)
+        moved = _moved_components(positions_before, positions_after, tolerance, active_unit)
+        warnings = []
+        if moved:
+            worst = moved[0]
+            warnings.append(
+                f"{len(moved)} component(s) changed position while this study was "
+                f"created/activated -- worst: '{worst['name']}' by "
+                f"{worst['distance']:.4g} {active_unit}. MotionManager switched the "
+                f"assembly into the study's own state; the pose it had before is not "
+                f"recorded anywhere by SolidWorks. If that pose mattered, restore it "
+                f"with restore_assembly_pose, and capture it with capture_assembly_pose "
+                f"before creating a study next time.")
+        if not positions_before:
+            warnings.append(
+                "no component positions could be read before creating the study (this "
+                "is a part document, or its components are not loaded), so whether the "
+                "assembly moved is UNVERIFIED here")
         return {"name": study_name, "created": True, "activated": bool(activate), "count": count,
-                "contains_motor": False, "study_type": "Animation"}
+                "contains_motor": False, "study_type": "Animation",
+                "unit": active_unit,
+                "components_checked": len(positions_before),
+                "components_moved": moved,
+                "pose_preserved": bool(positions_before) and not moved,
+                "mechanism_note": _mechanism_pose_reminder("a motion study"),
+                "warnings": warnings}
 
     return await _run(_impl)
 
@@ -9729,12 +9929,14 @@ async def add_advanced_mate(
     gear_ratio_numerator: float = 1.0,
     gear_ratio_denominator: float = 1.0,
     reverse: bool = False,
+    align: str = "closest",
     unit: Optional[str] = None,
 ) -> dict:
     """Add an advanced mate between two entities selected by point.
 
     Goes beyond basic mates to include distance, angle, width, and symmetry
-    constraints needed to precisely position parts on platforms and tanks.
+    constraints needed to precisely position parts on platforms and tanks, and
+    the gear mate that drives one rotation from another.
 
     mate_type: 'distance', 'angle', 'width', 'symmetric', 'lock', 'gear', 'tangent',
                'coincident', 'concentric', 'parallel', or 'perpendicular'.
@@ -9742,7 +9944,24 @@ async def add_advanced_mate(
     x2/y2/z2: a point on the second face/edge.
     value: distance (in current unit) for 'distance', or angle in degrees for 'angle'.
     gear_ratio_numerator/gear_ratio_denominator: positive gear ratio for ``gear``.
-    reverse: reverse the driven direction for a gear mate."""
+    reverse: reverse the driven direction for a gear mate.
+
+    ``align`` is 'aligned', 'anti_aligned' or 'closest' (the default), and it
+    USED TO BE FORCED. AddMate5's second argument is swMateAlign_e, and this
+    tool passed a literal 0 (ALIGNED) on every call -- the same bug add_mate was
+    fixed for, left behind in the tool a mechanism is actually built with. For
+    two faces meant to face each other, ALIGNED is the wrong solution, and
+    SolidWorks reports no error because it is a mathematically valid one: the
+    joint simply comes out flipped. 'closest' lets the solver keep whichever of
+    the two solutions stays near the components' current relative pose.
+
+    THE RESULT IS MEASURED. ``components`` reports each picked component's
+    position before and after, with ``moved`` giving how far the solve dragged
+    it. A mate is not asked for a position -- it is asked for a relationship,
+    and the position is the consequence, which is why it has to be read rather
+    than assumed. For a mechanism, read ``mechanism_note``: these mates leave
+    movement free on purpose, so the pose they leave behind is not one they
+    hold."""
 
     def _impl():
         assy = _active_assembly()
@@ -9758,7 +9977,11 @@ async def add_advanced_mate(
             raise ValueError(f"Unknown mate_type '{mate_type}'. Use: {', '.join(types)}")
         if mate_key == "gear" and (gear_ratio_numerator <= 0 or gear_ratio_denominator <= 0):
             raise ValueError("Gear ratio numerator and denominator must be positive.")
+        align_code = MATE_ALIGN.get(align.lower().strip())
+        if align_code is None:
+            raise ValueError(f"Unknown align '{align}'. Use one of: {', '.join(MATE_ALIGN)}")
 
+        active_unit, factor = _unit_factor(unit)
         x1_m, y1_m, z1_m = to_meters(x1, unit), to_meters(y1, unit), to_meters(z1, unit)
         x2_m, y2_m, z2_m = to_meters(x2, unit), to_meters(y2, unit), to_meters(z2, unit)
 
@@ -9769,6 +9992,9 @@ async def add_advanced_mate(
         if not assy.Extension.SelectByID2("", "FACE", x2_m, y2_m, z2_m, True, 1, empty, 0):
             raise RuntimeError(f"No entity found at point 2 ({x2}, {y2}, {z2}).")
 
+        # While the selection is still live: creating the mate consumes it.
+        picked, before = _capture_picked_components(assy, factor)
+
         if mate_key == "angle":
             mate_value = math.radians(value)
         else:
@@ -9776,7 +10002,7 @@ async def add_advanced_mate(
 
         mate_err = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
         mate = assy.AddMate5(
-            code, 0, bool(reverse) if mate_key == "gear" else False,
+            code, align_code, bool(reverse) if mate_key == "gear" else False,
             mate_value, mate_value, mate_value,
             float(gear_ratio_numerator) if mate_key == "gear" else 0.0,
             float(gear_ratio_denominator) if mate_key == "gear" else 0.0,
@@ -9792,10 +10018,22 @@ async def add_advanced_mate(
                 "Confirm both entities support this mate type."
             )
 
+        components, warnings = _report_component_movement(
+            picked, before, factor, active_unit, f"the {mate_key} mate")
+        # The mates that leave movement free are the mechanism ones; 'lock' and
+        # the fully-constraining ones do not, so the reminder would be noise.
+        mechanism_note = None
+        if mate_key in {"gear", "distance", "angle", "tangent", "concentric",
+                        "parallel", "perpendicular", "symmetric"}:
+            mechanism_note = _mechanism_pose_reminder(f"a '{mate_key}' mate")
         return {"mate_type": mate_key, "value": value if code in (5, 6) else None,
                 "gear_ratio": [gear_ratio_numerator, gear_ratio_denominator] if mate_key == "gear" else None,
                 "reverse": bool(reverse) if mate_key == "gear" else None,
-                "error_code": mate_err.value, "unit": unit or _default_unit}
+                "align": align.lower().strip(),
+                "error_code": mate_err.value, "unit": active_unit,
+                "components": components,
+                "mechanism_note": mechanism_note,
+                "warnings": warnings}
 
     return await _run(_impl)
 
@@ -9822,6 +10060,14 @@ async def add_cam_follower_mate(
     selection-type IDs accepted by ``SelectByRay`` (the official sample uses
     2 and 3 respectively).  ``alignment`` is ``aligned``, ``anti_aligned``,
     or ``closest``.
+
+    THE RESULT IS MEASURED. ``components`` reports where the cam and the
+    follower sat before this mate and where they sit after, with ``moved``
+    giving the displacement the solve caused. A cam-follower mate holds the
+    follower against the cam profile and leaves it free to travel along it, so
+    creating it moves the follower onto the profile -- that is correct, and it
+    is also the moment the follower stops being where it was put. Read
+    ``mechanism_note`` for what to do about keeping a pose.
     """
 
     def _impl():
@@ -9865,6 +10111,11 @@ async def add_cam_follower_mate(
                 "Cam-follower selection failed; confirm both rays intersect the intended cam and follower entities."
             )
 
+        active_unit, factor = _unit_factor(unit)
+        # NOT named `before`: that is already the set of pre-existing MateCam
+        # feature names, and the new-feature check below depends on it.
+        picked, pose_before = _capture_picked_components(assy, factor)
+
         mate_data = assy.CreateMateData(9)  # swMateCAMFOLLOWER
         mate_data.MateAlignment = alignments[alignment_key]
         # Python 3.14's dynamic COM proxy exposes CreateMate as a property.
@@ -9884,12 +10135,18 @@ async def add_cam_follower_mate(
         if not after:
             raise RuntimeError("Cam-follower API returned a feature but no MateCam feature was added to the tree.")
         _redraw_document(assy)
+        components, warnings = _report_component_movement(
+            picked, pose_before, factor, active_unit, "the cam-follower mate")
         return {
             "feature": str(after[-1].Name),
             "feature_type": str(after[-1].GetTypeName2),
             "alignment": alignment_key,
             "rebuilt": rebuilt,
             "selection_marks": {"cam": 1, "follower": 8},
+            "unit": active_unit,
+            "components": components,
+            "mechanism_note": _mechanism_pose_reminder("a cam-follower mate"),
+            "warnings": warnings,
         }
 
     return await _run(_impl)
@@ -9916,6 +10173,13 @@ async def add_screw_mate(
     ``revolution_type`` is ``distance_per_revolution`` or
     ``revolutions_per_unit_length``. Distance values are converted by the MCP
     to meters; revolutions-per-unit-length is a scalar.
+
+    THE RESULT IS MEASURED. A screw mate couples rotation to translation along
+    the same axis, which means it leaves BOTH free and only fixes the ratio
+    between them: creating it slides the nut to wherever the coupling is
+    satisfied. ``components`` reports that displacement instead of leaving it to
+    be discovered later, and ``mechanism_note`` says how to keep a pose that
+    matters.
     """
 
     def _impl():
@@ -9956,6 +10220,10 @@ async def add_screw_mate(
             assy.ClearSelection2(True)
             raise RuntimeError("Screw-mate selection failed; both rays must hit cylindrical mate entities.")
 
+        active_unit, factor = _unit_factor(unit)
+        # NOT named `before`: that is the set of pre-existing MateScrew names.
+        picked, pose_before = _capture_picked_components(assy, factor)
+
         mate_data = assy.CreateMateData(17)  # swMateSCREW
         mate_data.RevolutionType = revolution_types[revolution_key]
         mate_data.RevolutionVal = value
@@ -9973,10 +10241,16 @@ async def add_screw_mate(
         if not after:
             raise RuntimeError("Screw API returned a feature but no MateScrew feature was added to the tree.")
         _redraw_document(assy)
+        components, warnings = _report_component_movement(
+            picked, pose_before, factor, active_unit, "the screw mate")
         return {
             "feature": str(after[-1].Name), "feature_type": str(after[-1].GetTypeName2),
             "revolution_type": revolution_key, "revolution_value": revolution_value,
             "reverse": bool(reverse), "rebuilt": rebuilt, "selection_marks": [1, 1],
+            "unit": active_unit,
+            "components": components,
+            "mechanism_note": _mechanism_pose_reminder("a screw mate"),
+            "warnings": warnings,
         }
 
     return await _run(_impl)
@@ -10002,6 +10276,12 @@ async def add_rack_pinion_mate(
     marks 64 (rack) and 128 (pinion), then verifies ``MateRackPinionDim``.
     ``diameter_type`` is ``pinion_pitch_diameter`` or
     ``rack_travel_per_revolution``.
+
+    THE RESULT IS MEASURED. A rack-and-pinion mate couples the pinion's rotation
+    to the rack's travel and fixes only the ratio between them, leaving both
+    free: creating it slides the rack to wherever the coupling is satisfied.
+    ``components`` reports where the rack and pinion were and where they ended
+    up, and ``mechanism_note`` covers keeping a pose that matters.
     """
 
     def _impl():
@@ -10040,6 +10320,10 @@ async def add_rack_pinion_mate(
             assy.ClearSelection2(True)
             raise RuntimeError("Rack-pinion selection failed; select a linear rack edge and a cylindrical pinion entity.")
 
+        active_unit, factor = _unit_factor(unit)
+        # NOT named `before`: that is the set of pre-existing MateRackPinionDim names.
+        picked, pose_before = _capture_picked_components(assy, factor)
+
         mate_data = assy.CreateMateData(13)  # swMateRACKPINION
         mate_data.DiameterType = diameter_types[diameter_key]
         mate_data.DiameterVal = to_meters(diameter_value, unit)
@@ -10057,10 +10341,16 @@ async def add_rack_pinion_mate(
         if not after:
             raise RuntimeError("Rack-pinion API returned a feature but no MateRackPinionDim feature was added to the tree.")
         _redraw_document(assy)
+        components, warnings = _report_component_movement(
+            picked, pose_before, factor, active_unit, "the rack-and-pinion mate")
         return {
             "feature": str(after[-1].Name), "feature_type": str(after[-1].GetTypeName2),
             "diameter_type": diameter_key, "diameter_value": diameter_value,
             "reverse": bool(reverse), "rebuilt": rebuilt, "selection_marks": {"rack": 64, "pinion": 128},
+            "unit": active_unit,
+            "components": components,
+            "mechanism_note": _mechanism_pose_reminder("a rack-and-pinion mate"),
+            "warnings": warnings,
         }
 
     return await _run(_impl)

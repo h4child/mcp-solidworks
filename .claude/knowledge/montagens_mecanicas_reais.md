@@ -52,6 +52,45 @@ não for 0, 90 ou 180 graus, a peça está torta — e agora é um número, não
 impressão de vista isométrica. Se `closest` resolver do lado errado, chame de
 novo com `align='aligned'` ou `'anti_aligned'`.
 
+**A correção da v5.14.0 estava incompleta (fechado na v5.16.0).** Ela consertou
+o `add_mate` e deixou o literal `0` idêntico no `add_advanced_mate` — que é
+justamente a ferramenta com que um mecanismo é construído, porque é dela que
+saem `distance`, `angle`, `gear`, `width`, `symmetric` e `lock`. Resultado
+prático: montagem estática (feita com `add_mate`) saía certa, e **movimento
+saía torto**, porque toda mate de mecanismo forçava `ALIGNED`. Desde a v5.16.0
+o `add_advanced_mate` tem o mesmo `align` com o mesmo default `'closest'`.
+
+## 2.1.1. Toda mate de mecanismo move peça — e agora diz quais
+
+Uma mate não recebe uma posição: recebe uma *relação*, e a posição é a
+consequência. Quando a mate resolve, o SolidWorks arrasta o que ainda está
+livre até a configuração que ela permite. Isso é correto, e é exatamente onde
+nasce o "pedi movimento e saiu fora de posição": a geometria passa a estar num
+lugar que ninguém escolheu.
+
+Desde a v5.16.0, `add_advanced_mate`, `add_cam_follower_mate`, `add_screw_mate`
+e `add_rack_pinion_mate` devolvem `components` com `position_before`,
+`position_after` e `moved.distance` de cada componente pego. Leia o `moved`: se
+a peça que você só queria *acoplar* andou 40 mm, a mate está resolvendo num
+lugar diferente do que você imaginou — corrija a mate, não compense com a
+próxima.
+
+As mates que acoplam dois graus de liberdade (`gear`, parafuso, pinhão) fixam
+só a **razão** entre eles e deixam os dois livres: criar a mate desliza a peça
+até onde o acoplamento fecha. Esperar que ela fique onde estava é o erro.
+
+## 2.1.2. Criar/ativar motion study pode mover a montagem
+
+`create_motion_study` com `activate=True` faz o MotionManager trocar a montagem
+para o estado do estudo, e o SolidWorks **não registra** a pose anterior em
+lugar nenhum. É a forma mais provável de perder uma pose de mecanismo que deu
+trabalho pra alcançar.
+
+Desde a v5.16.0 a ferramenta mede: `components_moved` lista quem saiu do lugar
+(pior primeiro) e `pose_preserved` responde a pergunta direta. O fluxo certo é
+`capture_assembly_pose(filepath=...)` **antes** de criar o estudo, e
+`restore_assembly_pose` se o relatório mostrar movimento indesejado.
+
 ## 2.2. Mecanismo: a posição tem que ser GRAVADA, nenhuma mate a segura
 
 Montagem estática guarda a posição de graça — tudo fixo ou totalmente matado,
