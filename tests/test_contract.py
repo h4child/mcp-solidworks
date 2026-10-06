@@ -708,3 +708,120 @@ def test_the_piston_joint_centers_no_longer_claim_to_be_a_contract():
     assert "'measured': False" in source, (
         "joint_centers should say outright that it was not measured"
     )
+
+
+# ---------------------------------------------------------------------------
+# v5.16.0: the motion layer
+# ---------------------------------------------------------------------------
+# v5.14.0 fixed the forced mate alignment in add_mate and left the identical
+# literal 0 in add_advanced_mate -- the tool a mechanism is actually built with,
+# since it owns distance, angle, gear, width, symmetric and lock. And none of
+# the four mechanism mates reported where the solve left the components, which
+# for a mechanism is the whole question: these mates leave movement free on
+# purpose, so creating one DRAGS whatever is still free.
+
+MECHANISM_MATE_TOOLS = (
+    "add_advanced_mate", "add_cam_follower_mate",
+    "add_screw_mate", "add_rack_pinion_mate",
+)
+
+
+def test_add_advanced_mate_no_longer_forces_the_alignment():
+    """AddMate5's second argument is swMateAlign_e. A literal 0 forces ALIGNED,
+    which for two faces meant to face each other is the wrong solution -- and
+    SolidWorks reports no error, because it is a valid one."""
+    source = _executable_body(TOOLS["add_advanced_mate"].fn)
+    assert "MATE_ALIGN" in source, (
+        "add_advanced_mate does not resolve its alignment through MATE_ALIGN"
+    )
+    assert "align_code" in source, "add_advanced_mate still passes a fixed alignment"
+    params = inspect.signature(TOOLS["add_advanced_mate"].fn).parameters
+    assert "align" in params, "add_advanced_mate exposes no align argument"
+    assert params["align"].default == "closest", (
+        "the default should be 'closest', which keeps the components near their "
+        "current relative pose instead of always forcing one side"
+    )
+
+
+def test_no_mate_tool_passes_a_literal_alignment_to_addmate5():
+    """The regression in one sentence: find any AddMate5 call whose second
+    argument is a bare number."""
+    for name in ("add_mate", "add_advanced_mate"):
+        source = _executable_body(TOOLS[name].fn)
+        for marker in ("AddMate5(code, 0", "AddMate5(mate_code, 0"):
+            assert marker not in source.replace("\n", " "), (
+                f"{name} hardcodes the mate alignment again"
+            )
+
+
+@pytest.mark.parametrize("name", MECHANISM_MATE_TOOLS)
+def test_every_mechanism_mate_reports_where_it_left_the_components(name):
+    """A mate is not asked for a position; it is asked for a relationship, and
+    the position is the consequence. Unreported, that is where "I asked for
+    movement and it came out crooked" comes from."""
+    source = _executable_body(TOOLS[name].fn)
+    assert "_capture_picked_components" in source, (
+        f"{name} does not record where the components were before the solve"
+    )
+    assert "_report_component_movement" in source, (
+        f"{name} does not report where the solve left them"
+    )
+    assert "_mechanism_pose_reminder" in source, (
+        f"{name} does not tell the caller that the pose it leaves is not one the "
+        f"mate holds"
+    )
+
+
+@pytest.mark.parametrize("name", MECHANISM_MATE_TOOLS)
+def test_the_mechanism_mates_capture_before_the_mate_consumes_the_selection(name):
+    """Creating the mate clears the selection, so the components owning the
+    picked entities have to be taken while it is still live."""
+    source = _executable_body(TOOLS[name].fn)
+    capture = source.index("_capture_picked_components")
+    for creator in ("AddMate5", "CreateMateData"):
+        if creator in source:
+            assert capture < source.index(creator), (
+                f"{name} reads the picked components after {creator}, by which "
+                f"point the selection is gone"
+            )
+
+
+@pytest.mark.parametrize("name", ("add_cam_follower_mate", "add_screw_mate",
+                                  "add_rack_pinion_mate"))
+def test_the_ray_mates_do_not_shadow_their_feature_name_set(name):
+    """These tools already bind `before` to the set of pre-existing mate-feature
+    names, and detect the new feature by difference against it. Binding the pose
+    snapshot to the same name breaks that check silently."""
+    source = _executable_body(TOOLS[name].fn)
+    assert "pose_before" in source, (
+        f"{name} should keep the pose snapshot under its own name"
+    )
+    assert ", before = _capture_picked_components" not in source, (
+        f"{name} shadows its feature-name set with the pose snapshot"
+    )
+
+
+def test_create_motion_study_measures_whether_the_assembly_moved():
+    """Activating a study switches the assembly into that study's state, and
+    nothing in SolidWorks records the pose it had before."""
+    source = _executable_body(TOOLS["create_motion_study"].fn)
+    assert "_component_positions" in source, (
+        "create_motion_study does not measure component positions at all"
+    )
+    assert "_moved_components" in source, (
+        "create_motion_study does not report which components moved"
+    )
+    description = TOOLS["create_motion_study"].description
+    assert "capture_assembly_pose" in description, (
+        "the docstring should name the tool that prevents losing the pose"
+    )
+    assert "tolerance" in inspect.signature(TOOLS["create_motion_study"].fn).parameters
+
+
+def test_the_mechanism_reminder_points_at_the_pose_tools():
+    """No mate can hold a free degree of freedom -- the free DOF IS the
+    movement. capture/restore_assembly_pose is the only answer, so the reminder
+    has to say so rather than implying another mate would fix it."""
+    note = server._mechanism_pose_reminder("a test mate")
+    assert "capture_assembly_pose" in note and "restore_assembly_pose" in note
+    assert "not another mate" in note or "not another" in note

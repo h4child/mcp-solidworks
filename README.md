@@ -283,6 +283,44 @@ nao esta disponivel", inclusive `connect_solidworks`, porque o caminho de
 reconexao nunca era alcancado. Agora `_com_is_alive()` invoca a chamada de
 fato, e o mesmo padrao de no-op foi corrigido no rebuild de `shell_body`.
 
+### Novas em v5.16.0 (movimento: a mate de mecanismo conferida)
+
+A correcao de alinhamento da v5.14.0 **estava incompleta**, e isso explica o
+sintoma: modelagem estatica saia bem, movimento saia torto.
+
+**1. O `add_advanced_mate` ainda forcava `ALIGNED`.** A v5.14.0 trocou o
+literal `0` do segundo parametro do `AddMate5` (`swMateAlign_e`) por um `align`
+configuravel **no `add_mate`**, e deixou o literal `0` identico no
+`add_advanced_mate`. Acontece que `add_advanced_mate` e justamente a ferramenta
+com que um mecanismo e construido: e dela que saem `distance`, `angle`, `gear`,
+`width`, `symmetric` e `lock`. Montagem estatica usa `add_mate` (corrigido);
+mecanismo usa `add_advanced_mate` (nao corrigido) — por isso o movimento saia
+torto e o modelo parado nao. Agora ele tem o mesmo `align`
+('aligned' | 'anti_aligned' | **'closest'**, default).
+
+**2. Nenhuma das 4 mates de mecanismo dizia onde deixou as pecas.** Uma mate
+nao recebe uma posicao: recebe uma *relacao*, e a posicao e a consequencia.
+Quando ela resolve, o SolidWorks arrasta o que ainda esta livre ate a
+configuracao permitida — correto, e exatamente onde nasce o "pedi movimento e
+saiu fora de posicao". `add_advanced_mate`, `add_cam_follower_mate`,
+`add_screw_mate` e `add_rack_pinion_mate` agora devolvem `components` com
+`position_before`, `position_after` e `moved.distance` de cada componente pego.
+As mates que acoplam dois graus de liberdade (`gear`, parafuso, pinhao) fixam so
+a **razao** entre eles e deixam os dois livres: criar a mate desliza a peca ate
+onde o acoplamento fecha, e esperar que ela fique onde estava e o erro.
+
+**3. Criar/ativar motion study pode mover a montagem, sem registro.** O
+MotionManager troca a montagem para o estado do estudo, e o SolidWorks nao
+guarda a pose anterior em lugar nenhum — e a forma mais provavel de perder uma
+pose de mecanismo que deu trabalho. `create_motion_study` agora mede:
+`components_moved` (pior primeiro) e `pose_preserved`. O fluxo certo e
+`capture_assembly_pose(filepath=...)` **antes**, e `restore_assembly_pose` se o
+relatorio mostrar movimento indesejado.
+
+Todas as quatro trazem `mechanism_note`: nenhuma mate segura um grau de
+liberdade livre, porque o grau livre **e** o movimento — quem torna a pose
+reproduzivel e `capture_assembly_pose`/`restore_assembly_pose`, nao outra mate.
+
 ### Novas em v5.15.0 (geometria de peca conferida, 153 -> 154)
 
 A v5.14.0 consertou a camada de **montagem**. A de **peca** continuava 100%
