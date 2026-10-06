@@ -1144,6 +1144,409 @@ def _deviation(requested, measured: dict, tolerance: float) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Sketch geometry: measure what SolidWorks built, never echo what was asked
+# ---------------------------------------------------------------------------
+# Every Create* call on ISketchManager runs through SolidWorks' sketch
+# INFERENCE engine, which snaps the points it is handed onto nearby geometry.
+# That snap radius is a SCREEN distance -- a pixel count -- so how far a point
+# may travel depends on the current zoom, not on the model. Two consequences,
+# both measured live on a 1.74 x 1.80 x 1.50 m part:
+#
+#   * the loud one -- when the snap collapses two defining points into one, the
+#     Create* call returns None and nothing is drawn. CreateCornerRectangle and
+#     CreateCircle failed exactly this way at the zoom that fitted the whole
+#     part, while CreateLine, which does not take the inference path, succeeded
+#     at that same zoom. Zooming into the target area made the identical
+#     rectangle call succeed. _sketch_create below handles this one.
+#
+#   * the quiet one -- when the snap only MOVES a point onto a nearby vertex or
+#     edge, the call succeeds and hands back a perfectly valid segment sitting
+#     somewhere other than where it was asked for.
+#
+# The quiet one is what these helpers exist for. A tool that returns its own
+# input coordinates cannot tell the two apart, so the part gets built on a
+# profile nobody ever checked -- and the error only surfaces later, in an
+# assembly or a drawing, as a part that does not fit.
+#
+# swSketchSegments_e.
+SKETCH_SEGMENT_TYPES = {
+    0: "line", 1: "arc", 2: "ellipse", 3: "spline", 4: "text", 5: "parabola",
+}
+
+_SKETCH_SNAP_REFUSAL = (
+    "SolidWorks refused to create {what}. A sketch IS active, so this is not a "
+    "missing sketch: ISketchManager's Create* calls run through the sketch "
+    "inference engine, whose snap radius is a SCREEN distance. When the "
+    "requested geometry spans only a few pixels at the current zoom, or sits "
+    "within the snap radius of existing geometry, its defining points collapse "
+    "into one and the call returns nothing.{extra}"
+)
+
+
+def _sketch_point_xyz(raw_point, factor: float) -> dict:
+    """Coordinates of an ISketchPoint, in the caller's unit.
+
+    These are SKETCH coordinates -- the same frame the draw_* arguments are
+    expressed in -- so they compare directly against what was requested.
+    """
+    point = win32com.client.Dispatch(raw_point)
+    return {
+        "x": _com_member(point, "X") * factor,
+        "y": _com_member(point, "Y") * factor,
+        "z": _com_member(point, "Z") * factor,
+    }
+
+
+def _sketch_segment_geometry(raw_segment, factor: float) -> dict:
+    """Real geometry of one sketch segment, as SolidWorks holds it.
+
+    Only what the segment actually exposes is reported: a line has start/end,
+    an arc adds center and radius, a spline reports its ends. Anything that
+    cannot be read is simply absent rather than guessed at, so a caller can
+    tell "SolidWorks says the center is here" from "nobody knows".
+    """
+    segment = win32com.client.Dispatch(raw_segment)
+    try:
+        code = int(_com_member(segment, "GetType"))
+    except Exception:
+        code = -1
+    info = {"type": SKETCH_SEGMENT_TYPES.get(code, f"unknown({code})")}
+    try:
+        info["construction"] = bool(_com_member(segment, "ConstructionGeometry"))
+    except Exception:
+        info["construction"] = None
+    for member, key in (
+        ("GetStartPoint2", "start"),
+        ("GetEndPoint2", "end"),
+        ("GetCenterPoint2", "center"),
+    ):
+        try:
+            raw_point = getattr(segment, member)()
+        except Exception:
+            continue
+        if raw_point is None:
+            continue
+        try:
+            info[key] = _sketch_point_xyz(raw_point, factor)
+        except Exception:
+            continue
+    for member, key, scale in (
+        ("GetRadius", "radius", factor),
+        ("GetLength", "length", factor),
+    ):
+        try:
+            value = float(_com_member(segment, member))
+        except Exception:
+            continue
+        if value > 0:
+            info[key] = value * scale
+    try:
+        info["full_circle"] = bool(_com_member(segment, "IsCircle"))
+    except Exception:
+        pass
+    return info
+
+
+def _sketch_segments(sketch) -> tuple:
+    """Every segment of a sketch, as raw COM objects."""
+    try:
+        return tuple(_com_member(sketch, "GetSketchSegments") or ())
+    except Exception:
+        return ()
+
+
+def _active_sketch(doc):
+    """The active sketch, or a RuntimeError that says what to do about it."""
+    sketch = doc.SketchManager.ActiveSketch
+    if sketch is None:
+        raise RuntimeError(
+            "No sketch is active. Call create_sketch or create_sketch_on_face "
+            "first; list_sketch_entities can only read a sketch that is open "
+            "(pass ``name`` to read a closed one)."
+        )
+    return sketch
+
+
+def _point_deviation(requested, measured: dict, tolerance: float) -> dict:
+    """How far a stored sketch point sits from the one that was requested."""
+    dx = measured["x"] - requested[0]
+    dy = measured["y"] - requested[1]
+    want_z = requested[2] if len(requested) > 2 and requested[2] is not None else 0.0
+    dz = measured.get("z", 0.0) - want_z
+    distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+    return {
+        "dx": dx, "dy": dy, "dz": dz,
+        "distance": distance,
+        "tolerance": tolerance,
+        "within_tolerance": distance <= tolerance,
+    }
+
+
+def _match_endpoints(requested_start, requested_end, actual: dict) -> tuple:
+    """Pair a segment's stored ends with the requested ones, allowing a swap.
+
+    SolidWorks is free to store a segment with its start and end exchanged --
+    it is the same line either way. Comparing positionally would then report a
+    deviation the size of the whole segment and call a perfectly good line
+    "snapped", which is exactly the kind of false alarm that teaches a caller
+    to ignore the verification. So both pairings are scored and the better one
+    is used.
+    """
+    start, end = actual.get("start"), actual.get("end")
+    if not start or not end:
+        return start, end
+
+    def total(a, b):
+        return (_point_deviation(requested_start, a, 0.0)["distance"]
+                + _point_deviation(requested_end, b, 0.0)["distance"])
+
+    if total(end, start) < total(start, end):
+        return end, start
+    return start, end
+
+
+def _scalar_deviation(requested: float, measured, tolerance: float) -> dict:
+    """Same idea as _point_deviation for a single length (radius, width, ...)."""
+    if measured is None:
+        return {"requested": requested, "actual": None, "error": None,
+                "tolerance": tolerance, "within_tolerance": False}
+    error = measured - requested
+    return {
+        "requested": requested, "actual": measured, "error": error,
+        "tolerance": tolerance, "within_tolerance": abs(error) <= tolerance,
+    }
+
+
+def _sketch_create(doc, create, extents_m, what: str):
+    """Run a SketchManager Create* call, with an honest failure and one retry.
+
+    The old message on a None result -- "Is a sketch active?" -- sent callers
+    hunting for a sketch that was open the whole time. The sketch is checked
+    FIRST here, so a refusal afterwards is reported as what it actually is: the
+    screen-space snap described at the top of this section. One retry zoomed
+    into the target area is attempted, because that is the fix, and it is
+    reported in the result so the caller knows the camera moved.
+
+    ``extents_m`` is (x1, y1, x2, y2) in metres bounding the requested
+    geometry, or None when there is nothing sensible to zoom to.
+
+    Returns (created_object, zoom_retry_used).
+    """
+    if doc.SketchManager.ActiveSketch is None:
+        raise RuntimeError(
+            f"No sketch is active, so {what} cannot be drawn. Call create_sketch "
+            f"or create_sketch_on_face first."
+        )
+    created = create()
+    if created is not None:
+        return created, False
+    if extents_m is None:
+        raise RuntimeError(_SKETCH_SNAP_REFUSAL.format(
+            what=what,
+            extra=" Draw it at a larger scale, or away from existing entities."))
+    x1, y1, x2, y2 = extents_m
+    low_x, high_x = min(x1, x2), max(x1, x2)
+    low_y, high_y = min(y1, y2), max(y1, y2)
+    # One full span of padding on each side: the geometry then spans roughly a
+    # third of the viewport, comfortably clear of the snap radius, without
+    # zooming so far that nothing else is visible.
+    margin = max(high_x - low_x, high_y - low_y, 1e-6)
+    try:
+        doc.ViewZoomTo2(low_x - margin, low_y - margin, 0.0,
+                        high_x + margin, high_y + margin, 0.0)
+    except Exception as exc:
+        raise RuntimeError(_SKETCH_SNAP_REFUSAL.format(
+            what=what,
+            extra=f" Zooming in to retry failed as well ({exc}).")) from exc
+    retried = create()
+    if retried is None:
+        raise RuntimeError(_SKETCH_SNAP_REFUSAL.format(
+            what=what,
+            extra=(" Zooming into the target area and retrying did not help, so "
+                   "something else is wrong: check get_sketch_status and "
+                   "list_sketch_entities.")))
+    return retried, True
+
+
+def _sketch_verdict(what: str, points, scalars, tolerance: float,
+                    active_unit: str, zoom_retry: bool) -> dict:
+    """The measured half of a draw_* result: actual, deviation, verified.
+
+    ``points`` is a sequence of (label, requested_tuple, measured_dict_or_None)
+    and ``scalars`` of (label, requested, measured_or_None), all already in
+    ``active_unit``. ``snapped`` is the finding that matters: the geometry was
+    created, and SolidWorks put it somewhere else.
+    """
+    deviations = {}
+    unreadable = []
+    worst = 0.0
+    for label, requested, measured in points:
+        if measured is None:
+            unreadable.append(label)
+            deviations[label] = None
+            continue
+        entry = _point_deviation(requested, measured, tolerance)
+        deviations[label] = dict(entry, unit=active_unit)
+        worst = max(worst, entry["distance"])
+    for label, requested, measured in scalars:
+        entry = _scalar_deviation(requested, measured, tolerance)
+        deviations[label] = dict(entry, unit=active_unit)
+        if measured is None:
+            unreadable.append(label)
+        else:
+            worst = max(worst, abs(entry["error"]))
+    snapped = bool(not unreadable and worst > tolerance)
+    warnings = []
+    if zoom_retry:
+        warnings.append(
+            f"creating {what} was refused at the zoom level in effect, and "
+            f"succeeded after zooming into the target area -- SolidWorks' sketch "
+            f"snap works in screen space. The view has been left zoomed there.")
+    if unreadable:
+        warnings.append(
+            f"{what} was created, but SolidWorks would not report back: "
+            f"{', '.join(sorted(set(unreadable)))}. That part of the geometry is "
+            f"UNVERIFIED -- check it with list_sketch_entities before building on it.")
+    if snapped:
+        warnings.append(
+            f"SolidWorks stored {what} up to {worst:.4g} {active_unit} from the "
+            f"coordinates requested: the sketch inference engine SNAPPED it onto "
+            f"nearby geometry. This profile is NOT the one asked for. Delete it and "
+            f"redraw zoomed in, or clear of existing entities, before extruding -- "
+            f"a snapped profile is how a part ends up subtly the wrong shape.")
+    return {
+        "deviation": deviations,
+        "max_deviation": worst,
+        "unit": active_unit,
+        "tolerance": tolerance,
+        "snapped": snapped,
+        "verified": bool(not unreadable and not snapped),
+        "zoom_retry": zoom_retry,
+        "warnings": warnings,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Feature dimensions: read back what SolidWorks used, not what was asked for
+# ---------------------------------------------------------------------------
+# Every feature tool here checked ``if feat is None`` and nothing else, which
+# catches the loud failure and misses the quiet one: SolidWorks CLAMPS a
+# dimension it cannot satisfy and reports no error. A fillet radius larger than
+# the adjacent geometry allows comes back smaller; a shell thicker than the wall
+# comes back thinner; an end condition can resolve to a different depth than the
+# number handed in. The feature exists, the call succeeded, and the part is not
+# the size anybody thinks it is.
+
+
+def _feature_definition_value(feature, members):
+    """First readable value among ``members`` on a feature's definition object.
+
+    A member is a name, or a (name, args) pair for the ones that take
+    arguments (``GetDepth(forward)``). Values come back in SolidWorks' own
+    units -- metres, radians -- and the caller converts.
+    """
+    try:
+        raw = _com_member(feature, "GetDefinition")
+    except Exception:
+        return None, None
+    if raw is None:
+        return None, None
+    try:
+        definition = win32com.client.Dispatch(raw)
+    except Exception:
+        return None, None
+    for member in members:
+        name, args = member if isinstance(member, tuple) else (member, ())
+        try:
+            value = float(_com_member(definition, name, *args))
+        except Exception:
+            continue
+        rendered = f"{name}({', '.join(repr(a) for a in args)})" if args else name
+        return value, f"GetDefinition().{rendered}"
+    return None, None
+
+
+def _feature_dimension_value(doc, feature, dimension: str):
+    """A feature's named dimension (``D1@Fillet1``), in SolidWorks' own units.
+
+    The dimension name is built from the feature's OWN name rather than a
+    hardcoded English one, because feature names are localized -- on a
+    Portuguese install the same fillet is ``Filete1`` and an extrude is
+    ``Ressalto-extrusão1``, so a hardcoded ``D1@Boss-Extrude1`` would read
+    nothing and report every feature as unverifiable.
+    """
+    try:
+        name = _com_member(feature, "Name")
+    except Exception:
+        return None, None
+    key = f"{dimension}@{name}"
+    try:
+        parameter = doc.Parameter(key)
+        if parameter is None:
+            return None, None
+        return float(_com_member(parameter, "SystemValue")), f"Parameter('{key}')"
+    except Exception:
+        return None, None
+
+
+def _measured_feature_value(doc, feature, members, dimension):
+    """Read one real feature dimension back, in SolidWorks' own units.
+
+    Two routes, because neither is universally available through the dynamic
+    SolidWorks proxy: the feature-data object (locale-independent, but some
+    types insist on AccessSelections first) and the named dimension (always
+    present, but keyed by the localized feature name). Whichever answered is
+    reported as ``measurement_method``, so a value that looks wrong can be
+    traced to how it was obtained instead of guessed at.
+    """
+    value, how = _feature_definition_value(feature, members)
+    if value is None and dimension:
+        value, how = _feature_dimension_value(doc, feature, dimension)
+    return value, how
+
+
+def _feature_verdict(what: str, checks, tolerance: float, unit_label: str) -> dict:
+    """The measured half of a feature result.
+
+    ``checks`` is a sequence of (label, requested, measured_or_None, how).
+    """
+    deviations, methods, unreadable = {}, {}, []
+    for label, requested, measured, how in checks:
+        deviations[label] = _scalar_deviation(requested, measured, tolerance)
+        methods[label] = how
+        if measured is None:
+            unreadable.append(label)
+    adjusted = [
+        label for label, entry in deviations.items()
+        if entry["actual"] is not None and not entry["within_tolerance"]
+    ]
+    warnings = []
+    if unreadable:
+        warnings.append(
+            f"SolidWorks would not report back {', '.join(sorted(unreadable))} for "
+            f"{what}, so that value is UNVERIFIED: the feature was created, but "
+            f"whether it uses the number requested is unknown")
+    if adjusted:
+        detail = "; ".join(
+            f"{label}: asked {deviations[label]['requested']:.4g}, "
+            f"got {deviations[label]['actual']:.4g}"
+            for label in sorted(adjusted)
+        )
+        warnings.append(
+            f"SolidWorks did not use the value requested for {what} ({detail}). It "
+            f"CLAMPS a dimension it cannot satisfy and reports no error when it does, "
+            f"so this feature exists with different numbers than the ones asked for")
+    return {
+        "deviation": deviations,
+        "measurement_method": methods,
+        "measured_unit": unit_label,
+        "tolerance": tolerance,
+        "verified": bool(not unreadable and not adjusted),
+        "warnings": warnings,
+    }
+
+
 def _preload_and_insert_component(assy, filepath: str, x: float, y: float, z: float):
     """AddComponent5 silently returns None unless the source document is already
     loaded into the SolidWorks session (via a silent OpenDoc6) and the assembly
@@ -1694,6 +2097,30 @@ async def insert_component(filepath: str, x: float = 0, y: float = 0, z: float =
         result["rotation_convention"] = pose["rotation_convention"]
         result["deviation"] = deviation
         result["verified"] = bool(deviation["within_tolerance"])
+
+        # Whether the component came out ANCHORED is as important as where it
+        # landed, and nothing used to report it. SolidWorks fixes the first
+        # component of an assembly, and a fixed component never moves: every
+        # mate against it is solved by moving the OTHER part. A caller that does
+        # not know this mates part B to the fixed part A expecting A to line up
+        # with B, watches B move instead, and concludes the main part "cannot be
+        # positioned" -- when in fact it was anchored from the moment it was
+        # inserted. Reported here, at insert time, where it is cheap to change.
+        try:
+            result["fixed"] = bool(comp.IsFixed)
+        except Exception as exc:
+            result["fixed"] = None
+            warnings.append(
+                f"whether '{name}' is fixed could not be read ({exc}); "
+                f"list_components reports it per component")
+        if result["fixed"]:
+            warnings.append(
+                f"'{name}' is FIXED in the assembly (SolidWorks anchors the first "
+                f"component inserted). Mates against it will move the other "
+                f"component, never this one, and verify_assembly_positions will "
+                f"report M04 if it is mated as well. Call float_component('{name}') "
+                f"if this part is meant to be positioned by its mates.")
+
         if not deviation["within_tolerance"]:
             warnings.append(
                 f"'{name}' landed {deviation['distance']:.4g} {active_unit} away from the "
@@ -3637,28 +4064,141 @@ async def get_sketch_status() -> dict:
     return await _run(_impl)
 
 
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def list_sketch_entities(name: Optional[str] = None,
+                               unit: Optional[str] = None) -> dict:
+    """Read the real geometry of a sketch out of SolidWorks. Read-only.
+
+    THIS IS THE PART-LEVEL COUNTERPART OF get_component_transform. Without it a
+    caller has no way to ask where sketch geometry actually ended up: at part
+    level the only other read-backs are measure_body (mass, volume, bounding
+    box, centre of gravity) and list_faces, and neither can answer "is the
+    corner of that rectangle where I put it".
+
+    That question is not theoretical. Every ISketchManager Create* call runs
+    through SolidWorks' sketch inference engine, which snaps points onto nearby
+    geometry using a SCREEN-space radius -- so the same call lands differently
+    depending on the zoom. The draw_* tools now measure their own result, and
+    this tool is how to check a sketch they did not just create: one built
+    earlier, one edited by hand in the UI, or one about to be extruded.
+
+    Each segment reports its ``type`` (line, arc, ellipse, spline, ...),
+    whether it is ``construction`` geometry, and whichever of ``start``,
+    ``end``, ``center``, ``radius``, ``length`` and ``full_circle`` SolidWorks
+    exposes for that type. A field that could not be read is absent rather than
+    guessed at. Coordinates are SKETCH coordinates, in ``unit`` -- the same
+    frame and unit the draw_* arguments use, so they compare directly.
+
+    ``name`` reads a named sketch from the feature tree (``Esboço3``,
+    ``Sketch3``) instead of the active one, which is what makes it usable as a
+    gate before extruding: close the sketch, read it back, then extrude.
+    Without ``name`` the active sketch is read, and it is an error if none is
+    open.
+
+    ``construction`` matters more than it looks: revolve_sketch needs a real
+    centerline, and a centerline that came back as normal geometry silently
+    produces a different solid.
+    """
+
+    def _impl():
+        doc = _active_doc()
+        active_unit, factor = _unit_factor(unit)
+        if name:
+            sketch = None
+            for raw_feature in doc.FeatureManager.GetFeatures(False) or ():
+                feature = win32com.client.Dispatch(raw_feature)
+                try:
+                    if feature.Name != name:
+                        continue
+                except Exception:
+                    continue
+                try:
+                    specific = _com_member(feature, "GetSpecificFeature2")
+                    sketch = win32com.client.Dispatch(specific) if specific else None
+                except Exception:
+                    sketch = None
+                break
+            if sketch is None:
+                raise RuntimeError(
+                    f"No sketch named '{name}' in this document's feature tree. "
+                    f"list_features shows every feature and its type; sketches are "
+                    f"the ones typed ProfileFeature.")
+            sketch_name = name
+            was_active = False
+        else:
+            sketch = _active_sketch(doc)
+            try:
+                sketch_name = _com_member(sketch, "Name")
+            except Exception:
+                sketch_name = None
+            was_active = True
+
+        segments = [
+            _sketch_segment_geometry(raw_segment, factor)
+            for raw_segment in _sketch_segments(sketch)
+        ]
+        construction = sum(1 for s in segments if s.get("construction"))
+        return {
+            "sketch": sketch_name,
+            "active": was_active,
+            "unit": active_unit,
+            "count": len(segments),
+            "construction_count": construction,
+            "segments": segments,
+        }
+
+    return await _run(_impl)
+
+
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
-async def draw_line(x1: float = 0, y1: float = 0, x2: float = 100, y2: float = 0, unit: Optional[str] = None) -> dict:
-    """Draw a line in the active sketch from (x1, y1) to (x2, y2)."""
+async def draw_line(x1: float = 0, y1: float = 0, x2: float = 100, y2: float = 0,
+                    unit: Optional[str] = None, tolerance: float = 0.01) -> dict:
+    """Draw a line in the active sketch from (x1, y1) to (x2, y2).
+
+    THE RESULT IS MEASURED, NOT ECHOED. The segment SolidWorks created is read
+    back, so ``actual`` is where the line really is and ``deviation`` is how far
+    each end sits from the point requested. ``verified`` is true only when both
+    ends landed within ``tolerance``.
+
+    ``snapped`` true is the finding to act on: the line was created, and
+    SolidWorks' sketch inference moved it onto nearby geometry. The call still
+    succeeded, so without this field the profile looks correct and the part
+    comes out subtly wrong. ``tolerance`` is in the same unit as the
+    coordinates (default 0.01 mm).
+    """
 
     def _impl():
         if x1 == x2 and y1 == y2:
             raise ValueError("Start and end points are identical — line has zero length.")
         doc = _active_doc()
-        line = doc.SketchManager.CreateLine(
-            to_meters(x1, unit), to_meters(y1, unit), 0,
-            to_meters(x2, unit), to_meters(y2, unit), 0,
+        active_unit, factor = _unit_factor(unit)
+        x1_m, y1_m = to_meters(x1, unit), to_meters(y1, unit)
+        x2_m, y2_m = to_meters(x2, unit), to_meters(y2, unit)
+        line, zoom_retry = _sketch_create(
+            doc,
+            lambda: doc.SketchManager.CreateLine(x1_m, y1_m, 0, x2_m, y2_m, 0),
+            (x1_m, y1_m, x2_m, y2_m), "a line",
         )
-        if line is None:
-            raise RuntimeError("Failed to draw line. Is a sketch active?")
-        return {"from": [x1, y1], "to": [x2, y2], "unit": unit or _default_unit}
+        actual = _sketch_segment_geometry(line, factor)
+        start, end = _match_endpoints((x1, y1, 0.0), (x2, y2, 0.0), actual)
+        result = {
+            "from": [x1, y1], "to": [x2, y2], "unit": active_unit,
+            "requested": {"from": [x1, y1], "to": [x2, y2]},
+            "actual": actual,
+        }
+        result.update(_sketch_verdict(
+            "the line",
+            (("start", (x1, y1, 0.0), start), ("end", (x2, y2, 0.0), end)),
+            (), tolerance, active_unit, zoom_retry,
+        ))
+        return result
 
     return await _run(_impl)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def draw_centerline(x1: float = 0, y1: float = 0, x2: float = 0, y2: float = 100,
-                           unit: Optional[str] = None) -> dict:
+                           unit: Optional[str] = None, tolerance: float = 0.01) -> dict:
     """Draw a centerline (construction geometry) in the active PART/ASSEMBLY sketch.
 
     A centerline is required as the rotation axis for revolve_sketch (Insert >
@@ -3666,65 +4206,206 @@ async def draw_centerline(x1: float = 0, y1: float = 0, x2: float = 0, y2: float
     only works on drawing (.SLDDRW) views — this tool draws inside a 3D part or
     assembly sketch, e.g. to model a revolved part like a piston, shaft, or bolt.
 
-    x1/y1, x2/y2: the two endpoints of the centerline in sketch coordinates."""
+    x1/y1, x2/y2: the two endpoints of the centerline in sketch coordinates.
+
+    THE RESULT IS MEASURED, NOT ECHOED: ``actual`` is the segment read back out
+    of SolidWorks and ``deviation`` is how far it sits from the request. On top
+    of position, ``is_construction`` confirms SolidWorks really stored this as
+    construction geometry -- revolve_sketch needs a true centerline as its axis,
+    and one that came back as ordinary geometry revolves into a different solid
+    with no error anywhere."""
 
     def _impl():
         if x1 == x2 and y1 == y2:
             raise ValueError("Start and end points are identical — centerline has zero length.")
         doc = _active_doc()
-        if doc.SketchManager.ActiveSketch is None:
-            raise RuntimeError("No sketch is active. Call create_sketch first.")
-        line = doc.SketchManager.CreateCenterLine(
-            to_meters(x1, unit), to_meters(y1, unit), 0,
-            to_meters(x2, unit), to_meters(y2, unit), 0,
+        active_unit, factor = _unit_factor(unit)
+        x1_m, y1_m = to_meters(x1, unit), to_meters(y1, unit)
+        x2_m, y2_m = to_meters(x2, unit), to_meters(y2, unit)
+        line, zoom_retry = _sketch_create(
+            doc,
+            lambda: doc.SketchManager.CreateCenterLine(x1_m, y1_m, 0, x2_m, y2_m, 0),
+            (x1_m, y1_m, x2_m, y2_m), "a centerline",
         )
-        if line is None:
-            raise RuntimeError("Failed to draw centerline. Is a sketch active?")
-        return {"from": [x1, y1], "to": [x2, y2], "unit": unit or _default_unit}
+        actual = _sketch_segment_geometry(line, factor)
+        start, end = _match_endpoints((x1, y1, 0.0), (x2, y2, 0.0), actual)
+        result = {
+            "from": [x1, y1], "to": [x2, y2], "unit": active_unit,
+            "requested": {"from": [x1, y1], "to": [x2, y2]},
+            "actual": actual,
+            "is_construction": actual.get("construction"),
+        }
+        verdict = _sketch_verdict(
+            "the centerline",
+            (("start", (x1, y1, 0.0), start), ("end", (x2, y2, 0.0), end)),
+            (), tolerance, active_unit, zoom_retry,
+        )
+        if actual.get("construction") is False:
+            verdict["warnings"].append(
+                "SolidWorks did NOT store this as construction geometry, so "
+                "revolve_sketch will not accept it as an axis -- and if the "
+                "profile closes around it, it revolves a different solid instead "
+                "of failing")
+            verdict["verified"] = False
+        result.update(verdict)
+        return result
 
     return await _run(_impl)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
-async def draw_circle(x: float = 0, y: float = 0, radius: float = 25, unit: Optional[str] = None) -> dict:
-    """Draw a circle in the active sketch given its center and radius."""
+async def draw_circle(x: float = 0, y: float = 0, radius: float = 25,
+                      unit: Optional[str] = None, tolerance: float = 0.01) -> dict:
+    """Draw a circle in the active sketch given its center and radius.
+
+    THE RESULT IS MEASURED, NOT ECHOED: the arc SolidWorks created is read back,
+    so ``actual`` carries the stored centre and radius and ``deviation`` compares
+    both against the request. ``verified`` is true only when centre and radius
+    both landed within ``tolerance``.
+
+    CreateCircle is one of the calls that goes through the sketch inference
+    engine, and it was confirmed live to refuse outright when the circle spans
+    only a few pixels at the current zoom -- the same call succeeded zoomed in.
+    A refusal here is retried once zoomed into the target area (reported as
+    ``zoom_retry``), and a circle that was created but moved comes back as
+    ``snapped``.
+
+    The radius matters as much as the centre: a bore snapped to a neighbouring
+    edge is still round, still looks right, and no longer fits its shaft.
+    """
 
     def _impl():
         if radius <= 0:
             raise ValueError(f"Radius must be positive, got {radius}.")
         doc = _active_doc()
+        active_unit, factor = _unit_factor(unit)
         x_m, y_m, r_m = to_meters(x, unit), to_meters(y, unit), to_meters(radius, unit)
-        circle = doc.SketchManager.CreateCircle(x_m, y_m, 0, x_m + r_m, y_m, 0)
-        if circle is None:
-            raise RuntimeError("Failed to draw circle. Is a sketch active?")
-        return {"center": [x, y], "radius": radius, "unit": unit or _default_unit}
+        circle, zoom_retry = _sketch_create(
+            doc,
+            lambda: doc.SketchManager.CreateCircle(x_m, y_m, 0, x_m + r_m, y_m, 0),
+            (x_m - r_m, y_m - r_m, x_m + r_m, y_m + r_m), "a circle",
+        )
+        actual = _sketch_segment_geometry(circle, factor)
+        result = {
+            "center": [x, y], "radius": radius, "unit": active_unit,
+            "requested": {"center": [x, y], "radius": radius},
+            "actual": actual,
+        }
+        result.update(_sketch_verdict(
+            "the circle",
+            (("center", (x, y, 0.0), actual.get("center")),),
+            (("radius", radius, actual.get("radius")),),
+            tolerance, active_unit, zoom_retry,
+        ))
+        return result
 
     return await _run(_impl)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
-async def draw_rectangle(x1: float = -50, y1: float = -25, x2: float = 50, y2: float = 25, unit: Optional[str] = None) -> dict:
-    """Draw a rectangle in the active sketch given two opposite corners."""
+async def draw_rectangle(x1: float = -50, y1: float = -25, x2: float = 50, y2: float = 25,
+                         unit: Optional[str] = None, tolerance: float = 0.01) -> dict:
+    """Draw a rectangle in the active sketch given two opposite corners.
+
+    THE SIZE IS MEASURED, NOT COMPUTED. This tool used to return
+    ``width = abs(x2 - x1)`` -- arithmetic on its own arguments, which is true
+    of the request and says nothing about the model. Now the four lines
+    SolidWorks created are read back, and ``actual_width``/``actual_height``
+    come from their real endpoints, with ``actual_corners`` giving the measured
+    box. ``width``/``height`` keep their old meaning (the requested size) so
+    existing callers still read what they expect.
+
+    CreateCornerRectangle is the call this whole measurement layer came from: on
+    a 1.74 x 1.80 x 1.50 m part, a requested 40 x 20 mm rectangle was refused
+    outright at the zoom that fitted the part, and the identical call succeeded
+    after zooming in. The refusal is retried once zoomed into the target area
+    (``zoom_retry``); a rectangle that was created but snapped onto neighbouring
+    geometry comes back with ``snapped`` true and ``verified`` false.
+
+    ``segment_count`` below 4 means SolidWorks did not build a closed box, which
+    will fail or silently misbehave at extrude time.
+    """
 
     def _impl():
         if x1 == x2 or y1 == y2:
             raise ValueError("Rectangle corners must differ in both X and Y — zero-area rectangle.")
         doc = _active_doc()
-        rect = doc.SketchManager.CreateCornerRectangle(
-            to_meters(x1, unit), to_meters(y1, unit), 0,
-            to_meters(x2, unit), to_meters(y2, unit), 0,
+        active_unit, factor = _unit_factor(unit)
+        x1_m, y1_m = to_meters(x1, unit), to_meters(y1, unit)
+        x2_m, y2_m = to_meters(x2, unit), to_meters(y2, unit)
+
+        def _make():
+            created = doc.SketchManager.CreateCornerRectangle(x1_m, y1_m, 0, x2_m, y2_m, 0)
+            if created is None:
+                return None
+            # An empty array is a refusal too, and `is not None` would read it
+            # as success and then report a rectangle with no segments.
+            return tuple(created) or None
+
+        rect, zoom_retry = _sketch_create(
+            doc, _make, (x1_m, y1_m, x2_m, y2_m), "a rectangle",
         )
-        if rect is None:
-            raise RuntimeError("Failed to draw rectangle. Is a sketch active?")
-        return {"width": abs(x2 - x1), "height": abs(y2 - y1), "unit": unit or _default_unit}
+        segments = [_sketch_segment_geometry(raw, factor) for raw in rect]
+        xs, ys = [], []
+        for segment in segments:
+            for key in ("start", "end"):
+                point = segment.get(key)
+                if point:
+                    xs.append(point["x"])
+                    ys.append(point["y"])
+        if xs and ys:
+            low = {"x": min(xs), "y": min(ys), "z": 0.0}
+            high = {"x": max(xs), "y": max(ys), "z": 0.0}
+            actual_width = max(xs) - min(xs)
+            actual_height = max(ys) - min(ys)
+        else:
+            low = high = None
+            actual_width = actual_height = None
+
+        result = {
+            # width/height stay the REQUESTED size, as earlier callers read them.
+            "width": abs(x2 - x1), "height": abs(y2 - y1), "unit": active_unit,
+            "requested": {"corners": [[x1, y1], [x2, y2]],
+                          "width": abs(x2 - x1), "height": abs(y2 - y1)},
+            "segment_count": len(segments),
+            "segments": segments,
+            "actual_corners": None if low is None else [low, high],
+            "actual_width": actual_width,
+            "actual_height": actual_height,
+        }
+        verdict = _sketch_verdict(
+            "the rectangle",
+            (("corner_low", (min(x1, x2), min(y1, y2), 0.0), low),
+             ("corner_high", (max(x1, x2), max(y1, y2), 0.0), high)),
+            (("width", abs(x2 - x1), actual_width),
+             ("height", abs(y2 - y1), actual_height)),
+            tolerance, active_unit, zoom_retry,
+        )
+        if len(segments) != 4:
+            verdict["warnings"].append(
+                f"SolidWorks returned {len(segments)} segment(s) instead of 4, so this "
+                f"is not a closed rectangle -- extruding it will fail or produce the "
+                f"wrong solid")
+            verdict["verified"] = False
+        result.update(verdict)
+        return result
 
     return await _run(_impl)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def draw_arc(cx: float = 0, cy: float = 0, radius: float = 25,
-                    start_angle: float = 0, end_angle: float = 90, unit: Optional[str] = None) -> dict:
-    """Draw an arc in the active sketch given center, radius, and start/end angles (degrees)."""
+                    start_angle: float = 0, end_angle: float = 90,
+                    unit: Optional[str] = None, tolerance: float = 0.01) -> dict:
+    """Draw an arc in the active sketch given center, radius, and start/end angles (degrees).
+
+    THE RESULT IS MEASURED, NOT ECHOED: the arc is read back out of SolidWorks,
+    so ``actual`` carries its stored centre, radius and endpoints, and
+    ``deviation`` compares each against the request. The endpoints are checked
+    as well as the centre because an arc can keep its centre and radius while
+    its ends get snapped elsewhere, which changes the sweep without changing
+    anything this tool used to report.
+    """
 
     def _impl():
         if radius <= 0:
@@ -3732,27 +4413,60 @@ async def draw_arc(cx: float = 0, cy: float = 0, radius: float = 25,
         if start_angle == end_angle:
             raise ValueError("Start and end angles are identical — arc has zero sweep.")
         doc = _active_doc()
+        active_unit, factor = _unit_factor(unit)
         cx_m, cy_m, r_m = to_meters(cx, unit), to_meters(cy, unit), to_meters(radius, unit)
         a1, a2 = math.radians(start_angle), math.radians(end_angle)
         x1, y1 = cx_m + r_m * math.cos(a1), cy_m + r_m * math.sin(a1)
         x2, y2 = cx_m + r_m * math.cos(a2), cy_m + r_m * math.sin(a2)
-        arc = doc.SketchManager.CreateArc(cx_m, cy_m, 0, x1, y1, 0, x2, y2, 0, 1)
-        if arc is None:
-            raise RuntimeError("Failed to draw arc. Is a sketch active?")
-        return {"center": [cx, cy], "radius": radius, "start_angle": start_angle,
-                "end_angle": end_angle, "unit": unit or _default_unit}
+        arc, zoom_retry = _sketch_create(
+            doc,
+            lambda: doc.SketchManager.CreateArc(cx_m, cy_m, 0, x1, y1, 0, x2, y2, 0, 1),
+            (cx_m - r_m, cy_m - r_m, cx_m + r_m, cy_m + r_m), "an arc",
+        )
+        actual = _sketch_segment_geometry(arc, factor)
+        # Requested endpoints, back in the caller's unit for comparison.
+        want_start = (x1 * factor, y1 * factor, 0.0)
+        want_end = (x2 * factor, y2 * factor, 0.0)
+        start, end = _match_endpoints(want_start, want_end, actual)
+        result = {
+            "center": [cx, cy], "radius": radius, "start_angle": start_angle,
+            "end_angle": end_angle, "unit": active_unit,
+            "requested": {"center": [cx, cy], "radius": radius,
+                          "start_angle": start_angle, "end_angle": end_angle,
+                          "start": list(want_start[:2]), "end": list(want_end[:2])},
+            "actual": actual,
+        }
+        result.update(_sketch_verdict(
+            "the arc",
+            (("center", (cx, cy, 0.0), actual.get("center")),
+             ("start", want_start, start),
+             ("end", want_end, end)),
+            (("radius", radius, actual.get("radius")),),
+            tolerance, active_unit, zoom_retry,
+        ))
+        return result
 
     return await _run(_impl)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def draw_spline(points: list[list[float]], natural_ends: bool = True,
-                      unit: Optional[str] = None) -> dict:
+                      unit: Optional[str] = None, tolerance: float = 0.01) -> dict:
     """Draw a 2D B-spline through two or more [x, y] control points.
 
     Use splines for smooth aerodynamic outlines, ergonomic transitions, and
     organic industrial-design profiles. The active sketch remains in control;
     close it normally before creating a solid feature.
+
+    THE RESULT IS MEASURED, NOT ECHOED: the spline's stored ends are read back
+    and compared with the first and last control points, so ``deviation`` shows
+    an end that was snapped elsewhere and ``snapped`` says so outright.
+
+    ``actual_ends_apart`` is the extra check that matters for a spline: if the
+    stored ends coincide while the requested ones do not, SolidWorks built a
+    PERIODIC (closed) spline, which loops back through the points instead of
+    running through them once. That failure was previously only visible as a
+    shape that looked wrong -- see the is_periodic inversion below.
     """
 
     def _impl():
@@ -3790,21 +4504,75 @@ async def draw_spline(points: list[list[float]], natural_ends: bool = True,
         # correct open curve. Invert it so natural_ends=True (the default,
         # "open spline with free end tangents") maps to IsPeriodic=False.
         is_periodic = not natural_ends
-        spline = doc.SketchManager.CreateSpline3(point_data, None, None, is_periodic, status)
-        if spline is None:
-            raise RuntimeError("SolidWorks could not create the spline in the active sketch.")
-        return {
+        active_unit, factor = _unit_factor(unit)
+        spline, zoom_retry = _sketch_create(
+            doc,
+            lambda: doc.SketchManager.CreateSpline3(
+                point_data, None, None, is_periodic, status),
+            (min(flattened[0::2]), min(flattened[1::2]),
+             max(flattened[0::2]), max(flattened[1::2])),
+            "a spline",
+        )
+        actual = _sketch_segment_geometry(spline, factor)
+        first = (float(points[0][0]), float(points[0][1]), 0.0)
+        last = (float(points[-1][0]), float(points[-1][1]), 0.0)
+        start, end = _match_endpoints(first, last, actual)
+        result = {
             "point_count": len(points),
             "natural_ends": natural_ends,
-            "unit": unit or _default_unit,
+            "unit": active_unit,
+            "requested": {"first": list(first[:2]), "last": list(last[:2]),
+                          "point_count": len(points)},
+            "actual": actual,
         }
+        verdict = _sketch_verdict(
+            "the spline",
+            (("first_point", first, start), ("last_point", last, end)),
+            (), tolerance, active_unit, zoom_retry,
+        )
+        # A periodic spline closes on itself: its stored ends coincide. That is
+        # the failure the is_periodic inversion above exists to prevent, and it
+        # is worth catching by measurement rather than trusting the flag -- a
+        # closed spline through non-cyclic points whips back into a spike, and
+        # the only previous symptom was the shape looking wrong.
+        if start and end and len(points) > 2:
+            ends_apart = math.dist((start["x"], start["y"]), (end["x"], end["y"]))
+            requested_apart = math.dist(first[:2], last[:2])
+            if requested_apart > tolerance and ends_apart <= tolerance:
+                verdict["warnings"].append(
+                    "the spline came back CLOSED (its stored ends coincide) although "
+                    "the first and last control points are apart: SolidWorks built a "
+                    "periodic spline, which loops back through the points instead of "
+                    "running through them once")
+                verdict["verified"] = False
+            result["actual_ends_apart"] = ends_apart
+        result.update(verdict)
+        return result
 
     return await _run(_impl)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
-async def draw_polygon(cx: float = 0, cy: float = 0, radius: float = 25, sides: int = 6, unit: Optional[str] = None) -> dict:
-    """Draw a regular, circumscribed polygon in the active sketch."""
+async def draw_polygon(cx: float = 0, cy: float = 0, radius: float = 25, sides: int = 6,
+                       unit: Optional[str] = None, tolerance: float = 0.01) -> dict:
+    """Draw a regular, circumscribed polygon in the active sketch.
+
+    THE RESULT IS MEASURED, NOT ECHOED, and ``deviation`` reports how far the
+    measured centre sits from the request -- ``snapped`` true means SolidWorks'
+    sketch inference moved the polygon onto nearby geometry after creating it.
+    ``actual_sides`` counts the real
+    non-construction segments SolidWorks created rather than repeating the
+    ``sides`` that was asked for, and ``actual_center`` is measured from their
+    vertices. A hex that came out with five sides, or centred somewhere else, is
+    visible here instead of at extrude time.
+
+    ``actual_circumradius`` and ``actual_apothem`` are reported as measurements
+    only, and deliberately NOT compared against ``radius``: which of the two
+    SolidWorks treats as the radius argument depends on the inscribed flag, and
+    that mapping has not been confirmed live for this call. Comparing the wrong
+    one would raise a false alarm on a perfectly good polygon, which is worse
+    than reporting both and letting the caller choose.
+    """
 
     def _impl():
         if radius <= 0:
@@ -3812,11 +4580,62 @@ async def draw_polygon(cx: float = 0, cy: float = 0, radius: float = 25, sides: 
         if not (3 <= sides <= 100):
             raise ValueError("sides must be between 3 and 100.")
         doc = _active_doc()
+        active_unit, factor = _unit_factor(unit)
         cx_m, cy_m, r_m = to_meters(cx, unit), to_meters(cy, unit), to_meters(radius, unit)
-        polygon = doc.SketchManager.CreatePolygon(cx_m, cy_m, 0, cx_m + r_m, cy_m, 0, sides, False)
-        if polygon is None:
-            raise RuntimeError("Failed to draw polygon. Is a sketch active?")
-        return {"center": [cx, cy], "radius": radius, "sides": sides, "unit": unit or _default_unit}
+
+        def _make():
+            created = doc.SketchManager.CreatePolygon(
+                cx_m, cy_m, 0, cx_m + r_m, cy_m, 0, sides, False)
+            if created is None:
+                return None
+            return tuple(created) or None
+
+        polygon, zoom_retry = _sketch_create(
+            doc, _make, (cx_m - r_m, cy_m - r_m, cx_m + r_m, cy_m + r_m), "a polygon",
+        )
+        segments = [_sketch_segment_geometry(raw, factor) for raw in polygon]
+        edges = [s for s in segments if s.get("type") == "line" and not s.get("construction")]
+        vertices = []
+        for segment in edges:
+            for key in ("start", "end"):
+                point = segment.get(key)
+                if point:
+                    vertices.append((point["x"], point["y"]))
+        if vertices:
+            measured_center = {
+                "x": sum(v[0] for v in vertices) / len(vertices),
+                "y": sum(v[1] for v in vertices) / len(vertices),
+                "z": 0.0,
+            }
+            spans = [math.dist((measured_center["x"], measured_center["y"]), v)
+                     for v in vertices]
+            circumradius = max(spans)
+            apothem = min(spans)
+        else:
+            measured_center = None
+            circumradius = apothem = None
+
+        result = {
+            "center": [cx, cy], "radius": radius, "sides": sides, "unit": active_unit,
+            "requested": {"center": [cx, cy], "radius": radius, "sides": sides},
+            "actual_sides": len(edges),
+            "actual_center": measured_center,
+            "actual_circumradius": circumradius,
+            "actual_apothem": apothem,
+            "segment_count": len(segments),
+        }
+        verdict = _sketch_verdict(
+            "the polygon",
+            (("center", (cx, cy, 0.0), measured_center),),
+            (), tolerance, active_unit, zoom_retry,
+        )
+        if len(edges) != sides:
+            verdict["warnings"].append(
+                f"{sides} sides were requested and SolidWorks created {len(edges)}: "
+                f"this is not the polygon that was asked for")
+            verdict["verified"] = False
+        result.update(verdict)
+        return result
 
     return await _run(_impl)
 
@@ -3929,13 +4748,21 @@ async def add_sketch_relation(relation: str, x1: float, y1: float,
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def extrude_sketch(depth: float = 10, both_directions: bool = False,
-                         merge: bool = True, unit: Optional[str] = None) -> dict:
-    """Boss-extrude the last sketch drawn; set merge=False to keep a separate body."""
+                         merge: bool = True, unit: Optional[str] = None,
+                         tolerance: float = 0.01) -> dict:
+    """Boss-extrude the last sketch drawn; set merge=False to keep a separate body.
+
+    THE DEPTH IS MEASURED, NOT ECHOED: the extrusion's real depth is read back
+    out of the feature, so ``actual_depth`` is what SolidWorks used and
+    ``verified`` is true only when it matches the request within ``tolerance``.
+    The profile this was built from is worth checking too -- a snapped sketch
+    extrudes perfectly into the wrong solid (list_sketch_entities)."""
 
     def _impl():
         if depth <= 0:
             raise ValueError(f"Depth must be positive, got {depth}.")
         doc = _active_doc()
+        active_unit, factor = _unit_factor(unit)
         depth_m = to_meters(depth, unit)
         sketch_name = _select_last_sketch(doc)
         end_cond = 6 if both_directions else 0  # 6=MidPlane, 0=Blind
@@ -3947,21 +4774,45 @@ async def extrude_sketch(depth: float = 10, both_directions: bool = False,
         )
         if feat is None:
             raise RuntimeError(f"Extrusion failed on sketch '{sketch_name}'. Check that its profile is closed.")
-        return {"sketch": sketch_name, "depth": depth, "both_directions": both_directions, "merge": merge,
-                "unit": unit or _default_unit}
+        feature = win32com.client.Dispatch(feat)
+        raw_depth, how = _measured_feature_value(
+            doc, feature, [("GetDepth", (True,)), "Depth"], "D1")
+        actual_depth = None if raw_depth is None else raw_depth * factor
+        result = {
+            "sketch": sketch_name, "depth": depth,
+            "both_directions": both_directions, "merge": merge,
+            "unit": active_unit,
+            "requested_depth": depth,
+            "actual_depth": actual_depth,
+        }
+        result.update(_feature_verdict(
+            "the extrusion depth",
+            (("depth", depth, actual_depth, how),),
+            tolerance, active_unit,
+        ))
+        return result
 
     return await _run(_impl)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def cut_extrude(depth: float = 10, through_all: bool = False,
-                       both_directions: bool = False, unit: Optional[str] = None) -> dict:
-    """Cut-extrude the last sketch drawn, removing material from the body."""
+                       both_directions: bool = False, unit: Optional[str] = None,
+                       tolerance: float = 0.01) -> dict:
+    """Cut-extrude the last sketch drawn, removing material from the body.
+
+    THE DEPTH IS MEASURED, NOT ECHOED: for a blind cut the real depth is read
+    back out of the feature into ``actual_depth`` and compared with the request.
+    With ``through_all`` there is no depth to verify -- the end condition is what
+    decides where the cut stops -- so ``verified`` comes back None and
+    ``verification_skipped`` says so rather than claiming a check that did not
+    happen."""
 
     def _impl():
         if not through_all and depth <= 0:
             raise ValueError(f"Depth must be positive, got {depth}.")
         doc = _active_doc()
+        active_unit, factor = _unit_factor(unit)
         sketch_name = _select_last_sketch(doc)
         if through_all:
             end_cond = 2 if both_directions else 1  # ThroughAllBoth / ThroughAll
@@ -3983,8 +4834,28 @@ async def cut_extrude(depth: float = 10, through_all: bool = False,
                 f"Cut failed on sketch '{sketch_name}'. Check that its profile is closed. "
                 f"[_select_last_sketch debug: {_last_select_debug}]"
             )
-        return {"sketch": sketch_name, "through_all": through_all,
-                "depth": None if through_all else depth, "unit": unit or _default_unit}
+        result = {"sketch": sketch_name, "through_all": through_all,
+                  "depth": None if through_all else depth, "unit": active_unit}
+        if through_all:
+            result["actual_depth"] = None
+            result["verified"] = None
+            result["verification_skipped"] = (
+                "through_all cuts have no depth dimension to check: the end "
+                "condition decides where the cut stops")
+            result["warnings"] = []
+            return result
+        feature = win32com.client.Dispatch(feat)
+        raw_depth, how = _measured_feature_value(
+            doc, feature, [("GetDepth", (True,)), "Depth"], "D1")
+        actual_depth = None if raw_depth is None else raw_depth * factor
+        result["requested_depth"] = depth
+        result["actual_depth"] = actual_depth
+        result.update(_feature_verdict(
+            "the cut depth",
+            (("depth", depth, actual_depth, how),),
+            tolerance, active_unit,
+        ))
+        return result
 
     return await _run(_impl)
 
@@ -4129,8 +5000,15 @@ _BEND_FILLET_CHAMFER_WARNING = (
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
-async def fillet_edges(radius: float = 2, unit: Optional[str] = None, force: bool = False) -> dict:
+async def fillet_edges(radius: float = 2, unit: Optional[str] = None, force: bool = False,
+                       tolerance: float = 0.01) -> dict:
     """Apply a constant-radius fillet to every edge of the solid body/bodies.
+
+    THE RADIUS IS MEASURED, NOT ECHOED. This is the feature SolidWorks is most
+    likely to quietly change: asked for a radius the adjacent geometry cannot
+    take, it fillets with a smaller one and reports no error. ``actual_radius``
+    is read back out of the feature, and ``verified`` is false when it differs
+    from the request by more than ``tolerance``.
 
     force: required (set True) on a part with sheet-metal bends -- this
     tool cannot exclude bend edges from "every edge", and filleting a bend
@@ -4144,26 +5022,50 @@ async def fillet_edges(radius: float = 2, unit: Optional[str] = None, force: boo
         doc = _active_doc()
         if not force and _has_sheet_metal_bends(doc):
             raise RuntimeError(_BEND_FILLET_CHAMFER_WARNING.format(bend_types="SMBaseFlange/EdgeFlange/OneBend", tool="fillet_edges"))
+        active_unit, factor = _unit_factor(unit)
         radius_m = to_meters(radius, unit)
         edge_count = _select_all_edges(doc)
         empty = win32com.client.VARIANT(pythoncom.VT_EMPTY, None)
         feat = doc.FeatureManager.FeatureFillet3(195, radius_m, 0, False, False, empty, empty)
         if feat is None:
             raise RuntimeError("Failed to create fillet.")
-        return {"radius": radius, "unit": unit or _default_unit, "edges": edge_count}
+        feature = win32com.client.Dispatch(feat)
+        raw_radius, how = _measured_feature_value(
+            doc, feature, ["DefaultRadius", "Radius"], "D1")
+        actual_radius = None if raw_radius is None else raw_radius * factor
+        result = {
+            "radius": radius, "unit": active_unit, "edges": edge_count,
+            "requested_radius": radius,
+            "actual_radius": actual_radius,
+        }
+        result.update(_feature_verdict(
+            "the fillet radius",
+            (("radius", radius, actual_radius, how),),
+            tolerance, active_unit,
+        ))
+        return result
 
     return await _run(_impl)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
-async def chamfer_edges(distance: float = 2, angle: float = 45, unit: Optional[str] = None, force: bool = False) -> dict:
+async def chamfer_edges(distance: float = 2, angle: float = 45, unit: Optional[str] = None,
+                        force: bool = False, tolerance: float = 0.01) -> dict:
     """Apply a distance/angle chamfer to every edge of the solid body/bodies.
 
     force: required (set True) on a part with sheet-metal bends -- this
     tool cannot exclude bend edges from "every edge", and chamfering a bend
     edge is confirmed to break flatten_sheet_metal() afterward even though
     the folded 3D body stays valid. See the raised error for the full
-    explanation if this fires."""
+    explanation if this fires.
+
+    DISTANCE AND ANGLE ARE MEASURED, NOT ECHOED: both are read back out of the
+    feature into ``actual_distance`` and ``actual_angle`` and compared with the
+    request. Like a fillet, a chamfer larger than the geometry allows is applied
+    smaller without an error. The angle is compared in DEGREES against the
+    ``tolerance`` given, which is otherwise a length -- 0.01 is a sane bound for
+    both, but a tolerance chosen for millimetres is not a statement about
+    degrees, so read the two deviations separately."""
 
     def _impl():
         if distance <= 0:
@@ -4173,12 +5075,34 @@ async def chamfer_edges(distance: float = 2, angle: float = 45, unit: Optional[s
         doc = _active_doc()
         if not force and _has_sheet_metal_bends(doc):
             raise RuntimeError(_BEND_FILLET_CHAMFER_WARNING.format(bend_types="SMBaseFlange/EdgeFlange/OneBend", tool="chamfer_edges"))
+        active_unit, factor = _unit_factor(unit)
         dist_m = to_meters(distance, unit)
         edge_count = _select_all_edges(doc)
         feat = doc.FeatureManager.InsertFeatureChamfer(1, 0, dist_m, math.radians(angle), dist_m, 0, 0, 0)
         if feat is None:
             raise RuntimeError("Failed to create chamfer.")
-        return {"distance": distance, "angle": angle, "unit": unit or _default_unit, "edges": edge_count}
+        feature = win32com.client.Dispatch(feat)
+        raw_distance, distance_how = _measured_feature_value(
+            doc, feature, ["Distance", "D1"], "D1")
+        raw_angle, angle_how = _measured_feature_value(
+            doc, feature, ["Angle"], "D2")
+        actual_distance = None if raw_distance is None else raw_distance * factor
+        # The feature stores its angle in radians, like every other SolidWorks
+        # angle; the public argument is degrees, so compare in degrees.
+        actual_angle = None if raw_angle is None else math.degrees(raw_angle)
+        result = {
+            "distance": distance, "angle": angle,
+            "unit": active_unit, "edges": edge_count,
+            "requested_distance": distance, "requested_angle": angle,
+            "actual_distance": actual_distance, "actual_angle": actual_angle,
+        }
+        result.update(_feature_verdict(
+            "the chamfer",
+            (("distance", distance, actual_distance, distance_how),
+             ("angle_degrees", angle, actual_angle, angle_how)),
+            tolerance, active_unit,
+        ))
+        return result
 
     return await _run(_impl)
 
@@ -4187,10 +5111,15 @@ async def chamfer_edges(distance: float = 2, angle: float = 45, unit: Optional[s
 async def shell_body(thickness: float = 2, remove_face_at_x: Optional[float] = None,
                       remove_face_at_y: Optional[float] = None,
                       remove_face_at_z: Optional[float] = None,
-                      unit: Optional[str] = None) -> dict:
+                      unit: Optional[str] = None, tolerance: float = 0.01) -> dict:
     """Hollow out the solid body leaving thin walls.
     Optionally select a face to remove (open shell) by specifying a point on it.
-    If no face is selected, creates a closed shell (uniform thickness all around)."""
+    If no face is selected, creates a closed shell (uniform thickness all around).
+
+    THE THICKNESS IS MEASURED, NOT ECHOED: it is read back out of the Shell
+    feature into ``actual_thickness`` and compared with the request. A shell
+    thicker than the local wall allows is created thinner without an error, and
+    wall thickness is usually the one dimension a shelled part exists for."""
 
     def _impl():
         if thickness <= 0:
@@ -4229,7 +5158,33 @@ async def shell_body(thickness: float = 2, remove_face_at_x: Optional[float] = N
                 "Shell failed. Ensure the body has sufficient thickness "
                 "and select a face to remove for an open shell."
             )
-        return {"thickness": thickness, "unit": unit or _default_unit}
+        # InsertFeatureShell returns void, so the feature has to be found in the
+        # tree to be read back: the last Shell is the one just inserted.
+        active_unit, factor = _unit_factor(unit)
+        shell_feature = None
+        for raw_feature in doc.FeatureManager.GetFeatures(False) or ():
+            candidate = win32com.client.Dispatch(raw_feature)
+            try:
+                if candidate.GetTypeName2 == "Shell":
+                    shell_feature = candidate
+            except Exception:
+                continue
+        raw_thickness, how = (None, None)
+        if shell_feature is not None:
+            raw_thickness, how = _measured_feature_value(
+                doc, shell_feature, ["Thickness"], "D1")
+        actual_thickness = None if raw_thickness is None else raw_thickness * factor
+        result = {
+            "thickness": thickness, "unit": active_unit,
+            "requested_thickness": thickness,
+            "actual_thickness": actual_thickness,
+        }
+        result.update(_feature_verdict(
+            "the shell thickness",
+            (("thickness", thickness, actual_thickness, how),),
+            tolerance, active_unit,
+        ))
+        return result
 
     return await _run(_impl)
 
@@ -5091,30 +6046,48 @@ async def draw_line_3d(
     x1: float = 0, y1: float = 0, z1: float = 0,
     x2: float = 100, y2: float = 0, z2: float = 0,
     unit: Optional[str] = None,
+    tolerance: float = 0.01,
 ) -> dict:
     """Draw a line in a 3D sketch from (x1,y1,z1) to (x2,y2,z2).
 
     Use inside a 3D sketch (opened with create_3d_sketch). Unlike draw_line
     which only works in 2D (Z=0), this places line segments anywhere in 3D
-    space — essential for defining structural member paths."""
+    space — essential for defining structural member paths.
+
+    THE RESULT IS MEASURED, NOT ECHOED: the segment is read back, so ``actual``
+    is where the line really runs and ``deviation`` covers all three axes.
+    This matters more in a 3D sketch than anywhere else: these lines become the
+    paths of structural members, so a snapped endpoint does not just move a
+    profile -- it moves a whole beam, and the weldment is then built along the
+    wrong path."""
 
     def _impl():
         if x1 == x2 and y1 == y2 and z1 == z2:
             raise ValueError("Start and end points are identical — line has zero length.")
         doc = _active_doc()
-        if doc.SketchManager.ActiveSketch is None:
-            raise RuntimeError("No sketch is active. Call create_3d_sketch first.")
-        line = doc.SketchManager.CreateLine(
-            to_meters(x1, unit), to_meters(y1, unit), to_meters(z1, unit),
-            to_meters(x2, unit), to_meters(y2, unit), to_meters(z2, unit),
+        active_unit, factor = _unit_factor(unit)
+        x1_m, y1_m, z1_m = to_meters(x1, unit), to_meters(y1, unit), to_meters(z1, unit)
+        x2_m, y2_m, z2_m = to_meters(x2, unit), to_meters(y2, unit), to_meters(z2, unit)
+        line, zoom_retry = _sketch_create(
+            doc,
+            lambda: doc.SketchManager.CreateLine(x1_m, y1_m, z1_m, x2_m, y2_m, z2_m),
+            (x1_m, y1_m, x2_m, y2_m), "a 3D line",
         )
-        if line is None:
-            raise RuntimeError("Failed to draw 3D line.")
-        return {
+        actual = _sketch_segment_geometry(line, factor)
+        start, end = _match_endpoints((x1, y1, z1), (x2, y2, z2), actual)
+        result = {
             "from": [x1, y1, z1],
             "to": [x2, y2, z2],
-            "unit": unit or _default_unit,
+            "unit": active_unit,
+            "requested": {"from": [x1, y1, z1], "to": [x2, y2, z2]},
+            "actual": actual,
         }
+        result.update(_sketch_verdict(
+            "the 3D line",
+            (("start", (x1, y1, z1), start), ("end", (x2, y2, z2), end)),
+            (), tolerance, active_unit, zoom_retry,
+        ))
+        return result
 
     return await _run(_impl)
 
@@ -6239,6 +7212,7 @@ async def move_copy_body(
     copy: bool = False,
     num_copies: int = 1,
     unit: Optional[str] = None,
+    tolerance: float = 0.01,
 ) -> dict:
     """Move or copy a solid body by translation and/or rotation.
 
@@ -6252,7 +7226,20 @@ async def move_copy_body(
     dx/dy/dz: translation along each axis.
     rx/ry/rz: rotation angles in degrees around X, Y, Z axes.
     copy: True to create copies; False to move in place.
-    num_copies: how many copies to make (only used if copy=True)."""
+    num_copies: how many copies to make (only used if copy=True).
+
+    THE MOVE IS MEASURED, NOT ECHOED. ``translation``/``rotation_deg`` are still
+    what was requested, and the solid's bounding box is now read before and
+    after, so ``bounding_box_before``, ``bounding_box_after`` and
+    ``measured_center_shift`` say what actually happened to the geometry.
+
+    ``verified`` is only filled in for a PURE TRANSLATION of the original
+    (``copy=False`` and no rotation), where the bounding-box centre must shift
+    by exactly the requested amount. With a rotation the box changes shape, and
+    with ``copy=True`` the union box grows to cover the copies, so in those
+    cases the centre shift is not the translation and comparing them would raise
+    a false alarm: ``verified`` comes back None and ``verification_skipped``
+    says which case applied. The measurements are reported either way."""
 
     def _impl():
         if copy and num_copies < 1:
@@ -6267,8 +7254,12 @@ async def move_copy_body(
             )
 
         doc = _active_doc()
+        active_unit, factor = _unit_factor(unit)
         rotation_axis = requested_axes[0] if requested_axes else None
         doc.ClearSelection2(True)
+
+        # Measured BEFORE the move, so there is something to compare against.
+        box_before, _ = _bodies_bounding_box(doc)
 
         empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
         if not doc.Extension.SelectByID2(body_name, "SOLIDBODY", 0, 0, 0, False, 1, empty, 0):
@@ -6298,7 +7289,26 @@ async def move_copy_body(
             raise RuntimeError(f"Move/Copy failed on body '{body_name}'.")
 
         feat_dispatch = win32com.client.Dispatch(feat)
-        return {
+        box_after, _ = _bodies_bounding_box(doc)
+
+        def _scaled(box):
+            return None if box is None else [value * factor for value in box]
+
+        def _center(box):
+            if box is None:
+                return None
+            return {
+                "x": (box[0] + box[3]) / 2.0 * factor,
+                "y": (box[1] + box[4]) / 2.0 * factor,
+                "z": (box[2] + box[5]) / 2.0 * factor,
+            }
+
+        before_center, after_center = _center(box_before), _center(box_after)
+        shift = None
+        if before_center and after_center:
+            shift = {axis: after_center[axis] - before_center[axis] for axis in "xyz"}
+
+        result = {
             "feature": feat_dispatch.Name if hasattr(feat_dispatch, "Name") else ("BodyCopy" if copy else "BodyMove"),
             "body": body_name,
             "translation": [dx, dy, dz],
@@ -6306,8 +7316,39 @@ async def move_copy_body(
             "rotation_axis": rotation_axis,
             "copied": copy,
             "copies": n if copy else 0,
-            "unit": unit or _default_unit,
+            "unit": active_unit,
+            "requested_translation": {"x": dx, "y": dy, "z": dz, "unit": active_unit},
+            "bounding_box_before": _scaled(box_before),
+            "bounding_box_after": _scaled(box_after),
+            "measured_center_shift": None if shift is None else dict(shift, unit=active_unit),
         }
+        warnings = []
+        pure_translation = not copy and rotation_axis is None
+        if not pure_translation:
+            result["verified"] = None
+            result["verification_skipped"] = (
+                "a rotation changes the bounding box's shape" if rotation_axis
+                else "copy=True grows the union box to cover the copies")
+        elif shift is None:
+            result["verified"] = False
+            result["verification_skipped"] = (
+                "no solid body reported a usable bounding box before or after")
+            warnings.append(
+                f"the move was applied to '{body_name}' but no bounding box could be "
+                f"measured, so the displacement is UNVERIFIED")
+        else:
+            deviation = dict(
+                _deviation((dx, dy, dz), shift, tolerance), unit=active_unit)
+            result["deviation"] = deviation
+            result["verified"] = bool(deviation["within_tolerance"])
+            if not deviation["within_tolerance"]:
+                warnings.append(
+                    f"'{body_name}' moved {deviation['distance']:.4g} {active_unit} "
+                    f"differently from the translation requested (dx={deviation['dx']:.4g}, "
+                    f"dy={deviation['dy']:.4g}, dz={deviation['dz']:.4g} {active_unit} off): "
+                    f"the body is NOT where this call asked to put it")
+        result["warnings"] = warnings
+        return result
 
     return await _run(_impl)
 
@@ -10518,11 +11559,27 @@ async def create_automotive_piston_with_connecting_rod(
                 "hollow underside", "separate wrist pin", "small-end and big-end bores",
                 "narrow-web connecting rod",
             ],
+            # These are the centres this routine was BUILT AROUND -- arithmetic on
+            # its own arguments, computed before any geometry existed. They used
+            # to be published under a key called "contract", asserting that both
+            # rod bores and the wrist pin really sit on them, which nothing here
+            # ever checked. A reader downstream then mates to these numbers as if
+            # they had been measured. They have not: if any stage drifted, the
+            # mate is built on a false premise, which is exactly how an assembly
+            # ends up with a crooked gap nobody can source.
             "joint_centers": {
                 "wrist_pin": {"x": 0.0, "y": small_end_y, "z": 0.0},
                 "crank_pin": {"x": 0.0, "y": big_end_y, "z": 0.0},
                 "unit": unit or _default_unit,
-                "contract": "Both rod bores and the transverse wrist pin use these shared centers.",
+                "measured": False,
+                "design_intent": (
+                    "The centres this routine aimed the small-end bore, big-end "
+                    "bore and transverse wrist pin at. COMPUTED from the input "
+                    "dimensions, never read back from the model. Confirm them "
+                    "against the real geometry (list_faces for the bore axes, "
+                    "measure_body for the overall box) before mating anything to "
+                    "these coordinates."
+                ),
             },
             "completed_stages": completed,
         }

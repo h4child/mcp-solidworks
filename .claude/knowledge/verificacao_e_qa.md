@@ -3,6 +3,53 @@
 Checklist real, não decorativo. Rode isso antes de responder ao usuário que
 uma peça/montagem está terminada. Ver também o fluxo em `CLAUDE.md`.
 
+## 0. O esboço é onde o erro nasce — confira antes de extrudar
+
+Isto vem antes de tudo porque é o passo mais barato de corrigir e o mais caro
+de descobrir depois: um esboço deslocado extruda perfeitamente, reconstrói sem
+erro, passa no `validate_model` e só aparece como "peça que não encaixa" na
+montagem, três etapas adiante.
+
+**A causa, medida ao vivo (v5.15.0).** Toda chamada `Create*` do
+`ISketchManager` passa pelo motor de inferência do SolidWorks, e o raio de snap
+dele é uma distância **em pixels, não em milímetros**. Numa peça de
+1,74 × 1,80 × 1,50 m:
+
+| chamada | zoom | resultado |
+| --- | --- | --- |
+| `draw_rectangle(-20,-10,20,10)` | enquadrando a peça | **recusado** (`null`) |
+| `draw_line(0,0,30,0)` | o mesmo | funcionou |
+| `draw_rectangle(-200,200,200,600)` (400×400) | o mesmo | funcionou |
+| o mesmo retângulo de 40×20, após `zoom_to_area` | aproximado | funcionou |
+
+O `CreateLine` não passa por esse caminho; é por isso que o bug parece
+aleatório. A recusa é a falha **ruidosa**. A **silenciosa** é a perigosa:
+quando o snap apenas *desloca* um ponto para um vértice vizinho, a chamada tem
+sucesso e devolve um segmento válido no lugar errado.
+
+**O que fazer:**
+
+1. Leia o campo **`snapped`** no retorno de qualquer `draw_*`. `snapped: true`
+   significa que a geometria foi criada e o SolidWorks a pôs em outro lugar —
+   apague e redesenhe, não compense no passo seguinte.
+2. `verified: false` com `unreadable` preenchido é diferente: a geometria pode
+   estar certa, só não foi possível conferir. Confirme com
+   `list_sketch_entities` antes de seguir.
+3. `zoom_retry: true` avisa que a primeira tentativa foi recusada e funcionou
+   com zoom — a câmera ficou aproximada. Não é erro, mas é sinal de que você
+   está desenhando pequeno numa peça grande: as próximas chamadas no mesmo
+   esboço correm o mesmo risco.
+4. **Antes de `extrude_sketch`/`revolve_sketch`/`cut_extrude`:** feche o
+   esboço e rode `list_sketch_entities(name="Esboço3")`. É a única forma de
+   perguntar onde a geometria foi parar — `measure_body` e `list_faces` só
+   falam de sólido, e sólido só existe depois da extrusão.
+5. Peça grande + feature pequena: `zoom_to_area` na região **antes** de
+   desenhar. Barato, e evita a recusa.
+
+**Centerline:** `draw_centerline` devolve `is_construction`. Se vier `false`, o
+`revolve_sketch` não aceita aquilo como eixo — e se o perfil fechar em volta
+dele, revoluciona um sólido diferente sem erro em lugar nenhum.
+
 ## 1. A árvore de features reconstrói sem erro
 
 `validate_model` — rebuilda e relata erros/avisos. SolidWorks às vezes

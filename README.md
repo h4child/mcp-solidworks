@@ -283,6 +283,69 @@ nao esta disponivel", inclusive `connect_solidworks`, porque o caminho de
 reconexao nunca era alcancado. Agora `_com_is_alive()` invoca a chamada de
 fato, e o mesmo padrao de no-op foi corrigido no rebuild de `shell_body`.
 
+### Novas em v5.15.0 (geometria de peca conferida, 153 -> 154)
+
+A v5.14.0 consertou a camada de **montagem**. A de **peca** continuava 100%
+eco: auditoria com AST de todo o `server.py` achou **153 chaves de coordenada
+ou dimensao em 86 ferramentas, 95 delas eco** (o valor devolvido vinha dos
+parametros), contra 9 que liam algo de volta — e cinco dessas nove eram so o
+titulo do documento. O desvio nasce no esboco, e naquele momento ninguem podia
+olhar.
+
+**1. O snap de esboco e em espaco de TELA, e move a geometria.** Toda chamada
+`Create*` do `ISketchManager` passa pelo motor de inferencia do SolidWorks, cujo
+raio de snap e uma distancia em pixels. Medido ao vivo numa peca de
+1,74 x 1,80 x 1,50 m: um retangulo de 40 x 20 mm foi **recusado** no zoom que
+enquadrava a peca inteira (`CreateCornerRectangle` devolveu `null`), enquanto
+`CreateLine`, que nao passa por esse caminho, funcionou no mesmo zoom; a mesma
+chamada de retangulo funcionou depois de aproximar o zoom. Essa e a falha
+*ruidosa*. A *silenciosa* e pior: quando o snap apenas **desloca** um ponto para
+um vertice vizinho, a chamada tem sucesso e devolve um segmento valido no lugar
+errado.
+
+- As 8 primitivas (`draw_line`, `draw_centerline`, `draw_circle`,
+  `draw_rectangle`, `draw_arc`, `draw_polygon`, `draw_spline`, `draw_line_3d`)
+  agora **leem o segmento criado de volta** e devolvem `actual`, `deviation`,
+  `verified` e **`snapped`** — a geometria foi criada e o SolidWorks a colocou
+  em outro lugar. O `draw_rectangle` devolvia `width = abs(x2 - x1)`: aritmetica
+  nos proprios argumentos, zero contato com o modelo. Agora ha
+  `actual_width`/`actual_height`/`actual_corners`, medidos dos quatro segmentos.
+- A recusa ruidosa deixou de mentir. A mensagem era "Is a sketch active?" com o
+  esboco aberto o tempo todo; agora o esboco e checado **primeiro**, a recusa e
+  reportada como o que e, e ha **uma tentativa de retry com zoom** na area alvo
+  (reportada em `zoom_retry`).
+- `list_sketch_entities` (nova, somente leitura) e o equivalente do
+  `get_component_transform` no nivel de peca: tipo, pontos, centro, raio e se e
+  geometria de construcao, de cada segmento. Sem ela nao havia **como** perguntar
+  onde a geometria de esboco foi parar — `GetSketchSegments` aparecia uma unica
+  vez em 12.300 linhas, enterrada dentro do `create_weldment_profile`.
+
+**2. A primeira peca da montagem e ancorada, e ninguem avisava.** O SolidWorks
+fixa o primeiro componente inserido. Uma peca fixa **nunca se move**: toda mate
+contra ela e resolvida movendo *a outra*. O `insert_component` nunca lia
+`IsFixed`, entao a IA matava a peca principal esperando que ela se alinhasse,
+via a outra se mover, e concluia que a peca principal "nao muda de posicao".
+Agora o retorno traz `fixed` e, quando verdadeiro, o aviso com a consequencia e
+o `float_component` como saida.
+
+**3. O SolidWorks reduz dimensao que nao cabe, sem erro.** Todas as ferramentas
+de feature checavam `if feat is None` e nada mais — a falha ruidosa coberta, o
+desvio silencioso descoberto. `fillet_edges`, `chamfer_edges`, `shell_body`,
+`extrude_sketch` e `cut_extrude` agora leem a dimensao de volta
+(`actual_radius`, `actual_distance`/`actual_angle`, `actual_thickness`,
+`actual_depth`) com `measurement_method` dizendo por qual rota foi lida.
+
+**4. `move_copy_body` devolvia a translacao pedida.** Agora mede a caixa
+envolvente antes e depois (`measured_center_shift`). So **verifica** no caso sem
+ambiguidade (translacao pura, `copy=False`, sem rotacao); com rotacao ou copia a
+caixa muda de forma e `verified` vem `None` com `verification_skipped` dizendo
+por que, em vez de um alarme falso.
+
+**5. `joint_centers` do pistao prometia garantia que nao tinha.** Era aritmetica
+nos argumentos publicada sob uma chave chamada `contract`, afirmando que os dois
+mancais e o pino realmente estavam ali. Agora traz `measured: false` e
+`design_intent` dizendo que foi calculado, nao medido.
+
 ### Novas em v5.14.0 (posicao de montagem conferida + mecanismos, 150 -> 153)
 
 Tres bugs distintos de posicionamento, e o caso de montagem com movimento.

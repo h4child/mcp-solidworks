@@ -550,3 +550,161 @@ def test_the_pose_round_trip_never_goes_through_euler_angles():
             f"_apply_pose uses {forbidden}: the pose is going through an angle "
             f"conversion instead of the matrix SolidWorks reported"
         )
+
+
+# ---------------------------------------------------------------------------
+# v5.15.0: the part layer measures its own geometry
+# ---------------------------------------------------------------------------
+# An AST audit of server.py found 95 echoed coordinate/dimension keys across 86
+# tools against 9 that read anything back. The assembly layer had been fixed in
+# v5.14.0; the part layer still answered every question with its own arguments.
+
+SKETCH_PRIMITIVES = (
+    "draw_line", "draw_centerline", "draw_circle", "draw_rectangle",
+    "draw_arc", "draw_polygon", "draw_spline", "draw_line_3d",
+)
+
+MEASURED_FEATURE_TOOLS = (
+    "fillet_edges", "chamfer_edges", "shell_body", "extrude_sketch", "cut_extrude",
+)
+
+
+@pytest.mark.parametrize("name", SKETCH_PRIMITIVES)
+def test_every_sketch_primitive_takes_a_tolerance(name):
+    """Measuring without a tolerance is not a check, it is a float comparison."""
+    assert "tolerance" in inspect.signature(TOOLS[name].fn).parameters, (
+        f"{name} cannot state how close is close enough"
+    )
+
+
+@pytest.mark.parametrize("name", SKETCH_PRIMITIVES)
+def test_every_sketch_primitive_reads_its_own_geometry_back(name):
+    """The whole point: the segment SolidWorks created has to be read, not the
+    arguments repeated. _sketch_segment_geometry is the only way to do that."""
+    source = _executable_body(TOOLS[name].fn)
+    assert "_sketch_segment_geometry" in source, (
+        f"{name} never reads back the segment it created, so it cannot tell a "
+        f"snapped profile from a correct one"
+    )
+    assert "_sketch_verdict" in source, (
+        f"{name} does not report a verdict (deviation/verified/snapped)"
+    )
+
+
+@pytest.mark.parametrize("name", SKETCH_PRIMITIVES)
+def test_every_sketch_primitive_documents_the_snap(name):
+    """A caller who does not know the snap exists reads `snapped: true` as
+    noise. The docstring is where that is explained."""
+    description = (TOOLS[name].description or "").lower()
+    assert "measured" in description, f"{name} does not say its result is measured"
+    assert "snap" in description or "deviation" in description, (
+        f"{name} does not mention the snap or the deviation it reports"
+    )
+
+
+def test_draw_rectangle_no_longer_computes_its_size_from_its_arguments():
+    """It returned width = abs(x2 - x1): arithmetic on its own input, true of
+    the request and silent about the model."""
+    source = _executable_body(TOOLS["draw_rectangle"].fn)
+    assert "actual_width" in source and "actual_height" in source, (
+        "draw_rectangle still reports only the requested size"
+    )
+    assert "segment_count" in source, (
+        "a rectangle that came back with fewer than 4 segments is not closed, "
+        "and extruding it fails or builds the wrong solid"
+    )
+
+
+def test_the_sketch_refusal_no_longer_blames_a_missing_sketch():
+    """"Is a sketch active?" sent callers hunting for a sketch that was open
+    the whole time. The sketch is checked first now, so the message can say
+    what the refusal actually is."""
+    source = _executable_body(server._sketch_create)
+    assert "ActiveSketch is None" in source, (
+        "_sketch_create does not check for the sketch before blaming it"
+    )
+    assert "ViewZoomTo2" in source, (
+        "the screen-space snap is fixed by zooming in; _sketch_create should "
+        "retry that way once instead of only reporting the refusal"
+    )
+    assert "snap" in server._SKETCH_SNAP_REFUSAL.lower()
+
+
+def test_list_sketch_entities_is_the_part_level_read_back():
+    """Without it nothing can ask where sketch geometry ended up: at part level
+    the only other read-backs are measure_body and list_faces."""
+    assert "list_sketch_entities" in TOOLS
+    assert TOOLS["list_sketch_entities"].annotations.readOnlyHint is True
+    params = inspect.signature(TOOLS["list_sketch_entities"].fn).parameters
+    assert "name" in params, (
+        "a sketch can only be verified before extruding if a CLOSED one can be "
+        "read by name"
+    )
+    description = TOOLS["list_sketch_entities"].description.lower()
+    assert "construction" in description, (
+        "revolve_sketch needs a real centerline; whether a segment is "
+        "construction geometry is part of what this has to report"
+    )
+
+
+def test_insert_component_reports_whether_the_part_is_anchored():
+    """SolidWorks fixes the first component of an assembly. A fixed component
+    never moves, so every mate against it is solved by moving the OTHER part --
+    which reads as "the main part cannot be positioned"."""
+    source = _executable_body(TOOLS["insert_component"].fn)
+    assert "IsFixed" in source, (
+        "insert_component never reads whether the component came out fixed"
+    )
+    assert "float_component" in source, (
+        "the warning should name the way out, not just the symptom"
+    )
+
+
+@pytest.mark.parametrize("name", MEASURED_FEATURE_TOOLS)
+def test_every_measured_feature_tool_reads_its_dimension_back(name):
+    """SolidWorks CLAMPS a dimension it cannot satisfy and reports no error: a
+    fillet radius larger than the geometry allows comes back smaller."""
+    source = _executable_body(TOOLS[name].fn)
+    assert "_measured_feature_value" in source, (
+        f"{name} does not read its dimension back out of the feature"
+    )
+    assert "tolerance" in inspect.signature(TOOLS[name].fn).parameters
+
+
+def test_the_feature_dimension_lookup_does_not_hardcode_an_english_name():
+    """Feature names are localized -- a Portuguese install names an extrude
+    'Ressalto-extrusao1'. A hardcoded 'D1@Boss-Extrude1' reads nothing there and
+    would report every feature as unverifiable."""
+    source = _executable_body(server._feature_dimension_value)
+    assert "Boss-Extrude" not in source and "Fillet1" not in source, (
+        "the dimension key is built from a hardcoded English feature name"
+    )
+    assert '"Name"' in source or "'Name'" in source, (
+        "the dimension key should be built from the feature's own name"
+    )
+
+
+def test_move_copy_body_measures_the_displacement_it_caused():
+    source = _executable_body(TOOLS["move_copy_body"].fn)
+    assert "_bodies_bounding_box" in source, (
+        "move_copy_body still only repeats the translation it was given"
+    )
+    assert "verification_skipped" in source, (
+        "with a rotation or a copy the bounding-box centre shift is NOT the "
+        "translation; claiming a check there would be a false alarm"
+    )
+
+
+def test_the_piston_joint_centers_no_longer_claim_to_be_a_contract():
+    """They are arithmetic on the input dimensions, computed before any geometry
+    existed. Published as a 'contract', a reader downstream mates to them as if
+    they had been measured."""
+    # ast.unparse renders string literals single-quoted, whatever the source
+    # used -- asserting on '"contract"' would pass even with the key still there.
+    source = _executable_body(TOOLS["create_automotive_piston_with_connecting_rod"].fn)
+    assert "'contract'" not in source, (
+        "joint_centers still presents computed numbers as a guarantee"
+    )
+    assert "'measured': False" in source, (
+        "joint_centers should say outright that it was not measured"
+    )

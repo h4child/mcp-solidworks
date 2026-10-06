@@ -116,6 +116,7 @@
   "list_motion_studies",
   "list_open_documents",
   "list_p2m_appearances",
+  "list_sketch_entities",
   "loft_sketches",
   "lookup_material_properties",
   "measure_body",
