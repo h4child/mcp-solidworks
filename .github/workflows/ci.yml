@@ -1,0 +1,43 @@
+name: CI
+
+# Runs the contract/regression suite and the linter on every push and pull
+# request. None of this needs SolidWorks or even Windows: tests/conftest.py
+# fakes win32com/pythoncom on any OS where the real pywin32 is not
+# importable, so the ubuntu job gives the fast, free, primary signal, and
+# the windows job additionally confirms the server still *imports* cleanly
+# against the real pywin32 (no SolidWorks install required for that either --
+# see server.py's _connect(), which raises a clean error when nothing is
+# running instead of hanging).
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies (incl. dev group)
+        run: uv sync --group dev
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Test
+        run: uv run pytest
