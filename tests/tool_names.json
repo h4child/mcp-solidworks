@@ -25,6 +25,7 @@
   "apply_metal_finish",
   "apply_p2m_appearance",
   "apply_texture",
+  "capture_assembly_pose",
   "capture_standard_views",
   "capture_viewport",
   "chamfer_edges",
@@ -127,6 +128,7 @@
   "remove_texture",
   "rename_display_state",
   "resolve_persistent_reference",
+  "restore_assembly_pose",
   "revolve_sketch",
   "run_macro",
   "save_document",
@@ -146,6 +148,7 @@
   "trim_extend_structural",
   "unsuppress_component",
   "validate_model",
+  "verify_assembly_positions",
   "verify_drawing",
   "zoom_to_area",
   "zoom_to_fit"

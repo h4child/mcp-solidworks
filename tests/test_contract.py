@@ -370,3 +370,181 @@ def test_the_issue_codes_are_the_ones_the_report_defines():
 
 def test_the_entity_registry_starts_empty():
     assert server._ENTITY_REGISTRY.ids_for_view("nonexistent.slddrw", "V1") == []
+
+
+# ---------------------------------------------------------------------------
+# The assembly placement layer
+# ---------------------------------------------------------------------------
+# Same contract as the drawing layer, for the side of the model the drawing
+# codes cannot see: a part in the wrong place yields a valid drawing of the
+# wrong assembly.
+
+PLACEMENT_TOOLS = ("insert_component", "set_component_transform")
+
+
+def test_the_assembly_verifier_is_registered_and_reads_only():
+    assert "verify_assembly_positions" in TOOLS
+    description = TOOLS["verify_assembly_positions"].description.lower()
+    assert "read-only" in description or "read only" in description
+
+
+@pytest.mark.parametrize("name", PLACEMENT_TOOLS)
+def test_every_placement_tool_can_assert_its_own_result(name):
+    """The fix for "the part landed somewhere else".
+
+    Without a tolerance to check against, a placement tool can only report
+    what it was asked to do, never whether it happened. Any future placement
+    tool has to offer the same assertion, so it is tested rather than
+    remembered.
+    """
+    assert "tolerance" in inspect.signature(TOOLS[name].fn).parameters, (
+        f"'{name}' cannot be asked to verify its own result"
+    )
+
+
+@pytest.mark.parametrize("name", PLACEMENT_TOOLS)
+def test_every_placement_tool_documents_that_it_measures_the_result(name):
+    """A caller has to know the position in the payload is the measured one,
+    not the one that was requested -- otherwise the echo is read as proof."""
+    description = TOOLS[name].description.lower()
+    assert "actual_position" in description, (
+        f"'{name}' does not tell the caller that it reads the position back"
+    )
+    assert "verified" in description
+
+
+def test_add_mate_reports_what_the_mate_does_not_constrain():
+    """Every supported mate type leaves a degree of freedom open: a concentric
+    mate holds the axis and lets the part slide anywhere along it. A mate that
+    reports success has not necessarily located anything."""
+    description = TOOLS["add_mate"].description.lower()
+    assert "degrees_of_freedom_left" in description
+    for mate_type in ("coincident", "concentric", "parallel",
+                      "perpendicular", "tangent"):
+        assert mate_type in server.MATE_DOF_LEFT, (
+            f"mate type '{mate_type}' is offered by add_mate but its "
+            f"unconstrained degrees of freedom are not documented"
+        )
+
+
+def test_add_mate_no_longer_hardcodes_the_alignment():
+    """AddMate5's 2nd parameter is swMateAlign_e (ALIGNED=0, ANTI_ALIGNED=1,
+    CLOSEST=2). A literal 0 forces ALIGNED on every call regardless of the
+    geometry -- the wrong solve for two faces meant to face each other, and a
+    second, separate cause of a part landing tilted even when the face
+    selection itself was correct."""
+    source = _executable_body(TOOLS["add_mate"].fn)
+    assert "mate_code, 0," not in source.replace(" ", "").replace("\n", ""), (
+        "AddMate5's Align parameter is hardcoded to 0 (ALIGNED) again"
+    )
+    assert "align_code" in source
+    for option in ("aligned", "anti_aligned", "closest"):
+        assert option in server.MATE_ALIGN, f"align option '{option}' is missing"
+    assert server.MATE_ALIGN["aligned"] == 0
+    assert server.MATE_ALIGN["anti_aligned"] == 1
+    assert server.MATE_ALIGN["closest"] == 2
+
+
+def test_add_mate_measures_the_resulting_geometry():
+    """The "fica torta" symptom: a mate that solves to a tilted or crooked fit
+    without SolidWorks reporting any error. geometry_check gives a measured
+    angle to check against instead of judging it from a picture."""
+    description = TOOLS["add_mate"].description.lower()
+    assert "geometry_check" in description
+    assert "angle" in description
+    params = inspect.signature(TOOLS["add_mate"].fn).parameters
+    assert "align" in params
+    assert params["align"].default == "closest"
+
+
+def test_the_transform_tools_label_their_matrix_convention():
+    """Row-major, confirmed live. Assuming the column convention gives a
+    plausible but wrong global point that still selects *a* face, so the
+    convention travels in the payload instead of being guessed."""
+    for name in ("get_component_transform", "set_component_transform"):
+        assert "rotation_convention" in TOOLS[name].description, (
+            f"'{name}' does not state its rotation matrix convention"
+        )
+
+
+def test_the_assembly_issue_codes_exist():
+    for code in ("M01", "M02", "M03", "M04", "M05"):
+        assert code in ad.ISSUE_CODES
+
+
+def _executable_body(function) -> str:
+    """The function's code with its docstring removed.
+
+    Needed because these docstrings quote the bug they fixed: a docstring that
+    *explains* why bodies[0] is wrong must not read as bodies[0] being used.
+    """
+    tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+    body = tree.body[0].body
+    if (body and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)):
+        body = body[1:]
+    return "\n".join(ast.unparse(node) for node in body)
+
+
+def test_the_multibody_bounding_box_unions_every_body():
+    """A weldment has several solid bodies. Measuring only bodies[0] gives the
+    box of whichever body comes first, and the origin correction computed from
+    it displaces the component by the difference between the two boxes -- which
+    is every weldment and every structural-profile part."""
+    assert "bodies[0]" not in _executable_body(server._bodies_bounding_box), (
+        "the bounding box is being read from the first body only, which is "
+        "wrong for every multi-body part"
+    )
+    assert _executable_body(server._preload_and_insert_component).count(
+        "_bodies_bounding_box") == 1, (
+        "insert_component no longer measures the source document through "
+        "_bodies_bounding_box"
+    )
+
+
+def test_the_assembly_verifier_has_a_mechanism_mode():
+    """A mechanism's moving parts are under-constrained ON PURPOSE. Without a
+    way to declare them, M01 fires on every one of them and the real finding
+    drowns in false positives."""
+    params = inspect.signature(TOOLS["verify_assembly_positions"].fn).parameters
+    assert "moving_components" in params
+    assert params["moving_components"].default is None
+    assert "M06" in ad.ISSUE_CODES
+
+
+@pytest.mark.parametrize("name", ("capture_assembly_pose", "restore_assembly_pose"))
+def test_the_mechanism_pose_tools_are_registered(name):
+    assert name in TOOLS
+
+
+def test_capture_assembly_pose_reads_only_and_can_persist():
+    description = TOOLS["capture_assembly_pose"].description.lower()
+    assert "read-only" in description or "read only" in description
+    assert TOOLS["capture_assembly_pose"].annotations.readOnlyHint is True
+    params = inspect.signature(TOOLS["capture_assembly_pose"].fn).parameters
+    assert "filepath" in params, (
+        "a pose that cannot be written to disk does not survive the session, "
+        "which is the whole point for a mechanism"
+    )
+
+
+def test_restore_assembly_pose_verifies_what_it_restored():
+    """A mate can drag a restored component the moment the rebuild solves, and
+    SolidWorks reports nothing when it does."""
+    description = TOOLS["restore_assembly_pose"].description.lower()
+    assert "deviation" in description
+    assert "verified" in description
+    assert "tolerance" in inspect.signature(TOOLS["restore_assembly_pose"].fn).parameters
+
+
+def test_the_pose_round_trip_never_goes_through_euler_angles():
+    """Decomposing a rotation matrix to angles and recomposing it is not exact
+    (aliased triples map to the same matrix), and a mechanism pose has to come
+    back exactly. _apply_pose must take the matrix itself."""
+    source = _executable_body(server._apply_pose)
+    for forbidden in ("radians", "degrees", "math.cos", "math.sin"):
+        assert forbidden not in source, (
+            f"_apply_pose uses {forbidden}: the pose is going through an angle "
+            f"conversion instead of the matrix SolidWorks reported"
+        )

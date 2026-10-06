@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "solidworks-mcp",
   "display_name": "SolidWorks MCP",
-  "version": "5.13.0",
+  "version": "5.14.0",
   "description": "MCP server for SolidWorks automation through the Windows COM API, built with FastMCP.",
   "long_description": "Controls SolidWorks via COM for parts, assemblies, sketches, features, drawings, appearances, validation, and selected mechanical mates. Designed for trusted local desktop automation.",
   "author": {
@@ -129,6 +129,18 @@
     {
       "name": "list_mates",
       "description": "List all mates (constraints) in the assembly."
+    },
+    {
+      "name": "verify_assembly_positions",
+      "description": "Verify where every assembly component actually is: real positions, plus unconstrained, origin-stuck, stacked, over-constrained and wrongly-fixed moving components."
+    },
+    {
+      "name": "capture_assembly_pose",
+      "description": "Record the exact pose of every component of a moving assembly (mechanism) as a restorable snapshot, optionally to a JSON file."
+    },
+    {
+      "name": "restore_assembly_pose",
+      "description": "Put a mechanism back into a pose recorded by capture_assembly_pose, exactly, and report any component a mate dragged elsewhere."
     },
     {
       "name": "list_motion_studies",

@@ -557,6 +557,16 @@ ISSUE_CODES: dict[str, str] = {
     "E08": "scale wrong or not on the normalised series",
     "E09": "views not aligned / wrong projection angle",
     "E16": "dangling dimension",
+    # Assembly placement. Same taxonomy extended to the side of the model that
+    # the drawing codes above cannot see: where the components actually ARE.
+    # A part in the wrong place produces a perfectly valid drawing of the wrong
+    # assembly, so these have to be checkable on their own.
+    "M01": "component neither fixed nor mated: its position is not reproducible",
+    "M02": "component sitting on the assembly origin (placement probably did not take)",
+    "M03": "two or more components sharing one position (stacked on top of each other)",
+    "M04": "component fixed and mated at the same time (over-constrained)",
+    "M05": "component position could not be read (suppressed, lightweight or not loaded)",
+    "M06": "component declared as moving is fixed, so the mechanism cannot move",
 }
 
 SEVERITIES = ("critical", "warning", "info")
