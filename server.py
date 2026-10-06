@@ -13876,6 +13876,20 @@ def knowledge_index() -> str:
 
 
 _KNOWLEDGE_RESOURCES = [
+    # First on purpose: this one is about the TOOL RESULTS, not about
+    # engineering. Everything else here tells the caller what to build; this
+    # tells it how to know whether what it built is what it asked for -- and
+    # which of this server's own guarantees have not been proven live.
+    ("campos-de-verificacao", "campos_de_verificacao.md", "campos-de-verificacao-e-armadilhas",
+     "COMO LER O RETORNO DAS FERRAMENTAS. Este servidor mede o proprio "
+     "resultado: o contrato de requested_* vs actual_*, por que verified=false "
+     "e verified=null sao diferentes, e o que fazer com snapped, moved, "
+     "zoom_retry, components_moved, measurement_method e fixed. Traz as cinco "
+     "armadilhas confirmadas (snap de esboco em espaco de tela, alinhamento de "
+     "mate forcado, primeiro componente ancorado, dimensao de feature reduzida "
+     "sem erro, pose de mecanismo que nenhuma mate segura) e a lista honesta do "
+     "que ainda nao foi validado ao vivo. Leia antes de concluir que um passo "
+     "deu certo."),
     ("roteiro-projetista", "roteiro_projetista.md", "roteiro-projetista-mecanico",
      "Fluxo completo de ponta a ponta para projetar qualquer peca a partir de "
      "um pedido ou referencia -- amarra todos os outros resources de "
@@ -13906,19 +13920,28 @@ _KNOWLEDGE_RESOURCES = [
      "Design for manufacturing por processo: usinagem CNC, corte a laser + "
      "dobra, solda, injecao plastica, fundicao."),
     ("verificacao-e-qa", "verificacao_e_qa.md", "verificacao-e-qa-antes-de-entregar",
-     "Checklist real antes de dizer que uma peca esta pronta: reconstrucao "
-     "sem erro, massa bate, inspecao visual, interferencia, fabricabilidade, "
-     "e o que fazer quando pedem confirmacao de resistencia sem FEA "
-     "disponivel."),
+     "Checklist real antes de dizer que uma peca esta pronta. Comeca na secao "
+     "0, o esboco -- o snap de esboco do SolidWorks e em espaco de TELA e "
+     "desloca a geometria sem erro nenhum, entao um esboco errado extruda "
+     "perfeitamente e so aparece como peca que nao encaixa tres etapas depois. "
+     "Depois: reconstrucao sem erro, massa bate, inspecao visual, "
+     "interferencia, fabricabilidade, e o que fazer quando pedem confirmacao "
+     "de resistencia sem FEA disponivel."),
     ("montagens-mecanicas-reais", "montagens_mecanicas_reais.md", "montagens-mecanicas-encaixe-real",
-     "Encaixe real entre pecas numa montagem: por que validate_model e uma "
-     "isometrica solta nao bastam, mate concentric so trava 2 graus de "
-     "liberdade, boss so funde com a parede acima de um raio minimo, "
-     "convencao linha-vs-coluna da rotation_matrix, e bugs confirmados "
+     "Encaixe real entre pecas numa montagem, e MECANISMO. Por que "
+     "validate_model e uma isometrica solta nao bastam; mate concentric so "
+     "trava 2 graus de liberdade; alinhamento de mate forcado como segunda "
+     "causa de peca torta (corrigido no add_mate na v5.14.0 e, so na v5.16.0, "
+     "no add_advanced_mate -- a ferramenta com que mecanismo e construido, o "
+     "que explica estatico sair bem e movimento sair torto); toda mate de "
+     "mecanismo move peca e agora reporta quais; criar/ativar motion study pode "
+     "mover a montagem sem registro; pose de mecanismo tem que ser GRAVADA "
+     "porque nenhuma mate segura um grau de liberdade livre; convencao "
+     "linha-vs-coluna da rotation_matrix; e bugs confirmados "
      "(create_reference_plane flip/offset negativo no plano right, "
      "create_sketch falhando em silencio, close_document no documento "
      "ativo errado). Leia antes de montar qualquer par de pecas que se "
-     "encaixam (pino, eixo, rosca, mancal)."),
+     "encaixam (pino, eixo, rosca, mancal) e antes de qualquer movimento."),
 ]
 
 

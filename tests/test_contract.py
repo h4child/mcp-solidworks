@@ -825,3 +825,108 @@ def test_the_mechanism_reminder_points_at_the_pose_tools():
     note = server._mechanism_pose_reminder("a test mate")
     assert "capture_assembly_pose" in note and "restore_assembly_pose" in note
     assert "not another mate" in note or "not another" in note
+
+
+# ---------------------------------------------------------------------------
+# Resources: the context the calling AI actually receives
+# ---------------------------------------------------------------------------
+# The knowledge files are the only way any of this reaches a client that is not
+# Claude Code in this repository -- from Claude Desktop, .claude/ is invisible
+# and the resources are everything. A knowledge file nobody registered is a file
+# nobody reads, and a stale description is worse than a missing one: the
+# description is what the model uses to DECIDE whether to open the resource, so
+# a description that omits a section guarantees that section is never read.
+
+RESOURCES = server.mcp._resource_manager._resources
+KNOWLEDGE_DIR = os.path.join(ROOT, ".claude", "knowledge")
+
+
+def knowledge_filenames() -> set:
+    return {name for name in os.listdir(KNOWLEDGE_DIR) if name.endswith(".md")}
+
+
+def test_every_knowledge_file_is_exposed_as_a_resource():
+    """A file in .claude/knowledge/ that is not registered reaches Claude Code
+    in this repo and nothing else."""
+    registered = {filename for _slug, filename, _name, _desc
+                  in server._KNOWLEDGE_RESOURCES}
+    missing = sorted(knowledge_filenames() - registered)
+    assert not missing, (
+        f"{len(missing)} knowledge file(s) are not exposed as MCP resources: "
+        f"{', '.join(missing)}. Add them to _KNOWLEDGE_RESOURCES in server.py."
+    )
+
+
+def test_every_registered_knowledge_resource_points_at_a_real_file():
+    """The reverse: a registered resource whose file was renamed or deleted
+    answers with an error string instead of content, and only at call time."""
+    for _slug, filename, name, _desc in server._KNOWLEDGE_RESOURCES:
+        assert os.path.exists(os.path.join(KNOWLEDGE_DIR, filename)), (
+            f"resource '{name}' points at .claude/knowledge/{filename}, "
+            f"which does not exist"
+        )
+
+
+@pytest.mark.parametrize("uri", sorted(str(u) for u in RESOURCES))
+def test_every_resource_has_a_usable_description(uri):
+    """Same reason as for tools: the model picks by description."""
+    description = (RESOURCES[uri].description or "").strip()
+    assert len(description) >= 40, (
+        f"resource '{uri}' has a {len(description)}-character description"
+    )
+
+
+def test_the_verification_fields_resource_is_registered_and_first():
+    """It is about how to read tool RESULTS, not about engineering, so it
+    applies to every request -- including the ones that never open any other
+    knowledge resource."""
+    slugs = [slug for slug, _f, _n, _d in server._KNOWLEDGE_RESOURCES]
+    assert "campos-de-verificacao" in slugs, (
+        "the field-contract resource is not registered"
+    )
+    assert slugs[0] == "campos-de-verificacao", (
+        "it should be listed first: it is the one that applies regardless of "
+        "what is being modelled"
+    )
+
+
+def test_the_verification_fields_resource_covers_every_field_tools_return():
+    """A field a tool returns and this resource never mentions is a field the
+    caller has to guess at."""
+    with open(os.path.join(KNOWLEDGE_DIR, "campos_de_verificacao.md"),
+              encoding="utf-8") as handle:
+        text = handle.read()
+    for field in ("requested_", "actual_", "verified", "deviation", "snapped",
+                  "zoom_retry", "moved", "components_moved",
+                  "measurement_method", "UNVERIFIED", "is_construction",
+                  "geometry_check", "fixed"):
+        assert field in text, (
+            f"the field-contract resource never explains '{field}'"
+        )
+
+
+def test_the_verification_fields_resource_admits_what_is_unproven():
+    """This server's measurement layer was largely written without a live
+    SolidWorks. A resource that presented it as proven would be the same echo
+    problem one level up: confident output, unverified basis."""
+    with open(os.path.join(KNOWLEDGE_DIR, "campos_de_verificacao.md"),
+              encoding="utf-8") as handle:
+        text = handle.read().lower()
+    assert "nao foi validado ao vivo" in text or "não foi validado ao vivo" in text, (
+        "the resource does not state which of its guarantees are unproven"
+    )
+    assert "closest" in text, (
+        "align='closest' is the headline untested default; it has to be named"
+    )
+
+
+def test_the_assembly_knowledge_description_mentions_movement():
+    """The mechanism sections were added to that file in v5.16.0. If the
+    description still only promises 'encaixe real', a caller debugging movement
+    has no reason to open it."""
+    uri = "solidworks://knowledge/montagens-mecanicas-reais"
+    description = RESOURCES[uri].description.lower()
+    for topic in ("mecanismo", "motion study", "add_advanced_mate"):
+        assert topic in description, (
+            f"the assembly resource description does not mention '{topic}'"
+        )

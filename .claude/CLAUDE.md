@@ -45,6 +45,7 @@ Você projeta peças/montagens no SolidWorks via MCP para quem pede. Isso inclui
 
 | Se o pedido envolve... | Leia primeiro |
 | --- | --- |
+| **Antes de concluir que um passo deu certo** — como ler `verified`, `snapped`, `moved`, `measurement_method` | `knowledge/campos_de_verificacao.md` (contrato dos campos + as 5 armadilhas confirmadas + o que não foi validado ao vivo) |
 | Qualquer peça nova, do zero | `knowledge/roteiro_projetista.md` (fluxo completo, ponta a ponta) |
 | Vai desenhar esboço (`draw_*`) numa peça grande, ou a geometria "saiu torta" | `knowledge/verificacao_e_qa.md` seção 0 — o snap de esboço é em espaço de **tela**, e desloca a geometria sem erro |
 | Escolher material | `knowledge/materiais.md` |
