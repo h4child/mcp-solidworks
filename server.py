@@ -12,6 +12,7 @@ out must be used from the thread that first connected to it.
 import os
 import io
 import re
+import json
 import math
 import time
 import atexit
@@ -1023,6 +1024,126 @@ def _invoke_motion_manager(manager, member: str, return_type, arguments=()):
     return manager._oleobj_.InvokeTypes(dispid, 0, 1, return_type, arguments)
 
 
+# ---------------------------------------------------------------------------
+# Component placement: measure, never assume
+# ---------------------------------------------------------------------------
+# A placement that silently lands somewhere else is the hardest failure to
+# notice from a tool result: the call returns, the numbers echoed back are the
+# ones that were asked for, and the part is only found in the wrong place much
+# later -- in a view, or in a drawing. So every placement helper below reads
+# the real state back out of SolidWorks and reports what it MEASURED next to
+# what was requested, and anything it could not compute comes back as a
+# warning in the payload instead of being swallowed.
+
+
+def _unit_factor(unit: Optional[str]) -> tuple:
+    """Resolve a unit name to (name, multiplier from metres to that unit)."""
+    active = (unit or _default_unit).lower()
+    if active not in UNIT_TO_METERS:
+        raise ValueError(f"Unknown unit '{unit}'. Use one of: {', '.join(UNIT_TO_METERS)}")
+    return active, 1.0 / UNIT_TO_METERS[active]
+
+
+def _bodies_bounding_box(doc) -> tuple:
+    """Union of the bounding boxes of EVERY solid body in a document.
+
+    ``IBody2.GetBodyBox`` is per-body, so a multi-body part needs all of them
+    unioned -- and multi-body is not an edge case here: every weldment and
+    every structural-profile part is one. Reading only ``bodies[0]`` gives the
+    box of whichever body happens to come first in the list, so an origin
+    correction computed from it is wrong by however far the rest of the part
+    extends beyond that single body. That is exactly the error that puts an
+    inserted weldment somewhere other than the point it was asked for.
+
+    Returns (box, body_count), box being [xmin, ymin, zmin, xmax, ymax, zmax]
+    in metres -- or (None, body_count) when no body reported a usable box,
+    which is the normal answer for a subassembly, a surface-only part, or a
+    document that came in lightweight.
+    """
+    bodies = doc.GetBodies2(0, True) or ()
+    low = [None, None, None]
+    high = [None, None, None]
+    measured = 0
+    for raw_body in bodies:
+        try:
+            box = win32com.client.Dispatch(raw_body).GetBodyBox()
+        except Exception:
+            continue
+        if not box or len(box) < 6:
+            continue
+        measured += 1
+        for axis in range(3):
+            lo, hi = box[axis], box[axis + 3]
+            if lo > hi:
+                lo, hi = hi, lo
+            low[axis] = lo if low[axis] is None else min(low[axis], lo)
+            high[axis] = hi if high[axis] is None else max(high[axis], hi)
+    if not measured:
+        return None, len(bodies)
+    return [low[0], low[1], low[2], high[0], high[1], high[2]], len(bodies)
+
+
+def _component_pose(component, factor: float) -> dict:
+    """Read a component's real position and orientation out of SolidWorks.
+
+    ``IMathTransform.ArrayData`` is the documented flat form of the pose:
+    indices 0-8 the 3x3 rotation, 9-11 the translation in metres, 12 the scale.
+
+    The rotation comes back ROW-major -- [[r00,r01,r02],[r10,r11,r12],
+    [r20,r21,r22]] -- so a point (lx,ly,lz) in the component's own system maps
+    to global.x = r00*lx + r01*ly + r02*lz (and so on), plus the translation.
+    That convention was confirmed live against a known face; see
+    .claude/knowledge/montagens_mecanicas_reais.md. Every payload carrying a
+    matrix states it as ``rotation_convention`` precisely so no caller has to
+    guess: assume the column convention instead and you get a plausible but
+    wrong point, which still selects *a* face -- and a caller who then nudges
+    the point until the selection "works" has validated the wrong convention
+    rather than found the right one.
+    """
+    transform = component.Transform2
+    data = transform.ArrayData
+    if callable(data):
+        data = data()
+    values = list(data or ())
+    if len(values) < 12:
+        raise RuntimeError(
+            "SolidWorks returned an invalid transform (fewer than 12 elements).")
+    return {
+        "translation": {
+            "x": values[9] * factor,
+            "y": values[10] * factor,
+            "z": values[11] * factor,
+        },
+        "rotation_matrix": [list(values[0:3]), list(values[3:6]), list(values[6:9])],
+        "rotation_convention": "row-major",
+    }
+
+
+def _read_pose(assy, name: str, factor: float):
+    """Pose of a component by name, or None if it cannot be read right now."""
+    try:
+        component = _find_component(assy, name)
+        if component is None:
+            return None
+        return _component_pose(component, factor)
+    except Exception:
+        return None
+
+
+def _deviation(requested, measured: dict, tolerance: float) -> dict:
+    """How far a measured point sits from the one that was requested."""
+    dx = measured["x"] - requested[0]
+    dy = measured["y"] - requested[1]
+    dz = measured["z"] - requested[2]
+    distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+    return {
+        "dx": dx, "dy": dy, "dz": dz,
+        "distance": distance,
+        "tolerance": tolerance,
+        "within_tolerance": distance <= tolerance,
+    }
+
+
 def _preload_and_insert_component(assy, filepath: str, x: float, y: float, z: float):
     """AddComponent5 silently returns None unless the source document is already
     loaded into the SolidWorks session (via a silent OpenDoc6) and the assembly
@@ -1038,6 +1159,16 @@ def _preload_and_insert_component(assy, filepath: str, x: float, y: float, z: fl
     Measure the just-opened source doc's bounding box here and add its center
     to x/y/z before the AddComponent5 call, so the component's ORIGIN -- not
     its bbox center -- ends up at the caller's requested point instead.
+
+    The box is the union of EVERY solid body (_bodies_bounding_box), not the
+    first one: a weldment or a structural profile part has several, and the
+    first body's box alone describes only a piece of it.
+
+    Returns (assembly, component, correction). ``correction`` records the
+    offset actually applied, how many bodies it was measured from, and any
+    reason it could not be computed -- so insert_component can report that
+    rather than leaving the caller to infer it from a position that came out
+    wrong.
     """
     assy_title = _doc_title(assy)
     app = _connect()
@@ -1047,17 +1178,38 @@ def _preload_and_insert_component(assy, filepath: str, x: float, y: float, z: fl
     if loaded_doc is None:
         raise RuntimeError(f"Failed to load component '{filepath}' (error code {errors}).")
 
+    correction = {"applied": False, "offset_m": [0.0, 0.0, 0.0],
+                  "body_count": 0, "bodies_measured": False, "warnings": []}
+    uncorrected = (
+        "AddComponent5 places the bounding-box centre at the requested point, so the "
+        "component's ORIGIN lands at (requested - bbox centre) instead: check "
+        "actual_position against requested_position in the result before relying on "
+        "this placement"
+    )
     try:
-        bodies = loaded_doc.GetBodies2(0, True)
-        if bodies:
-            body = win32com.client.Dispatch(bodies[0])
-            box = body.GetBodyBox()
-            if box:
-                x += (box[0] + box[3]) / 2.0
-                y += (box[1] + box[4]) / 2.0
-                z += (box[2] + box[5]) / 2.0
-    except Exception:
-        pass  # fall back to AddComponent5's native (bbox-center) placement
+        box, body_count = _bodies_bounding_box(loaded_doc)
+        correction["body_count"] = body_count
+        correction["bodies_measured"] = box is not None
+        if box is None:
+            correction["warnings"].append(
+                f"no solid body in '{os.path.basename(filepath)}' reported a readable "
+                f"bounding box (subassembly, surface-only or lightweight), so the origin "
+                f"correction could not be computed -- {uncorrected}")
+        else:
+            offset = [(box[0] + box[3]) / 2.0,
+                      (box[1] + box[4]) / 2.0,
+                      (box[2] + box[5]) / 2.0]
+            x += offset[0]
+            y += offset[1]
+            z += offset[2]
+            correction["applied"] = True
+            correction["offset_m"] = offset
+    except Exception as exc:
+        # Reported, never swallowed: the component still gets inserted, just at
+        # AddComponent5's own bbox-centre placement, and the caller has to know
+        # that to read the resulting position correctly.
+        correction["warnings"].append(
+            f"could not measure the source document's bodies ({exc}) -- {uncorrected}")
 
     active_assy, reactivate_errors = _activate_doc3(app, assy_title, False)
     if active_assy is None:
@@ -1067,7 +1219,7 @@ def _preload_and_insert_component(assy, filepath: str, x: float, y: float, z: fl
     comp = assy.AddComponent5(filepath, 0, "", False, "", x, y, z)
     if comp is None:
         raise RuntimeError(f"Failed to insert component '{filepath}' into the assembly.")
-    return assy, win32com.client.Dispatch(comp)
+    return assy, win32com.client.Dispatch(comp), correction
 
 
 def _find_component_feature(assy, name: str):
@@ -1477,21 +1629,79 @@ async def list_open_documents() -> dict:
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def insert_component(filepath: str, x: float = 0, y: float = 0, z: float = 0,
-                            unit: Optional[str] = None) -> dict:
+                            unit: Optional[str] = None,
+                            tolerance: float = 0.01) -> dict:
     """Insert an existing part or sub-assembly file into the active assembly at a position.
 
     x/y/z place the component's own origin (its sketch/model origin, as seen
     when you open that file alone) at this point in the assembly -- not its
     bounding-box center, which is what the underlying AddComponent5 call does
-    natively if not corrected for (see _preload_and_insert_component)."""
+    natively if not corrected for (see _preload_and_insert_component).
+
+    THE POSITION IS VERIFIED, NOT ASSUMED. After the insert, the component's
+    pose is read back out of SolidWorks, so the result carries
+    ``actual_position`` (what was measured) beside ``requested_position`` (what
+    was asked for) and the ``deviation`` between them. ``verified`` is true
+    only when the measured origin landed within ``tolerance`` of the requested
+    point. Read it: a false there is a part sitting somewhere other than where
+    it was put, caught at insert time instead of in a drawing later.
+
+    ``tolerance`` is in the same unit as x/y/z (default 0.01 mm).
+
+    ``origin_correction`` reports the offset applied to compensate
+    AddComponent5's bounding-box-centre placement, and how many solid bodies it
+    was measured from -- ``body_count`` above 1 means a weldment or multi-body
+    part, whose box is the union of all of them. Anything that could not be
+    computed or measured lands in ``warnings`` rather than passing silently."""
 
     def _impl():
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"File not found: {filepath}")
         assy = _active_assembly()
+        active_unit, factor = _unit_factor(unit)
         x_m, y_m, z_m = to_meters(x, unit), to_meters(y, unit), to_meters(z, unit)
-        _assy, comp = _preload_and_insert_component(assy, filepath, x_m, y_m, z_m)
-        return {"name": comp.Name2, "path": filepath, "position": [x, y, z], "unit": unit or _default_unit}
+        assy, comp, correction = _preload_and_insert_component(assy, filepath, x_m, y_m, z_m)
+        name = comp.Name2
+        warnings = list(correction.pop("warnings", []))
+        result = {
+            # name/path/position/unit keep the shape earlier callers read.
+            "name": name,
+            "path": filepath,
+            "position": [x, y, z],
+            "unit": active_unit,
+            "requested_position": {"x": x, "y": y, "z": z, "unit": active_unit},
+            "origin_correction": correction,
+        }
+
+        try:
+            pose = _component_pose(comp, factor)
+        except Exception as exc:
+            result["actual_position"] = None
+            result["deviation"] = None
+            result["verified"] = False
+            warnings.append(
+                f"the component was inserted but its position could not be read back "
+                f"from SolidWorks ({exc}), so this placement is UNVERIFIED -- confirm it "
+                f"with get_component_transform or verify_assembly_positions")
+            result["warnings"] = warnings
+            return result
+
+        measured = dict(pose["translation"], unit=active_unit)
+        deviation = dict(_deviation((x, y, z), pose["translation"], tolerance),
+                         unit=active_unit)
+        result["actual_position"] = measured
+        result["rotation_matrix"] = pose["rotation_matrix"]
+        result["rotation_convention"] = pose["rotation_convention"]
+        result["deviation"] = deviation
+        result["verified"] = bool(deviation["within_tolerance"])
+        if not deviation["within_tolerance"]:
+            warnings.append(
+                f"'{name}' landed {deviation['distance']:.4g} {active_unit} away from the "
+                f"requested point (dx={deviation['dx']:.4g}, dy={deviation['dy']:.4g}, "
+                f"dz={deviation['dz']:.4g} {active_unit}): the component is NOT where it "
+                f"was asked to be, do not build on this placement before fixing it")
+        result["warnings"] = warnings
+        return result
 
     return await _run(_impl)
 
@@ -1946,7 +2156,19 @@ async def get_component_transform(name: str, unit: Optional[str] = None) -> dict
 
     Returns translation in ``unit`` (mm by default), the 3x3 rotation matrix,
     and whether the component is fixed. Use this before changing an assembly
-    pose so a placement can be checked or restored deterministically.
+    pose so a placement can be checked or restored deterministically -- and
+    after every mate, to see where the component actually ended up rather than
+    where it was meant to go.
+
+    ``rotation_matrix`` is ROW-major and says so in ``rotation_convention``:
+    a point (lx,ly,lz) in the component's own system becomes
+    global.x = r00*lx + r01*ly + r02*lz, global.y = r10*lx + r11*ly + r12*lz,
+    global.z = r20*lx + r21*ly + r22*lz, plus the translation. Confirmed live
+    against a known face (.claude/knowledge/montagens_mecanicas_reais.md).
+    Do not guess the other convention: it produces a plausible but wrong
+    global point that still manages to select *a* face, so a caller who then
+    adjusts the point until the selection works has confirmed the wrong
+    convention instead of finding the right one.
     """
 
     def _impl():
@@ -1954,26 +2176,16 @@ async def get_component_transform(name: str, unit: Optional[str] = None) -> dict
         component = _find_component(assy, name)
         if component is None:
             raise RuntimeError(f"Component '{name}' not found in the assembly.")
-        transform = component.Transform2
-        data = transform.ArrayData
-        if callable(data):
-            data = data()
-        values = list(data or ())
-        if len(values) < 12:
-            raise RuntimeError(f"Component '{name}' returned an invalid transform.")
-        active_unit = (unit or _default_unit).lower()
-        if active_unit not in UNIT_TO_METERS:
-            raise ValueError(f"Unknown unit '{unit}'. Use one of: {', '.join(UNIT_TO_METERS)}")
-        factor = 1.0 / UNIT_TO_METERS[active_unit]
+        active_unit, factor = _unit_factor(unit)
+        try:
+            pose = _component_pose(component, factor)
+        except Exception as exc:
+            raise RuntimeError(f"Component '{name}' returned an invalid transform: {exc}") from exc
         return {
             "name": name,
-            "translation": {
-                "x": values[9] * factor,
-                "y": values[10] * factor,
-                "z": values[11] * factor,
-                "unit": active_unit,
-            },
-            "rotation_matrix": [values[0:3], values[3:6], values[6:9]],
+            "translation": dict(pose["translation"], unit=active_unit),
+            "rotation_matrix": pose["rotation_matrix"],
+            "rotation_convention": pose["rotation_convention"],
             "fixed": bool(component.IsFixed),
         }
 
@@ -1991,6 +2203,7 @@ async def set_component_transform(
     rotation_z: float = 0,
     unit: Optional[str] = None,
     fix_after: bool = False,
+    tolerance: float = 0.01,
 ) -> dict:
     """Set a component's absolute assembly position and Euler rotation.
 
@@ -1998,6 +2211,24 @@ async def set_component_transform(
     rotation is composed X then Y then Z, and is applied as an absolute pose,
     not an incremental drag. Fixed components are floated automatically before
     the transform is applied. Set ``fix_after`` to lock the verified pose.
+
+    THE RESULT IS MEASURED, NOT ECHOED. After the transform is applied and the
+    assembly rebuilt, the pose is read back out of SolidWorks:
+    ``actual_position`` and ``actual_rotation_matrix`` are what SolidWorks
+    reports, ``deviation`` is the distance from the requested point, and
+    ``verified`` is true only when both the position landed within
+    ``tolerance`` and the rotation matrix came back as the one that was sent.
+    A component that an existing mate drags elsewhere the moment the rebuild
+    solves shows up here as a non-zero deviation instead of a clean-looking
+    success.
+
+    ``tolerance`` is in the same unit as x/y/z (default 0.01 mm). Both matrices
+    in the result follow the convention named in ``rotation_convention``
+    (row-major, the same one get_component_transform reports). Orientation is
+    only confirmed here as a round-trip of that matrix; whether it produces
+    the intended orientation of real geometry is a separate question, answered
+    by looking at a view aligned to the axis in question, not by the
+    round-trip (see .claude/knowledge/montagens_mecanicas_reais.md).
     """
 
     def _impl():
@@ -2043,13 +2274,64 @@ async def set_component_transform(
             _select_component(assy, name)
             assy.FixComponent()
 
-        return {
+        active_unit, factor = _unit_factor(unit)
+        result = {
             "name": name,
-            "translation": {"x": x, "y": y, "z": z, "unit": unit or _default_unit},
+            # translation/rotation_degrees keep the shape earlier callers read:
+            # they are the REQUESTED pose. actual_* below is the measured one.
+            "translation": {"x": x, "y": y, "z": z, "unit": active_unit},
             "rotation_degrees": {"x": rotation_x, "y": rotation_y, "z": rotation_z},
+            "requested_position": {"x": x, "y": y, "z": z, "unit": active_unit},
             "fixed": bool(fix_after),
             "previously_fixed": was_fixed,
         }
+        warnings = []
+
+        # Read the pose back instead of trusting that the write took: an
+        # existing mate can drag the component somewhere else as soon as the
+        # rebuild solves, and SolidWorks reports no error when it does.
+        try:
+            applied = _component_pose(component, factor)
+        except Exception as exc:
+            result["actual_position"] = None
+            result["actual_rotation_matrix"] = None
+            result["deviation"] = None
+            result["verified"] = False
+            warnings.append(
+                f"the transform was applied but the resulting pose could not be read "
+                f"back from SolidWorks ({exc}), so it is UNVERIFIED")
+            result["warnings"] = warnings
+            return result
+
+        deviation = dict(_deviation((x, y, z), applied["translation"], tolerance),
+                         unit=active_unit)
+        intended = [list(rotation[0:3]), list(rotation[3:6]), list(rotation[6:9])]
+        rotation_error = max(
+            abs(sent - read)
+            for sent_row, read_row in zip(intended, applied["rotation_matrix"])
+            for sent, read in zip(sent_row, read_row)
+        )
+        result["actual_position"] = dict(applied["translation"], unit=active_unit)
+        result["actual_rotation_matrix"] = applied["rotation_matrix"]
+        result["rotation_convention"] = applied["rotation_convention"]
+        result["requested_rotation_matrix"] = intended
+        result["rotation_max_elementwise_error"] = rotation_error
+        result["deviation"] = deviation
+        result["verified"] = bool(deviation["within_tolerance"] and rotation_error <= 1e-6)
+
+        if not deviation["within_tolerance"]:
+            warnings.append(
+                f"'{name}' ended up {deviation['distance']:.4g} {active_unit} from the "
+                f"requested point (dx={deviation['dx']:.4g}, dy={deviation['dy']:.4g}, "
+                f"dz={deviation['dz']:.4g} {active_unit}) -- an existing mate is most "
+                f"likely overriding this placement; check list_mates for '{name}'")
+        if rotation_error > 1e-6:
+            warnings.append(
+                f"the rotation SolidWorks reports back differs from the one sent by "
+                f"{rotation_error:.3g} at worst per element: the orientation of '{name}' "
+                f"is not the one requested")
+        result["warnings"] = warnings
+        return result
 
     return await _run(_impl)
 
@@ -2166,13 +2448,145 @@ async def unsuppress_component(name: str) -> dict:
     return await _run(_impl)
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
-async def add_mate(mate_type: str, point1: dict, point2: dict) -> dict:
-    """Mate two faces/planes, each chosen by a point that lies on it,
-    e.g. point1={"x":0,"y":0,"z":0,"unit":"mm"}. Supported mate_type values:
-    'coincident', 'concentric', 'parallel', 'perpendicular', 'tangent'.
+# What each supported mate type does NOT constrain. Every one of them leaves
+# something open, so a mate that reports success has not necessarily LOCATED
+# anything -- the classic case being a concentric mate on a shaft, which holds
+# the axis and lets the part slide anywhere along it. Reported as
+# degrees_of_freedom_left so the caller reads it instead of assuming.
+MATE_DOF_LEFT = {
+    "coincident": ("the two translations within the plane and the spin about the plane "
+                   "normal are still free"),
+    "concentric": ("sliding along the shared axis and spinning about it are both still "
+                   "free -- a concentric mate does NOT fix axial position, so the part "
+                   "can sit anywhere along its hole and still look correctly mated in "
+                   "an isometric view"),
+    "perpendicular": "all three translations are still free -- this fixes direction only",
+    "parallel": "all three translations are still free -- this fixes direction only",
+    "tangent": "sliding along the contact and the spin about it are still free",
+}
 
-    TWO LIMITS WORTH KNOWING BEFORE RELYING ON THIS.
+# swMateAlign_e (confirmed against SolidWorks API documentation and VBA
+# examples): ALIGNED=0, ANTI_ALIGNED=1, CLOSEST=2. AddMate5's second
+# parameter takes one of these -- it was previously hardcoded to 0
+# (ALIGNED) on every call, regardless of the actual geometry.
+#
+# That hardcoding is a second, distinct cause of a part landing "torta"
+# (tilted, or seated through a crooked gap) even when the FACE SELECTION
+# itself is correct: forcing ALIGNED makes SolidWorks solve for the two
+# faces' reference directions pointing the SAME way, which is the physically
+# wrong solve for a mate whose faces are meant to face each other (the usual
+# case for two flat faces pressed together, or a shaft seated against a
+# shoulder) -- the solver still reports success, because ALIGNED is a valid
+# solution, just not the one that produces a flush fit. CLOSEST lets
+# SolidWorks pick whichever of the two solutions keeps the components near
+# their CURRENT relative pose instead of always forcing one side, which
+# removes that systematic bias; an explicit 'aligned'/'anti_aligned' is still
+# available for a caller that already knows which one the geometry needs.
+MATE_ALIGN = {"aligned": 0, "anti_aligned": 1, "closest": 2}
+
+
+def _entity_direction_local(entity):
+    """A single direction vector for a FACE, in its OWN part's coordinates:
+    the face normal for a planar face, the axis for a cylindrical one.
+
+    Returns (kind, (x,y,z)) or (None, None) for a face this reduces to no
+    single direction (anything but plane/cylinder) -- there is no
+    "torta" check to run on a direction that doesn't exist.
+    """
+    try:
+        surface = win32com.client.Dispatch(entity.GetSurface)
+    except Exception:
+        return None, None
+    try:
+        is_planar = surface.IsPlane
+        if callable(is_planar):
+            is_planar = is_planar()
+        if is_planar:
+            normal = tuple(_com_member(entity, "Normal"))
+            if len(normal) >= 3 and any(normal[:3]):
+                return "planar_normal", tuple(normal[:3])
+    except Exception:
+        pass
+    try:
+        is_cylinder = surface.IsCylinder
+        if callable(is_cylinder):
+            is_cylinder = is_cylinder()
+        if is_cylinder:
+            params = tuple(_com_member(surface, "CylinderParams"))
+            if len(params) >= 7 and any(params[3:6]):
+                return "cylindrical_axis", tuple(params[3:6])
+    except Exception:
+        pass
+    return None, None
+
+
+def _rotate_direction(direction, rotation_matrix):
+    """Apply a row-major 3x3 rotation to a direction (no translation)."""
+    r = rotation_matrix
+    return (
+        r[0][0] * direction[0] + r[0][1] * direction[1] + r[0][2] * direction[2],
+        r[1][0] * direction[0] + r[1][1] * direction[1] + r[1][2] * direction[2],
+        r[2][0] * direction[0] + r[2][1] * direction[1] + r[2][2] * direction[2],
+    )
+
+
+def _angle_between_degrees(a, b) -> Optional[float]:
+    """Angle between two direction vectors, or None if either is ~zero-length."""
+    norm_a = math.sqrt(sum(v * v for v in a))
+    norm_b = math.sqrt(sum(v * v for v in b))
+    if norm_a < 1e-9 or norm_b < 1e-9:
+        return None
+    cosine = sum(x * y for x, y in zip(a, b)) / (norm_a * norm_b)
+    cosine = max(-1.0, min(1.0, cosine))
+    return math.degrees(math.acos(cosine))
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def add_mate(mate_type: str, point1: dict, point2: dict,
+                   align: str = "closest") -> dict:
+    """Mate two faces/planes, each chosen by a point that
+    lies on it, e.g. point1={"x":0,"y":0,"z":0,"unit":"mm"}. Supported mate_type
+    values: 'coincident', 'concentric', 'parallel', 'perpendicular', 'tangent'.
+
+    THE EFFECT IS MEASURED, NOT ASSUMED. The two components owning the picked
+    faces are identified, and their positions are read out of SolidWorks before
+    and after the mate: ``components`` carries, per component,
+    ``position_before``, ``position_after`` and ``moved`` (how far the mate
+    actually dragged it). A mate that solves to somewhere other than intended
+    is visible right here, instead of being discovered later in a view.
+
+    ``align`` -- 'closest' (default), 'aligned' or 'anti_aligned' -- is
+    swMateAlign_e. EVERY call used to force 'aligned' regardless of the
+    geometry, which is a second, separate way a part ends up tilted or seated
+    through a crooked gap even when the face selection itself was right:
+    forcing the two faces' reference directions to point the SAME way is the
+    wrong solve for the common case of two faces meant to face each other (two
+    flat faces pressed flush, a shaft against a shoulder) -- SolidWorks still
+    reports success, because 'aligned' is a mathematically valid solution,
+    just not the flush one. 'closest' removes that bias by picking whichever
+    solution keeps the components near where they already were; pass
+    'aligned' or 'anti_aligned' only when the geometry's correct orientation
+    is already known.
+
+    ``geometry_check`` reports the MEASURED angle, in the assembly's global
+    coordinates, between the two picked faces' reference directions (the
+    normal for a planar face, the axis for a cylindrical one) after the mate
+    solved -- a number to read instead of judging "crooked" from a picture.
+    It does not say what that angle SHOULD be (this tool has no way to know
+    the intended fit), so a caller that knows the expected angle for this
+    joint (0, 90 or 180 degrees are the common cases) should compare it
+    itself; ``kind`` is None when neither face reduces to a single direction
+    (anything but a plane or a cylinder), which is reported rather than
+    silently skipped.
+
+    ``degrees_of_freedom_left`` says what this mate type does NOT constrain.
+    Read it before treating the component as located: every supported type
+    leaves something free, and the position reported above is simply where the
+    part sits now -- not a position the mate holds. For a concentric mate in
+    particular, the axial position is NOT fixed; constrain the remaining
+    direction with a second mate, or fix_component, before building on it.
+
+    TWO LIMITS THAT NEITHER OF THOSE FIELDS CAN REPORT.
 
     It resolves each point through SelectByID2, which picks from the current
     CAMERA. A face hidden behind the model cannot be reached at all, whatever
@@ -2181,15 +2595,15 @@ async def add_mate(mate_type: str, point1: dict, point2: dict) -> dict:
     either fails or silently grabs the outer face in front of it. Use
     list_faces on the part first to get a pick point that really lies on the
     face wanted, and set_view('isometric') before picking; that only helps for
-    a convex part.
+    a convex part. When the two faces are already coaxial, the near part can
+    occlude the far one's bore from every angle, and no pick point exists.
 
-    It also returns no geometry: the mate is created, but the resulting
-    component position is not read back. A 'concentric' mate removes only two
-    degrees of freedom -- it aligns the axes and leaves sliding along the
-    shared axis free -- so the part stops wherever the solver left it. After
-    any concentric mate, call get_component_transform on the mated component
-    and check the position along that axis against the geometry that is
-    supposed to limit it, BEFORE fix_component. See
+    A 'concentric' mate removes only two degrees of freedom -- it aligns the
+    axes and leaves sliding along the shared axis free -- so the part stops
+    wherever the solver left it. The ``components`` field above now reports
+    where that was, but it is still only one of infinitely many valid
+    positions: check it with get_component_transform against the geometry that
+    is supposed to limit it BEFORE fix_component, and see
     .claude/knowledge/montagens_mecanicas_reais.md."""
 
     def _impl():
@@ -2198,6 +2612,9 @@ async def add_mate(mate_type: str, point1: dict, point2: dict) -> dict:
         mate_code = types.get(mate_type.lower())
         if mate_code is None:
             raise ValueError(f"Unknown mate_type '{mate_type}'. Use one of: {', '.join(types)}")
+        align_code = MATE_ALIGN.get(align.lower())
+        if align_code is None:
+            raise ValueError(f"Unknown align '{align}'. Use one of: {', '.join(MATE_ALIGN)}")
 
         def pt(p):
             u = p.get("unit")
@@ -2205,6 +2622,7 @@ async def add_mate(mate_type: str, point1: dict, point2: dict) -> dict:
 
         x1, y1, z1 = pt(point1)
         x2, y2, z2 = pt(point2)
+        active_unit, factor = _unit_factor(point1.get("unit"))
 
         assy.ClearSelection2(True)
         empty_callout = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
@@ -2213,9 +2631,40 @@ async def add_mate(mate_type: str, point1: dict, point2: dict) -> dict:
         if not assy.Extension.SelectByID2("", "FACE", x2, y2, z2, True, 1, empty_callout, 0):
             raise RuntimeError(f"No face/plane found at point2 {point2}.")
 
+        # Hold on to the components owning the two picked faces, AND the two
+        # picked faces themselves (for the direction check below), all taken
+        # from the selection before AddMate5 consumes it. The IComponent2
+        # objects stay valid across AddMate5, so the same objects give the
+        # before and the after pose.
+        picked = []
+        local_directions = {}
+        for index in (1, 2):
+            try:
+                raw_component = assy.SelectionManager.GetSelectedObjectsComponent4(index, -1)
+                if raw_component is None:
+                    continue
+                component = win32com.client.Dispatch(raw_component)
+                name = str(component.Name2)
+                picked.append((name, component))
+            except Exception:
+                continue
+            try:
+                raw_entity = assy.SelectionManager.GetSelectedObject6(index, -1)
+                kind, direction = _entity_direction_local(win32com.client.Dispatch(raw_entity))
+                if kind is not None:
+                    local_directions[index] = (kind, direction)
+            except Exception:
+                continue
+        before = {}
+        for name, component in picked:
+            try:
+                before[name] = _component_pose(component, factor)
+            except Exception:
+                before[name] = None
+
         mate_err = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
         mate = assy.AddMate5(
-            mate_code, 0, False,
+            mate_code, align_code, False,
             0.0, 0.0, 0.0,
             0.0, 0.0,
             0.0, 0.0, 0.0,
@@ -2224,7 +2673,104 @@ async def add_mate(mate_type: str, point1: dict, point2: dict) -> dict:
         # swAddMateError_NoError is 1; COM can return an object even on failure.
         if mate is None or mate_err.value != 1:
             raise RuntimeError(f"Mate creation failed (error code {mate_err.value}).")
-        return {"mate_type": mate_type, "error_code": mate_err.value}
+
+        # Geometry check: the two faces' reference directions, rotated into
+        # the ASSEMBLY's coordinates using each owning component's pose AFTER
+        # the mate solved, then the angle between them. Needs both directions
+        # and both components resolved; anything missing is named in `kind`
+        # rather than silently producing no result.
+        geometry_check = {"kind": None, "angle_degrees": None, "note": None}
+        if len(picked) == 2 and set(local_directions) == {1, 2}:
+            try:
+                global_directions = []
+                for index, (name, component) in zip((1, 2), picked):
+                    kind, local_dir = local_directions[index]
+                    pose_now = _component_pose(component, 1.0)  # direction is unit-less
+                    global_directions.append(
+                        _rotate_direction(local_dir, pose_now["rotation_matrix"]))
+                angle = _angle_between_degrees(*global_directions)
+                kinds = {local_directions[1][0], local_directions[2][0]}
+                geometry_check["kind"] = (
+                    "planar_normals" if kinds == {"planar_normal"} else
+                    "cylindrical_axes" if kinds == {"cylindrical_axis"} else
+                    "mixed")
+                geometry_check["angle_degrees"] = angle
+                geometry_check["note"] = (
+                    "angle between the two faces' reference directions in assembly "
+                    "coordinates -- 0 or 180 degrees means parallel/anti-parallel "
+                    "(flush or facing-away), 90 means perpendicular; this tool does "
+                    "not know which one this joint should be")
+            except Exception as exc:
+                geometry_check["note"] = f"could not be computed ({exc})"
+        else:
+            geometry_check["note"] = (
+                "at least one picked face is neither planar nor cylindrical (or its "
+                "owning component could not be resolved), so it reduces to no single "
+                "direction to check")
+
+        warnings = []
+        components = []
+        for name, component in picked:
+            entry = {"name": name}
+            start = before.get(name)
+            entry["position_before"] = (dict(start["translation"], unit=active_unit)
+                                        if start else None)
+            try:
+                end = _component_pose(component, factor)
+            except Exception as exc:
+                entry["position_after"] = None
+                entry["moved"] = None
+                components.append(entry)
+                warnings.append(
+                    f"the mate was created but '{name}' position could not be read back "
+                    f"({exc}), so its resulting position is UNVERIFIED")
+                continue
+            entry["position_after"] = dict(end["translation"], unit=active_unit)
+            entry["rotation_matrix_after"] = end["rotation_matrix"]
+            entry["rotation_convention"] = end["rotation_convention"]
+            if start:
+                delta = _deviation(
+                    (start["translation"]["x"], start["translation"]["y"],
+                     start["translation"]["z"]),
+                    end["translation"], 0.0)
+                entry["moved"] = {
+                    "dx": delta["dx"], "dy": delta["dy"], "dz": delta["dz"],
+                    "distance": delta["distance"], "unit": active_unit,
+                }
+            else:
+                entry["moved"] = None
+            components.append(entry)
+
+        if not picked:
+            warnings.append(
+                "the mate was created but neither picked face could be traced back to a "
+                "component, so no position was verified -- check the result with "
+                "verify_assembly_positions")
+        dof_left = MATE_DOF_LEFT.get(mate_type.lower())
+        if dof_left:
+            warnings.append(
+                f"a '{mate_type}' mate does not fully locate anything: {dof_left}. The "
+                f"positions above are where the components sit now, not positions this "
+                f"mate holds -- constrain the remaining direction with another mate, or "
+                f"fix_component, before building on them")
+        angle = geometry_check.get("angle_degrees")
+        if angle is not None and 1e-3 < angle < 179.999:
+            warnings.append(
+                f"the two faces' reference directions are {angle:.3g} degrees apart in "
+                f"assembly coordinates, neither parallel (0) nor anti-parallel (180): if "
+                f"this joint is meant to be flush or axis-aligned, it is NOT -- it is "
+                f"sitting at an angle. Try align='aligned' or align='anti_aligned' "
+                f"instead of 'closest', or re-check which faces were picked")
+        return {
+            "mate_type": mate_type,
+            "align": align.lower(),
+            "error_code": mate_err.value,
+            "unit": active_unit,
+            "components": components,
+            "geometry_check": geometry_check,
+            "degrees_of_freedom_left": dof_left,
+            "warnings": warnings,
+        }
 
     return await _run(_impl)
 
@@ -2253,6 +2799,567 @@ async def list_mates() -> dict:
             except Exception:
                 pass
         return {"count": len(mates), "mates": mates}
+
+    return await _run(_impl)
+
+
+def _mated_component_names(assy) -> tuple:
+    """Names of every component taking part in at least one mate.
+
+    Returns (names, complete). ``complete`` is False when the mate entities
+    could not be read, and in that case the caller must NOT conclude that a
+    component is unmated -- it only means this particular check could not run,
+    which is reported rather than turned into a false finding.
+    """
+    names = set()
+    complete = True
+    try:
+        features = assy.FeatureManager.GetFeatures(False) or ()
+    except Exception:
+        return names, False
+    for raw_feature in features:
+        feat = win32com.client.Dispatch(raw_feature)
+        try:
+            type_name = str(feat.GetTypeName2)
+        except Exception:
+            complete = False
+            continue
+        if not type_name.startswith("Mate") or type_name == "MateGroup":
+            continue
+        try:
+            mate = _com_member(feat, "GetSpecificFeature2")
+            if mate is None:
+                complete = False
+                continue
+            mate = win32com.client.Dispatch(mate)
+            count = _com_member(mate, "GetMateEntityCount")
+            for index in range(int(count or 0)):
+                entity = win32com.client.Dispatch(mate.MateEntity(index))
+                component = _com_member(entity, "ReferenceComponent")
+                if component is not None:
+                    names.add(str(win32com.client.Dispatch(component).Name2))
+        except Exception:
+            complete = False
+    return names, complete
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def verify_assembly_positions(tolerance: float = 0.01,
+                                    unit: Optional[str] = None,
+                                    require_constrained: bool = True,
+                                    top_level_only: bool = True,
+                                    moving_components: Optional[list] = None) -> dict:
+    """Check where every component of the active assembly ACTUALLY is. Read-only.
+
+    The assembly-side counterpart of verify_drawing, and the gate to run before
+    telling anyone an assembly is built: a part in the wrong place produces a
+    perfectly valid drawing of the wrong assembly, so position has to be
+    checkable on its own terms.
+
+    Every component's pose is read out of SolidWorks and returned, then checked
+    for the failures that put a part somewhere other than where it was placed:
+
+      M01  neither fixed nor mated -- nothing holds it, so its position is not
+           reproducible and the next rebuild may move it (skip with
+           require_constrained=False)
+      M02  sitting exactly on the assembly origin, which is what a placement
+           that did not take looks like
+      M03  two or more components sharing one position, i.e. parts stacked on
+           top of each other instead of spread where they belong
+      M04  fixed and mated at once -- over-constrained, and the mate silently
+           loses to the fix
+      M05  position could not be read at all (suppressed, lightweight, not
+           loaded)
+      M06  a component named in ``moving_components`` is fixed, so the
+           mechanism it belongs to cannot actually move
+
+    MECHANISMS. ``moving_components`` is the list of component names that are
+    MEANT to move -- a slider, a crank, a piston, any link of a linkage.
+    Without it, every one of them trips M01, because being under-constrained
+    is exactly what a moving part is, and the check cannot tell an intentional
+    degree of freedom from a forgotten mate. Naming them here says "these are
+    free on purpose": they are exempted from M01, and checked for the opposite
+    failure instead (M06, fixed when they should be free). Everything else
+    still applies to them -- a moving part stacked on another part (M03) is
+    just as wrong in a mechanism as in a static assembly.
+
+    A moving component's position is still not reproducible, though, and no
+    mate will make it so: that is the nature of a free degree of freedom. To
+    record and get back a mechanism's position, use capture_assembly_pose and
+    restore_assembly_pose; this tool reports where things are, it does not
+    remember it.
+
+    Each issue carries a code, a severity, a message and the component names it
+    refers to. ``status`` is "approved" only when nothing was found.
+
+    ``tolerance`` (in ``unit``, default 0.01 mm) is how close two positions
+    have to be to count as the same, and how close to the origin counts as on
+    it. ``top_level_only`` defaults to True because a nested component's
+    transform is expressed within its own parent assembly, which makes
+    cross-level position comparison meaningless; set it False to list deeper
+    components as well, and read their positions per parent.
+
+    This checks placement, not solid overlap -- run interference_check for
+    that, and verify_drawing for the drawing itself.
+    """
+
+    def _impl():
+        assy = _active_assembly()
+        active_unit, factor = _unit_factor(unit)
+        mated, mate_scan_complete = _mated_component_names(assy)
+        mobile = {str(n) for n in (moving_components or ())}
+
+        issues = []
+        components = []
+        for raw_component in assy.GetComponents(bool(top_level_only)) or ():
+            component = win32com.client.Dispatch(raw_component)
+            name = str(component.Name2)
+            entry = {"name": name, "position": None, "rotation_matrix": None}
+            try:
+                entry["path"] = component.GetPathName
+                entry["suppressed"] = bool(component.IsSuppressed)
+                entry["fixed"] = bool(component.IsFixed)
+            except Exception:
+                entry.setdefault("path", None)
+                entry.setdefault("suppressed", None)
+                entry.setdefault("fixed", None)
+            entry["mated"] = (name in mated) if mate_scan_complete else None
+            entry["declared_moving"] = name in mobile
+
+            try:
+                pose = _component_pose(component, factor)
+            except Exception as exc:
+                entry["position"] = None
+                issues.append(ad.issue(
+                    "M05", "warning",
+                    f"could not read the position of '{name}' ({exc}): it is suppressed, "
+                    f"lightweight or not loaded, so there is no way to confirm where it is",
+                    name))
+                components.append(entry)
+                continue
+
+            entry["position"] = dict(pose["translation"], unit=active_unit)
+            entry["rotation_matrix"] = pose["rotation_matrix"]
+            entry["rotation_convention"] = pose["rotation_convention"]
+            components.append(entry)
+
+        # A suppressed component is not actually instanced in the assembly --
+        # whatever Transform2 happens to return for it (often a stale value
+        # from before it was suppressed) describes nothing real, so M01/M02/
+        # M03 would be noise computed over a part that is not there. M05 above
+        # already covers one that cannot be read at all; this excludes the
+        # ones that COULD be read but should not be judged.
+        positioned = [c for c in components
+                     if c["position"] is not None and not c.get("suppressed")]
+
+        # M06: a part that is supposed to move but is pinned. Checked before
+        # M01 and independently of the mate scan -- being fixed is read
+        # straight off the component, so this one answer is always available.
+        for entry in positioned:
+            if entry["declared_moving"] and entry["fixed"]:
+                issues.append(ad.issue(
+                    "M06", "warning",
+                    f"'{entry['name']}' was declared as a moving component but is FIXED: "
+                    f"whatever drives the mechanism cannot move it, and the assembly will "
+                    f"look stuck or over-constrained instead of articulating. "
+                    f"float_component it.",
+                    entry["name"]))
+
+        # M01 / M04: what holds each component in place.
+        if mate_scan_complete:
+            for entry in positioned:
+                name = entry["name"]
+                if (require_constrained and not entry["mated"] and not entry["fixed"]
+                        and not entry["declared_moving"]):
+                    issues.append(ad.issue(
+                        "M01", "warning",
+                        f"'{name}' is neither fixed nor part of any mate: nothing holds it "
+                        f"where it is, so its position is not reproducible and a rebuild "
+                        f"or a drag can move it. Mate it, fix_component it, or -- if it is "
+                        f"meant to move -- name it in moving_components.",
+                        name))
+                if entry["mated"] and entry["fixed"]:
+                    issues.append(ad.issue(
+                        "M04", "warning",
+                        f"'{name}' is fixed AND mated: the fix wins and the mate is carried "
+                        f"without doing anything, which hides the fact that the mate is not "
+                        f"what is positioning the part. float_component it, or drop the mate.",
+                        name))
+
+        # M02: a component on the origin, which is where a placement that did
+        # not take ends up. Normal for the one base part of an assembly, so it
+        # is only worth reporting when there is more than one component.
+        if len(positioned) > 1:
+            for entry in positioned:
+                point = entry["position"]
+                if max(abs(point["x"]), abs(point["y"]), abs(point["z"])) <= tolerance:
+                    issues.append(ad.issue(
+                        "M02", "info",
+                        f"'{entry['name']}' sits on the assembly origin "
+                        f"(0, 0, 0 {active_unit}). Intended for a base part; for any other "
+                        f"part this is what an insert whose position did not take looks like.",
+                        entry["name"]))
+
+        # M03: components occupying the same point -- the "parts all landed in
+        # the same place" symptom, which an isometric view hides completely.
+        for first in range(len(positioned)):
+            for second in range(first + 1, len(positioned)):
+                a, b = positioned[first], positioned[second]
+                gap = math.sqrt(
+                    (a["position"]["x"] - b["position"]["x"]) ** 2
+                    + (a["position"]["y"] - b["position"]["y"]) ** 2
+                    + (a["position"]["z"] - b["position"]["z"]) ** 2
+                )
+                if gap <= tolerance:
+                    issues.append(ad.issue(
+                        "M03", "warning",
+                        f"'{a['name']}' and '{b['name']}' are at the same position "
+                        f"({gap:.4g} {active_unit} apart): they are stacked on top of each "
+                        f"other rather than placed where each belongs.",
+                        a["name"], b["name"]))
+
+        checks_skipped = []
+        if not mate_scan_complete:
+            checks_skipped.append(
+                "M01/M04: the mate entities could not be read, so which components are "
+                "mated is unknown -- no conclusion was drawn about constraints")
+        if not require_constrained:
+            checks_skipped.append("M01: disabled by require_constrained=False")
+        if mobile:
+            checks_skipped.append(
+                f"M01 on {len(mobile)} component(s) declared as moving "
+                f"({', '.join(sorted(mobile))}): a free degree of freedom is what makes "
+                f"them move, so it is not reported as a missing constraint. Their "
+                f"positions are not reproducible by definition -- record them with "
+                f"capture_assembly_pose.")
+        unknown_mobile = sorted(mobile - {c["name"] for c in components})
+        if unknown_mobile:
+            checks_skipped.append(
+                f"moving_components named {', '.join(unknown_mobile)}, which are not in "
+                f"this assembly at this level -- check the names against list_components "
+                f"(a nested component's name looks like 'sub-1/part-1')")
+
+        return {
+            "status": ad.worst_status(issues),
+            "assembly": _doc_title(_active_doc()),
+            "unit": active_unit,
+            "tolerance": tolerance,
+            "top_level_only": bool(top_level_only),
+            "moving_components": sorted(mobile),
+            "component_count": len(components),
+            "positions_read": len(positioned),
+            "components": components,
+            "count": len(issues),
+            "critical": sum(1 for i in issues if i["severity"] == "critical"),
+            "warnings": sum(1 for i in issues if i["severity"] == "warning"),
+            "issues": issues,
+            "checks_skipped": checks_skipped,
+        }
+
+    return await _run(_impl)
+
+
+# ---------------------------------------------------------------------------
+# Mechanism poses: a moving assembly's position has to be RECORDED
+# ---------------------------------------------------------------------------
+# A static assembly keeps its position for free: everything in it is fixed or
+# fully mated, so a rebuild puts it all back exactly where it was. A mechanism
+# cannot work that way. Its moving components are under-constrained ON
+# PURPOSE -- that free degree of freedom is the movement -- so the pose it
+# happens to be in is one of infinitely many valid ones, and the next drag,
+# rebuild, motion study or mate edit silently replaces it. Nothing in
+# SolidWorks records what it was.
+#
+# That is why positions "get lost" as soon as movement is involved while the
+# same assembly modelled static stays put, and it is not a bug to fix in a
+# mate: no mate can hold a degree of freedom that is meant to be free. The
+# answer is to record the pose outside the model and be able to put it back.
+
+
+POSE_FORMAT = "solidworks-mcp/assembly-pose/1"
+
+
+def _apply_pose(component, rotation_rows, translation_m) -> None:
+    """Write a pose straight into a component's IMathTransform.
+
+    Takes the 3x3 rotation ROWS and the translation in METRES -- the same flat
+    layout _component_pose reads (indices 0-8 rotation row-major, 9-11
+    translation, 12 scale). Deliberately not Euler angles: a mechanism pose
+    has to come back exactly, and decomposing a matrix to angles and
+    recomposing it loses that (gimbal-aliased triples map to the same matrix,
+    and the round trip is only as exact as the decomposition).
+    """
+    flat = tuple(float(v) for row in rotation_rows for v in row) + (
+        float(translation_m[0]), float(translation_m[1]), float(translation_m[2]),
+        1.0, 0.0, 0.0, 0.0,
+    )
+    variant = win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, flat)
+    transform = component.Transform2
+    transform.ArrayData = variant
+    component.Transform2 = transform
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def capture_assembly_pose(label: str = "",
+                                filepath: Optional[str] = None,
+                                unit: Optional[str] = None,
+                                top_level_only: bool = True) -> dict:
+    """Record where every component of the active assembly is RIGHT NOW, as a
+    snapshot restore_assembly_pose can put back exactly. Read-only.
+
+    THIS IS FOR ASSEMBLIES THAT MOVE. A static assembly does not need it --
+    fixed and fully mated components return to the same place on every
+    rebuild. A mechanism does: its moving parts are under-constrained on
+    purpose, so the position it is in right now is one of infinitely many
+    valid ones and the next drag, rebuild or motion study overwrites it with
+    no record of what it was. No mate can prevent that, because the free
+    degree of freedom IS the movement. Capturing the pose is what makes a
+    mechanism position reproducible.
+
+    Each component is stored with its translation in metres AND the exact 3x3
+    rotation matrix SolidWorks reports (row-major, see
+    get_component_transform), plus whether it was fixed. No Euler conversion
+    anywhere, so the restore is exact rather than close.
+
+    ``filepath`` also writes the snapshot as JSON, which is what lets a pose
+    outlive the session -- pass the same path to restore_assembly_pose later,
+    or keep several files for several positions of the same mechanism. Without
+    it the snapshot exists only in this conversation's history.
+
+    ``label`` is free text kept in the snapshot ("crank at 45 deg", "piston at
+    TDC", "gate half open") so a folder of poses stays readable.
+
+    A suppressed or unreadable component is recorded with ``position: null``
+    and named in ``warnings``: it is skipped on restore rather than being
+    silently given a wrong pose.
+    """
+
+    def _impl():
+        assy = _active_assembly()
+        active_unit, factor = _unit_factor(unit)
+        warnings = []
+        components = []
+        for raw_component in assy.GetComponents(bool(top_level_only)) or ():
+            component = win32com.client.Dispatch(raw_component)
+            name = str(component.Name2)
+            entry = {"name": name, "position": None, "position_m": None,
+                     "rotation_matrix": None}
+            for attribute, key in (("GetPathName", "path"),
+                                   ("IsSuppressed", "suppressed"),
+                                   ("IsFixed", "fixed")):
+                try:
+                    value = _com_member(component, attribute)
+                    entry[key] = str(value) if key == "path" else bool(value)
+                except Exception:
+                    entry[key] = None
+            try:
+                # Read twice: once in metres, which is what restores exactly,
+                # and once in the caller's unit, which is what a human reads.
+                exact = _component_pose(component, 1.0)
+                shown = _component_pose(component, factor)
+            except Exception as exc:
+                warnings.append(
+                    f"'{name}' pose could not be read ({exc}), so it is recorded without "
+                    f"a position and will be left untouched on restore")
+                components.append(entry)
+                continue
+            entry["position_m"] = [exact["translation"]["x"],
+                                   exact["translation"]["y"],
+                                   exact["translation"]["z"]]
+            entry["position"] = dict(shown["translation"], unit=active_unit)
+            entry["rotation_matrix"] = exact["rotation_matrix"]
+            entry["rotation_convention"] = exact["rotation_convention"]
+            components.append(entry)
+
+        pose = {
+            "format": POSE_FORMAT,
+            "assembly": _doc_title(_active_doc()),
+            "assembly_path": _doc_path(_active_doc()),
+            "label": label,
+            "captured_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "unit": active_unit,
+            "top_level_only": bool(top_level_only),
+            "component_count": len(components),
+            "positions_recorded": sum(1 for c in components if c["position_m"]),
+            "components": components,
+        }
+        if filepath:
+            target = _resolve_write_path(filepath)
+            os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+            with open(target, "w", encoding="utf-8") as handle:
+                json.dump(pose, handle, indent=2, ensure_ascii=False)
+            if not os.path.exists(target):
+                raise RuntimeError(f"SolidWorks MCP did not write the pose to '{target}'.")
+            pose["filepath"] = target
+        pose["warnings"] = warnings
+        return pose
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+async def restore_assembly_pose(filepath: Optional[str] = None,
+                                pose: Optional[dict] = None,
+                                tolerance: float = 0.01,
+                                restore_fixed_state: bool = True) -> dict:
+    """Put a mechanism back into a pose recorded by capture_assembly_pose.
+
+    Pass ``filepath`` (a JSON snapshot written earlier) or ``pose`` (the dict
+    capture_assembly_pose returned). The exact 3x3 rotation matrix and the
+    metre translation are written straight back into each component's
+    transform, so the mechanism returns to that pose exactly, not
+    approximately.
+
+    THE RESULT IS MEASURED. After the assembly rebuilds, every component's
+    pose is read back and compared with the snapshot: ``components`` carries
+    the per-component ``deviation``, and ``verified`` is true only when every
+    one of them landed within ``tolerance``. This matters more here than
+    anywhere else -- an existing mate can override a restored pose the moment
+    the rebuild solves, and the component that gets dragged elsewhere is
+    reported instead of being assumed back in place.
+
+    A component in the snapshot that is no longer in the assembly, or was
+    recorded without a position, is listed in ``skipped`` rather than guessed
+    at. A component in the assembly that is not in the snapshot is listed in
+    ``untouched`` -- the restore does not invent a pose for it.
+
+    ``restore_fixed_state`` puts each component's fixed/floating state back as
+    recorded. A fixed component is floated before its transform is written
+    (SolidWorks will not move a fixed component) and re-fixed afterwards.
+    """
+
+    def _impl():
+        if (filepath is None) == (pose is None):
+            raise ValueError("Pass exactly one of filepath or pose.")
+        if filepath is not None:
+            if not os.path.exists(filepath):
+                raise FileNotFoundError(f"Pose file not found: {filepath}")
+            with open(filepath, "r", encoding="utf-8") as handle:
+                snapshot = json.load(handle)
+        else:
+            snapshot = pose
+        if not isinstance(snapshot, dict) or not snapshot.get("components"):
+            raise ValueError(
+                "That is not an assembly pose: expected the object "
+                f"capture_assembly_pose returns (format '{POSE_FORMAT}') with a "
+                f"non-empty 'components' list.")
+        stored_format = str(snapshot.get("format", ""))
+        if stored_format and stored_format != POSE_FORMAT:
+            raise ValueError(
+                f"Pose format '{stored_format}' is not '{POSE_FORMAT}'; it was written by "
+                f"a different version and its layout cannot be assumed.")
+
+        assy = _active_assembly()
+        active_unit, factor = _unit_factor(snapshot.get("unit"))
+        title = _doc_title(_active_doc())
+        warnings = []
+        if snapshot.get("assembly") and snapshot["assembly"] != title:
+            warnings.append(
+                f"this pose was captured from assembly '{snapshot['assembly']}' but the "
+                f"active assembly is '{title}': the components were matched by name, so "
+                f"confirm the result before relying on it")
+
+        wanted = {}
+        skipped = []
+        for entry in snapshot["components"]:
+            name = str(entry.get("name", ""))
+            if not entry.get("position_m") or not entry.get("rotation_matrix"):
+                skipped.append({"name": name, "reason": "recorded without a position"})
+                continue
+            wanted[name] = entry
+
+        present = {}
+        for raw_component in assy.GetComponents(bool(snapshot.get("top_level_only", True))) or ():
+            component = win32com.client.Dispatch(raw_component)
+            present[str(component.Name2)] = component
+        for name in sorted(set(wanted) - set(present)):
+            skipped.append({"name": name, "reason": "no longer in the assembly"})
+            wanted.pop(name, None)
+        untouched = sorted(set(present) - set(wanted) - {s["name"] for s in skipped})
+
+        # Float first, write every transform, then rebuild ONCE: rebuilding
+        # between writes lets a half-restored pose solve against mates and
+        # drag components that have not been written yet.
+        refix = []
+        for name, entry in wanted.items():
+            component = present[name]
+            try:
+                if bool(component.IsFixed):
+                    _select_component(assy, name)
+                    assy.UnfixComponent()
+                    if restore_fixed_state and entry.get("fixed"):
+                        refix.append(name)
+                elif restore_fixed_state and entry.get("fixed"):
+                    refix.append(name)
+            except Exception as exc:
+                warnings.append(f"could not float '{name}' before restoring it ({exc})")
+            try:
+                _apply_pose(component, entry["rotation_matrix"], entry["position_m"])
+            except Exception as exc:
+                skipped.append({"name": name, "reason": f"transform could not be written: {exc}"})
+
+        rebuild = assy.EditRebuild3
+        if callable(rebuild):
+            rebuild()
+
+        for name in refix:
+            try:
+                _select_component(assy, name)
+                assy.FixComponent()
+            except Exception as exc:
+                warnings.append(f"could not re-fix '{name}' after restoring it ({exc})")
+
+        failed = {s["name"] for s in skipped}
+        components = []
+        for name, entry in wanted.items():
+            if name in failed:
+                continue
+            result = {"name": name,
+                      "requested_position": dict(
+                          zip(("x", "y", "z"),
+                              [v * factor for v in entry["position_m"]]),
+                          unit=active_unit)}
+            try:
+                landed = _component_pose(present[name], factor)
+            except Exception as exc:
+                result["actual_position"] = None
+                result["deviation"] = None
+                result["verified"] = False
+                warnings.append(
+                    f"'{name}' was restored but its pose could not be read back ({exc}), "
+                    f"so it is UNVERIFIED")
+                components.append(result)
+                continue
+            requested = tuple(v * factor for v in entry["position_m"])
+            deviation = dict(_deviation(requested, landed["translation"], tolerance),
+                             unit=active_unit)
+            result["actual_position"] = dict(landed["translation"], unit=active_unit)
+            result["deviation"] = deviation
+            result["verified"] = bool(deviation["within_tolerance"])
+            result["fixed"] = name in refix
+            if not deviation["within_tolerance"]:
+                warnings.append(
+                    f"'{name}' did not return to its recorded pose: it is "
+                    f"{deviation['distance']:.4g} {active_unit} away (dx="
+                    f"{deviation['dx']:.4g}, dy={deviation['dy']:.4g}, dz="
+                    f"{deviation['dz']:.4g}). A mate most likely overrode the restore -- "
+                    f"check list_mates for '{name}'")
+            components.append(result)
+
+        return {
+            "assembly": title,
+            "label": snapshot.get("label", ""),
+            "captured_at": snapshot.get("captured_at"),
+            "source": filepath or "inline pose",
+            "unit": active_unit,
+            "restored": len(components),
+            "verified": bool(components) and all(c["verified"] for c in components),
+            "components": components,
+            "skipped": skipped,
+            "untouched": untouched,
+            "refixed": sorted(refix) if restore_fixed_state else [],
+            "warnings": warnings,
+        }
 
     return await _run(_impl)
 

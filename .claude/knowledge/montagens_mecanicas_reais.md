@@ -35,6 +35,52 @@ Depois de uma mate `concentric`, sempre:
 2. Verifique essa posição contra a geometria real que deveria limitá-la
    (ex.: o vão entre dois mancais) antes de `fix_component`.
 
+## 2.1. Alinhamento de mate forçado é uma segunda causa de peça torta (corrigido v5.14.0)
+
+Até a v5.13.0, `add_mate` chamava `AddMate5` com o parâmetro de alinhamento
+(`swMateAlign_e`) fixo em `ALIGNED`. É diferente do item 2: mesmo escolhendo
+as faces certas e com a posição dentro da tolerância, a mate podia resolver
+com as duas faces apontando pro MESMO lado quando a geometria pede que elas
+se encarem (duas faces planas pressionadas, eixo contra ombro) — encaixe
+torto ou com brecha, e o SolidWorks **não reporta erro**, porque `ALIGNED` é
+uma solução matematicamente válida, só não é a física certa.
+
+Desde a v5.14.0 o default é `align='closest'` (o solver escolhe o lado mais
+próximo da pose atual) e `add_mate` devolve `geometry_check` com o ângulo
+medido entre as direções de referência das duas faces. Leia esse campo: se
+não for 0, 90 ou 180 graus, a peça está torta — e agora é um número, não uma
+impressão de vista isométrica. Se `closest` resolver do lado errado, chame de
+novo com `align='aligned'` ou `'anti_aligned'`.
+
+## 2.2. Mecanismo: a posição tem que ser GRAVADA, nenhuma mate a segura
+
+Montagem estática guarda a posição de graça — tudo fixo ou totalmente matado,
+e um rebuild devolve cada peça ao mesmo lugar. Mecanismo não: as peças móveis
+são sub-restringidas **de propósito**, e é esse grau de liberdade livre que é
+o movimento. A pose em que o mecanismo está é uma de infinitas válidas, e o
+próximo drag, rebuild, motion study ou edição de mate a substitui sem
+registrar qual era. É por isso que "com movimentação fica perdido as
+posições" enquanto a mesma montagem modelada estática fica quieta.
+
+Não tente resolver isso com mate nem com `fix_component`: travar a peça mata
+o mecanismo. O caminho é:
+
+1. Declare as peças móveis em `verify_assembly_positions(moving_components=[...])`
+   — sem isso, cada uma dispara `M01` ("nem fixa nem matada"), que é
+   exatamente o que uma peça móvel é. Declaradas, viram isentas de `M01` e
+   passam a ser checadas pelo problema oposto (`M06`: fixa quando deveria
+   estar livre).
+2. Grave a pose com `capture_assembly_pose(label="biela a 45 graus",
+   filepath="...pose_45.json")` antes de qualquer coisa que mova o mecanismo
+   — inclusive antes de gerar desenho, porque a prancha mostra a pose em que
+   a montagem estava.
+3. Volte com `restore_assembly_pose(filepath=...)`. Ele mede o resultado: se
+   uma mate arrastar o componente no rebuild, aparece como `deviation`, não
+   como sucesso.
+
+Uma pose por arquivo = uma posição do mecanismo. É assim que se compara duas
+posições (PMS/PMI de um pistão, portão aberto/fechado) de forma reproduzível.
+
 ## 3. Vistas ortográficas por eixo, não só isométrica
 
 Uma vista isométrica "parece encaixada" com muita facilidade mesmo quando

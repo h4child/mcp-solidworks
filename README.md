@@ -118,10 +118,16 @@ instalacao, nao no codigo -- nao e encontrada),
 `split_body` (EXP -- fluxo Pre/PostSplitBody), `add_rib` (EXP)
 
 ### Montagem
-`insert_component` (OK), `list_components` (OK), `fix_component`,
+`insert_component` (OK -- posicao conferida: devolve `actual_position` lido do
+SolidWorks, `deviation` e `verified`), `verify_assembly_positions` (OK),
+`capture_assembly_pose` (OK), `restore_assembly_pose` (OK),
+`list_components` (OK), `fix_component`,
 `float_component`, `delete_component`, `suppress_component`,
 `unsuppress_component`, `list_mates`, `interference_check` (OK),
-`add_mate` (EXP), `add_advanced_mate` (EXP), `add_cam_follower_mate` (OK),
+`add_mate` (EXP -- devolve a posicao dos dois componentes antes/depois, os
+graus de liberdade que a mate NAO trava, e `geometry_check` com o angulo
+medido entre as duas faces; `align` deixou de forcar `swMateAlignALIGNED`),
+`add_advanced_mate` (EXP), `add_cam_follower_mate` (OK),
 `add_screw_mate` (OK), `add_rack_pinion_mate` (OK),
 `list_motion_studies` (OK), `create_motion_study` (OK),
 `create_assembly_pattern` (EXP -- precisa de referencia de direcao),
@@ -276,6 +282,64 @@ fechar e reabrir o SolidWorks, *todas* as chamadas falhavam com "O servidor RPC
 nao esta disponivel", inclusive `connect_solidworks`, porque o caminho de
 reconexao nunca era alcancado. Agora `_com_is_alive()` invoca a chamada de
 fato, e o mesmo padrao de no-op foi corrigido no rebuild de `shell_body`.
+
+### Novas em v5.14.0 (posicao de montagem conferida + mecanismos, 150 -> 153)
+
+Tres bugs distintos de posicionamento, e o caso de montagem com movimento.
+
+**1. Peca multi-corpo era inserida fora do lugar.** A correcao de origem do
+`insert_component` (que compensa o `AddComponent5`, que posiciona o CENTRO da
+caixa envolvente no ponto pedido, nao a origem) media a caixa de
+`bodies[0]` apenas. Toda estrutura soldada e todo perfil estrutural tem mais
+de um corpo, e a caixa do primeiro corpo descreve so um pedaco da peca: a
+peca saia deslocada pela diferenca entre as duas caixas. Agora a caixa e a
+uniao de **todos** os corpos solidos.
+
+**2. O alinhamento da mate era forcado em toda chamada.** O segundo parametro
+do `AddMate5` e `swMateAlign_e` (ALIGNED=0, ANTI_ALIGNED=1, CLOSEST=2) e
+estava fixo em `0` — forcando ALIGNED independentemente da geometria. Para
+duas faces feitas pra se encarar (duas faces planas pressionadas, eixo contra
+ombro), ALIGNED e a solucao errada; o SolidWorks nao reporta erro, porque e
+uma solucao matematicamente valida, so nao e a que encaixa. Era a causa da
+"brecha torta" sem erro nenhum. `add_mate` agora tem `align`
+('aligned' | 'anti_aligned' | **'closest'**, novo default) e devolve
+`geometry_check` com o angulo real medido entre as direcoes de referencia das
+duas faces, em coordenadas da montagem.
+
+**3. Nenhuma ferramenta de posicionamento conferia o proprio resultado.**
+Devolviam os parametros de entrada de volta (padrao "eco"), entao uma peca no
+lugar errado era indistinguivel de sucesso. Agora `insert_component` e
+`set_component_transform` leem a pose de volta do SolidWorks e devolvem
+`requested_position` ao lado de `actual_position`, `deviation` e `verified`;
+`get_component_transform` rotula a convencao da matriz
+(`rotation_convention: "row-major"`) pro chamador nao adivinhar.
+`verify_assembly_positions` (nova) e o gate de montagem, no formato do
+`verify_drawing`: `M01` nem fixa nem matada, `M02` sobre a origem, `M03` duas
+pecas na mesma posicao, `M04` fixa e matada ao mesmo tempo, `M05` posicao
+ilegivel, `M06` peca declarada movel mas fixa.
+
+**4. Montagem com movimento perdia as posicoes.** Uma montagem estatica
+guarda a posicao de graca: tudo nela e fixo ou totalmente matado, e um
+rebuild devolve cada peca ao mesmo lugar. Um mecanismo nao pode funcionar
+assim — suas pecas moveis sao sub-restringidas **de proposito**, e esse grau
+de liberdade livre e o movimento. A pose em que ele esta e uma de infinitas
+validas, e o proximo drag, rebuild ou motion study a substitui sem registrar
+qual era. Nao e um bug de mate: nenhuma mate pode travar um grau de liberdade
+que deve ficar livre.
+
+- `verify_assembly_positions` ganhou `moving_components`: os nomes das pecas
+  que **devem** se mover. Sem isso, cada uma delas dispara `M01`, porque
+  estar sub-restringida e exatamente o que uma peca movel e. Declaradas,
+  ficam isentas de `M01` e passam a ser checadas pelo problema oposto
+  (`M06`: fixa quando deveria estar livre).
+- `capture_assembly_pose` / `restore_assembly_pose` (novas): gravam a pose
+  exata de cada componente e a colocam de volta. Guardam a matriz de rotacao
+  3x3 que o SolidWorks reporta e a translacao em metros — **sem** conversao
+  pra angulo de Euler, porque decompor e recompor nao e exato e uma pose de
+  mecanismo tem que voltar exata. Com `filepath`, a pose vira um JSON e
+  sobrevive a sessao (varios arquivos = varias posicoes do mesmo mecanismo).
+  O restore mede o resultado: se uma mate arrastar o componente no rebuild,
+  isso aparece como `deviation` em vez de sucesso limpo.
 
 ### Novas em v5.12.0 (7 ferramentas, 143 -> 150)
 - Camada de leitura/verificacao de desenho (modulo `alfa_drawing.py`, sem COM,
