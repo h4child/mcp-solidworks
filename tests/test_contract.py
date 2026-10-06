@@ -17,10 +17,12 @@ pywin32. It does NOT need SolidWorks to be running: no tool is called.
 Run with:  python -m pytest tests/test_contract.py -q
 """
 
+import ast
 import inspect
 import json
 import os
 import sys
+import textwrap
 
 import pytest
 

@@ -2584,7 +2584,27 @@ async def add_mate(mate_type: str, point1: dict, point2: dict,
     leaves something free, and the position reported above is simply where the
     part sits now -- not a position the mate holds. For a concentric mate in
     particular, the axial position is NOT fixed; constrain the remaining
-    direction with a second mate, or fix_component, before building on it."""
+    direction with a second mate, or fix_component, before building on it.
+
+    TWO LIMITS THAT NEITHER OF THOSE FIELDS CAN REPORT.
+
+    It resolves each point through SelectByID2, which picks from the current
+    CAMERA. A face hidden behind the model cannot be reached at all, whatever
+    coordinate is passed -- so an internal face, such as a piston's pin-boss
+    bore inside the skirt, is unreachable from any orientation, and the call
+    either fails or silently grabs the outer face in front of it. Use
+    list_faces on the part first to get a pick point that really lies on the
+    face wanted, and set_view('isometric') before picking; that only helps for
+    a convex part. When the two faces are already coaxial, the near part can
+    occlude the far one's bore from every angle, and no pick point exists.
+
+    A 'concentric' mate removes only two degrees of freedom -- it aligns the
+    axes and leaves sliding along the shared axis free -- so the part stops
+    wherever the solver left it. The ``components`` field above now reports
+    where that was, but it is still only one of infinitely many valid
+    positions: check it with get_component_transform against the geometry that
+    is supposed to limit it BEFORE fix_component, and see
+    .claude/knowledge/montagens_mecanicas_reais.md."""
 
     def _impl():
         assy = _active_assembly()
