@@ -186,3 +186,61 @@ vale para peça convexa). O furo do mancal do pistão é interno à saia —
 nenhuma orientação de câmera o alcança. Para faces internas, `add_mate` por
 coordenada não serve; use o pino como intermediário (cujas faces são
 externas) em vez de tentar mateal a biela direto no mancal.
+
+## 10. `create_automotive_piston_assembly`: pino e biela nascem com eixo perpendicular ao mancal do pistão (90°), não só deslocados
+
+Confirmado por medição ao vivo (2026-10-05), comparando `list_faces(surface_type="cylinder")`
+de cada peça standalone (pistão, pino, biela) depois de `create_automotive_piston_assembly`:
+
+- Furo do mancal do pistão: `axis=[1,0,0]` (eixo global X, transversal — correto para um
+  pino de pistão real).
+- Face externa do pino (`wrist_pin`), inserido sem rotação pelo `insert_component`:
+  `axis=[0,0,-1]` (eixo local Z).
+- Furo do olhal pequeno da biela: `axis=[0,0,1]` (eixo local Z).
+
+Ou seja: pino e biela foram modelados internamente usando um eixo Z para o furo,
+mas o pistão foi modelado com o mancal em X. Como `insert_component` só translada
+(não gira) a peça, o resultado nativo tem os eixos **perpendiculares entre si**, não
+apenas um gap de alinhamento — nenhuma mate concêntrica resolve isso sem antes girar
+o componente. Isso é consistente com o sintoma relatado pelo usuário: "para criar o
+pistão/biela funciona 100%, mas ao tentar posicionar para gerar movimento, perde a
+posição e perde o desenho" — porque qualquer tentativa de ajuste fino parte de uma
+base já desalinhada em rotação, não só em translação.
+
+**Correção aplicada e verificada ao vivo:** `set_component_transform` com
+`rotation_y=90` no pino e na biela resolve o desalinhamento de eixo (confirmado via
+`get_component_transform`: a matriz resultante `[[0,0,1],[0,1,0],[-1,0,0]]` mapeia o
+eixo local Z exatamente para o eixo global X do mancal). A translação precisa ser
+recalculada com a convenção de linha do item 4 deste arquivo — **não** basta girar;
+sem recompor a translação, o furo gira em torno da origem local da peça (que não
+coincide com o centro do furo) e sai do lugar.
+
+**Limite ainda não contornado:** mesmo depois de alinhar pino e biela por
+`set_component_transform` (validado visualmente: vista `right` mostra o conjunto
+pistão→pino→biela→(mancal) perfeitamente alinhado, sem gap), tentar formalizar esse
+encaixe com uma mate real (`add_mate(concentric, ...)`) no furo do olhal da biela
+falhou com `"No face/plane found at point2"` **mesmo usando o ponto exato devolvido
+por `list_faces`**, transformado corretamente pela matriz de rotação. Causa provável:
+uma vez que pino e biela já estão coaxiais (é exatamente o objetivo), o corpo sólido
+do PINO ocupa fisicamente o mesmo eixo e bloqueia a câmera de alcançar a face interna
+do furo da biela por trás dele — autoexclusão geométrica, não um erro de cálculo de
+ponto. Isso significa que, com o toolset atual (seleção por coordenada/câmera via
+`SelectByID2`), **não dá para criar uma mate concêntrica real e resolvida pelo
+solver** nessa junta depois de alinhada — só dá para posicionar por transformação
+absoluta (`set_component_transform` + `fix_component`), o que é posição estática
+correta, mas não é uma junta cinemática (o solver do SolidWorks não está envolvido,
+então nada "sabe" que a peça deve deslizar/girar dentro de limites).
+
+**Caminho correto pesquisado (ver sessão de 2026-10-05, resposta ao usuário sobre
+"como a mate vai saber as posições"):** a forma robusta de o SolidWorks resolver
+posição/encaixe é via geometria de referência estável — **Mate References**
+(`InsertMateReference2` na API) marcadas em cada peça no momento da modelagem, ou
+**Coordinate System Mates** entre sistemas de coordenadas nomeados e coincidentes.
+Qualquer uma das duas elimina o cálculo manual de matriz de rotação e o problema de
+autoexclusão por câmera, porque a mate deixa de depender de picar um ponto visível e
+passa a referenciar uma entidade nomeada. A correção de causa raiz fica em
+`create_automotive_piston_assembly` no `server.py`: ou (a) modelar o furo do mancal
+do pistão, o pino e o olhal da biela todos no mesmo eixo/plano de sketch desde a
+criação (eliminando a necessidade de qualquer rotação pós-inserção), ou (b) inserir
+um `Coordinate System` em cada componente no ponto de articulação e mateá-los entre
+si via coordinate-system mate em vez de `add_mate` por coordenada de face.
