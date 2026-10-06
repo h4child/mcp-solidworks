@@ -50,3 +50,4 @@ tests/output/
 
 # Migrated local CAD projects and package artifacts are retained only here.
 tests/output/legacy/
+calls.jsonl
