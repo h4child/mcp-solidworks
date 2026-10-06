@@ -825,3 +825,129 @@ def test_the_mechanism_reminder_points_at_the_pose_tools():
     note = server._mechanism_pose_reminder("a test mate")
     assert "capture_assembly_pose" in note and "restore_assembly_pose" in note
     assert "not another mate" in note or "not another" in note
+
+
+# ---------------------------------------------------------------------------
+# The gear layer
+# ---------------------------------------------------------------------------
+# A gear is the one shape the generic sketch tools could not build, and it
+# failed silently: a smooth disc that rebuilds clean, measures plausibly and
+# gets handed over as a gear. These freeze the three things that keep
+# create_spur_gear from regressing back into that -- the analytic profile, the
+# inference engine being off while it is drawn, and the volume check that
+# catches it if either ever stops working.
+
+import gear_geometry as gg  # noqa: E402
+
+
+def test_the_server_uses_the_shared_gear_geometry_module():
+    """Same contract as alfa_drawing: one implementation of the involute.
+
+    A second copy inside server.py could only be tested with SolidWorks open,
+    which is how a gear profile drifts from the table printed next to it.
+    """
+    assert server.gg is gg
+
+
+def test_the_gear_tool_is_registered_and_not_read_only():
+    assert "create_spur_gear" in TOOLS
+    annotations = TOOLS["create_spur_gear"].annotations
+    assert annotations.readOnlyHint is not True
+    assert annotations.destructiveHint is not True   # it adds, it does not remove
+    assert annotations.openWorldHint is False
+
+
+def test_the_gear_tool_warns_the_caller_off_drawing_teeth_by_hand():
+    """The docstring is where a model decides whether to use this tool or to
+    improvise with draw_line + cut_extrude + circular_pattern. If it does not
+    say what goes wrong when you improvise, it gets improvised."""
+    description = TOOLS["create_spur_gear"].description.lower()
+    assert "smooth" in description
+    assert "snap" in description or "inference" in description
+    assert "circular_pattern" in description
+
+
+def test_the_gear_tool_declares_what_it_does_not_cut():
+    """Helical, internal, bevel, worm and profile shift are all out of scope.
+
+    A tool that stays quiet about its limits gets used past them.
+    """
+    description = TOOLS["create_spur_gear"].description.lower()
+    for absent in ("helical", "internal", "bevel", "worm", "profile shift"):
+        assert absent in description, f"the docstring does not mention {absent}"
+
+
+def test_the_gear_tool_draws_its_profile_with_the_inference_engine_off():
+    """SetAddToDB is the load-bearing line of the whole tool.
+
+    With it, a tooth-scale point lands where it was asked to; without it, the
+    point goes through the screen-space snap and the teeth collapse. It must
+    also be switched back off, or every later draw_* call in the session
+    silently stops getting inference and relations.
+    """
+    source = inspect.getsource(TOOLS["create_spur_gear"].fn)
+    assert "SetAddToDB(True)" in source
+    assert "SetAddToDB(False)" in source
+    assert "finally:" in source, "SetAddToDB must be restored even on failure"
+
+
+def test_the_gear_tool_does_not_pattern_a_tooth():
+    """The failure mode this tool replaces, frozen as a test.
+
+    One seed tooth gap cut and patterned around the blank is exactly what
+    produced the smooth disc: the seed profile is the fragile part, and the
+    pattern multiplies it. The whole outline is drawn at once instead.
+    """
+    source = inspect.getsource(TOOLS["create_spur_gear"].fn)
+    # The docstring names circular_pattern to say why it is not used, so this
+    # looks for the call, not the word.
+    assert "circular_pattern(" not in source
+    assert "linear_pattern(" not in source
+    assert "cut_extrude(" in source  # only for the optional shaft bore
+
+
+def test_the_gear_tool_measures_whether_the_teeth_are_really_there():
+    """verified alone is not enough: a wrong-sized gear and a smooth disc are
+    different failures, and only one of them is worth refusing to call a gear.
+    """
+    source = inspect.getsource(TOOLS["create_spur_gear"].fn)
+    assert "teeth_present" in source
+    assert "measure_body" in source
+    parameters = inspect.signature(TOOLS["create_spur_gear"].fn).parameters
+    assert "volume_tolerance" in parameters
+    description = TOOLS["create_spur_gear"].description.lower()
+    assert "teeth_present" in description
+    assert "measured, not assumed" in description
+
+
+def test_the_gear_tool_gets_room_to_draw_a_whole_profile():
+    """20-30 segments per tooth is over a thousand COM calls on a big gear.
+
+    On the ordinary 60s feature budget that is cut off halfway through, which
+    leaves an open profile and a confusing timeout instead of a gear.
+    """
+    assert server.TIMEOUT_BUDGET_OVERRIDES.get("create_spur_gear", 0) >= 300
+
+
+def test_every_knowledge_file_the_server_advertises_exists():
+    """A resource that 404s is worse than one that was never offered: the
+    model asks for the file, gets a "nao encontrado" string back, and carries
+    on without the knowledge it just decided it needed.
+    """
+    missing = [
+        filename
+        for _, filename, _, _ in server._KNOWLEDGE_RESOURCES
+        if not os.path.exists(os.path.join(ROOT, ".claude", "knowledge", filename))
+    ]
+    assert not missing, f"advertised but absent: {', '.join(missing)}"
+
+
+def test_the_gear_knowledge_is_advertised_and_routed():
+    """Both clients have to be able to find it: Claude Code auto-loads
+    .claude/CLAUDE.md's table, an MCP-only client reads the resource list.
+    """
+    assert any(filename == "engrenagens.md"
+               for _, filename, _, _ in server._KNOWLEDGE_RESOURCES)
+    with open(os.path.join(ROOT, ".claude", "CLAUDE.md"), encoding="utf-8") as handle:
+        routing = handle.read()
+    assert "knowledge/engrenagens.md" in routing

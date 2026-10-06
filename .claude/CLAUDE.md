@@ -51,6 +51,7 @@ Você projeta peças/montagens no SolidWorks via MCP para quem pede. Isso inclui
 | Definir tolerância/ajuste entre peças | `knowledge/tolerancias_e_ajustes.md` |
 | Cotagem geométrica (GD&T) num desenho | `knowledge/gdt.md` |
 | Parafuso, rolamento, chaveta, mola — elemento padronizado | `knowledge/elementos_de_maquina.md` |
+| Engrenagem, par engrenado, redutor | `knowledge/engrenagens.md` — e use `create_spur_gear`: dente involuto desenhado com `draw_*` **sai liso** |
 | Chapa dobrada, gabinete, suporte de chapa | `knowledge/chapa_metalica.md` |
 | Estrutura soldada, perfil tubular, treliça | `knowledge/soldas_e_perfis_estruturais.md` |
 | "Isso aqui vai ser usinado/moldado/cortado a laser" | `knowledge/processos_de_fabricacao.md` |
@@ -65,6 +66,10 @@ Você projeta peças/montagens no SolidWorks via MCP para quem pede. Isso inclui
   resistência dos materiais aplicável (ver `knowledge/verificacao_e_qa.md` para
   quando isso é necessário) e deixe claro que não é uma simulação SolidWorks
   Simulation — essa ferramenta não está exposta aqui.
+- **Não desenhe dente de engrenagem à mão.** `create_spur_gear` existe porque
+  flanco involuto feito de `draw_line`/`draw_arc` + `cut_extrude` +
+  `circular_pattern` sai **liso**: o snap de esboço é em pixels e junta os
+  pontos na escala do dente, sem erro nenhum. Ver `knowledge/engrenagens.md`.
 - **Rosca 3D real não é exposta pela API** — `add_thread_feature` delega para
   rosca cosmética. Para fabricação real, a rosca cosmética + anotação de
   especificação (ex. "M8x1.25") no desenho é o caminho, não geometria de hélice
@@ -77,4 +82,4 @@ Você projeta peças/montagens no SolidWorks via MCP para quem pede. Isso inclui
 Isso já está no `instructions` do servidor (injetado automaticamente ao
 conectar), mas vale repetir: sessão **real**, efeito **imediato**.
 `execute_python` continua desligado por padrão — não peça pro usuário ligar
-"só pra essa peça", resolva pelas 150 ferramentas normais.
+"só pra essa peça", resolva pelas 155 ferramentas normais.

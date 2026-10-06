@@ -1,7 +1,7 @@
 # SolidWorks MCP Server
 
 Servidor MCP em Python que controla o SolidWorks via COM (`win32com`), escrito
-com o SDK oficial (`mcp`, usando `FastMCP`). **150 ferramentas** (v5.13.0).
+com o SDK oficial (`mcp`, usando `FastMCP`). **155 ferramentas** (v5.17.0).
 
 ## Para quem so quer usar
 
@@ -116,6 +116,23 @@ instalacao, nao no codigo -- nao e encontrada),
 `create_reference_axis` (EXP -- InsertAxis2 depende de selecao valida),
 `combine_bodies` (EXP -- corpos precisam se tocar/interseccionar),
 `split_body` (EXP -- fluxo Pre/PostSplitBody), `add_rib` (EXP)
+
+### Engrenagens
+`create_spur_gear` (EXP -- ver a ressalva abaixo)
+
+A geometria do dente e **testada**: `gear_geometry.py` e Python puro e
+`tests/test_gear_geometry.py` tem 113 testes que conferem o involuto contra a
+sua propria definicao, a espessura pi*m/2 na circunferencia primitiva (a
+condicao de engrenamento), a tangencia do raio de pe, o fechamento do contorno
+e a prova de que ele nao pode se autointersectar. O que **nao** foi rodado
+nesta instalacao e o caminho COM: `SetAddToDB(True)` + umas 500 chamadas de
+`CreateLine2` num unico esboco. Por isso EXP, e nao OK.
+
+A propria ferramenta mede o resultado: compara o volume real do solido com o
+volume analitico do contorno e devolve `verified`, mais um `teeth_present` que
+existe so pra pegar o disco liso. Ou seja, se o caminho COM falhar nesta
+instalacao, a falha vem reportada em vez de silenciosa -- que era exatamente o
+problema. Para confirmar ao vivo: `python tests/run_gear_live_test.py`.
 
 ### Montagem
 `insert_component` (OK -- posicao conferida: devolve `actual_position` lido do
@@ -282,6 +299,41 @@ fechar e reabrir o SolidWorks, *todas* as chamadas falhavam com "O servidor RPC
 nao esta disponivel", inclusive `connect_solidworks`, porque o caminho de
 reconexao nunca era alcancado. Agora `_com_is_alive()` invoca a chamada de
 fato, e o mesmo padrao de no-op foi corrigido no rebuild de `shell_body`.
+
+### Novas em v5.17.0 (a engrenagem tem dentes, 154 -> 155)
+
+**O sintoma:** toda engrenagem modelada aqui saia lisa. Um cilindro com furo.
+
+**Nao era um bug, era a aritmetica.** Um flanco involuto precisa de uma duzia
+de pontos a decimos de milimetro um do outro. Toda chamada `draw_*` passa pelo
+motor de inferencia do SolidWorks, cujo raio de snap e medido em **pixels de
+tela** (ver "O esboco e onde o erro nasce" em
+`.claude/knowledge/verificacao_e_qa.md`), e dois pontos em escala de dente, um
+do lado do outro, e exatamente o que esse motor junta -- **movendo** o ponto,
+sem erro nenhum. O perfil do vao de dente chegava degenerado ao `cut_extrude`,
+e um vao achatado repetido 20 vezes pelo `circular_pattern` e um disco de novo.
+Nenhuma das 154 ferramentas avisava: `validate_model` passava, `measure_body`
+devolvia uma massa plausivel, e a peca era entregue como engrenagem.
+
+**O conserto:** `create_spur_gear`. O contorno **inteiro** -- todos os dentes,
+fechado -- e calculado analiticamente em `gear_geometry.py` (ISO 53, altura
+cheia: adendo 1,0*m, dedendo 1,25*m, 20 graus, sem correcao de perfil) e
+desenhado como **um** perfil com o motor de inferencia desligado
+(`SetAddToDB`), depois extrudado uma vez. Sem corte, sem padrao, nada pra
+snapar. Inclui raio de pe tangente (0,38*m, o raio de ponta do cremalheira da
+ISO 53), furo de eixo opcional e a distancia entre centros pro par engrenar.
+
+**E ele se mede.** A secao transversal exata do contorno e conhecida, entao o
+volume real do solido extrudado e comparado com ela: `verified` so vem `true`
+quando fecham dentro de `volume_tolerance`, e `teeth_present` e uma checagem
+separada e mais grosseira de que o material dos vaos saiu mesmo do blank --
+essa e a que pega "saiu lisa". Nao da pra uma engrenagem sair lisa e ser
+reportada como pronta.
+
+Limites declarados na docstring: so engrenagem cilindrica de dentes retos,
+externa, sem correcao de perfil. Helicoidal, interna, conica, coroa/rosca sem
+fim e chanfro de topo ficam de fora -- e, como sempre, nao ha FEA aqui pra
+conferir resistencia do dente.
 
 ### Novas em v5.16.0 (movimento: a mate de mecanismo conferida)
 
@@ -460,7 +512,7 @@ que deve ficar livre.
 - Late binding (dispatch dinamico) -- igual ao ambiente do Claude Desktop.
 
 ### Camada de metodologia (design-sandbox): instructions, resource e prompt
-As 150 ferramentas sao primitivas; sozinhas nao ensinam a IA a projetar bem.
+As 155 ferramentas sao primitivas; sozinhas nao ensinam a IA a projetar bem.
 O servidor expoe as outras duas primitivas do protocolo MCP para cobrir essa
 lacuna, codificando o metodo ja validado nas replicas de engenharia deste
 projeto (ver `RELATORIO_TESTES.md`) em vez de depender de disciplina manual
@@ -486,8 +538,9 @@ arquivos agora sao expostos tambem como resources
 `solidworks://knowledge/index` + `solidworks://knowledge/<topico>` (materiais,
 tolerancias-e-ajustes, gdt, elementos-de-maquina, chapa-metalica,
 soldas-e-perfis-estruturais, processos-de-fabricacao, verificacao-e-qa,
-roteiro-projetista, montagens-mecanicas-reais -- este ultimo adicionado em
-04/10/2026) -- mesma fonte, lida ao vivo, para os dois clientes
+roteiro-projetista, montagens-mecanicas-reais -- este adicionado em
+04/10/2026 --, engrenagens -- adicionado em 06/10/2026) -- mesma fonte, lida
+ao vivo, para os dois clientes
 nunca divergirem. Cobrem o que a IA precisa saber pra projetar como um
 projetista/engenheiro de verdade (nao so "como chamar a ferramenta"):
 material certo por aplicacao, ajuste ISO entre furo e eixo, GD&T, dimensao

@@ -54,6 +54,7 @@
   "create_reference_plane",
   "create_sketch",
   "create_sketch_on_face",
+  "create_spur_gear",
   "create_weldment_profile",
   "cut_extrude",
   "delete_component",

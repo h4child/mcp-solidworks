@@ -42,6 +42,11 @@ from pydantic import ConfigDict
 # SolidWorks open -- see tests/test_alfa_drawing.py.
 import alfa_drawing as ad
 
+# Involute gear geometry, same reasoning as alfa_drawing: the whole reason a
+# gear came out smooth is arithmetic, not COM, so it lives in plain Python
+# where it can be tested without SolidWorks open -- see tests/test_gear_geometry.py.
+import gear_geometry as gg
+
 # Reject unknown tool arguments instead of silently ignoring them. Without
 # this, FastMCP's default Pydantic config (extra="ignore") means a caller
 # that misspells a parameter name (e.g. "x_center" instead of "cx") gets no
@@ -243,6 +248,11 @@ _BATCH_EXPORT_TIMEOUT_SECONDS = 900
 # the assembly-scale or the plain read/feature budget below.
 TIMEOUT_BUDGET_OVERRIDES = {
     "connect_solidworks": 240,
+    # One gear profile is 20-30 sketch segments per tooth, so a 40-tooth gear
+    # is over a thousand CreateLine2 calls in a single COM call. That is slow
+    # by construction, not stuck, and the 60s feature budget would cut it off
+    # halfway through an open profile.
+    "create_spur_gear": 300,
 }
 
 # Reading the whole assembly tree, cross-component interference or a
@@ -12078,6 +12088,368 @@ async def create_pedestal_fan_propeller(
 
 
 # ===========================================================================
+# Involute gearing
+# ===========================================================================
+# A gear is the one shape this server could not build with its generic sketch
+# tools, and it failed in the worst possible way: silently, as a smooth disc.
+# See create_spur_gear's docstring and gear_geometry.py for why, and
+# .claude/knowledge/engrenagens.md for the design side of it.
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def create_spur_gear(
+    module: float = 2.0,
+    teeth: int = 20,
+    thickness: float = 10.0,
+    pressure_angle: float = 20.0,
+    bore_diameter: float = 0.0,
+    plane: str = "front",
+    addendum_coefficient: float = 1.0,
+    dedendum_coefficient: float = 1.25,
+    root_fillet_coefficient: float = gg.DEFAULT_ROOT_FILLET_COEFFICIENT,
+    flank_points: int = 7,
+    unit: Optional[str] = None,
+    volume_tolerance: float = 0.02,
+) -> dict:
+    """Create an involute spur gear WITH REAL TEETH in the ACTIVE part document.
+
+    Use this for any gear. Drawing one by hand with draw_line/draw_arc plus
+    cut_extrude and circular_pattern is what produces the smooth disc this tool
+    exists to replace: a single involute flank needs a dozen points a fraction
+    of a millimetre apart, every draw_* call goes through SolidWorks' inference
+    engine whose snap radius is in SCREEN PIXELS, and tooth-scale points next
+    to each other are exactly what that engine collapses -- by MOVING the
+    point, with no error (verificacao_e_qa.md, section 0). A flattened tooth
+    gap patterned 20 times around the blank is a blank. Here the whole closed
+    outline -- every tooth -- is computed analytically and drawn as ONE profile
+    with the inference engine switched off (SetAddToDB), then extruded once.
+    No cut, no pattern, nothing to snap.
+
+    It does NOT create a document: call create_new_part first for a standalone
+    gear, or leave the shaft/hub part active to merge the gear onto it.
+
+    Geometry is ISO 53 standard full depth: addendum 1.0*module, dedendum
+    1.25*module, 20-degree pressure angle, no profile shift, zero backlash.
+    Tooth thickness at the pitch circle is exactly pi*module/2, so the result
+    meshes with any other gear of the same module and pressure angle at centre
+    distance module*(z1+z2)/2 -- that number comes back in the result.
+
+    module: the module m in ``unit`` (ISO 54 preferred values: 1, 1.25, 1.5, 2,
+        2.5, 3, 4, 5, 6, 8, 10). Pitch diameter is module*teeth; module and
+        pressure_angle are what decide whether two gears can mesh at all.
+    teeth: tooth count. Below 17 at 20 degrees a hobbed gear would be
+        undercut; the result says so instead of pretending otherwise.
+    thickness: face width, extruded symmetrically about ``plane`` so the gear
+        is centred on it (one coincident mate then aligns it with a shaft).
+    bore_diameter: optional through bore for the shaft, cut concentric. 0 for
+        none. Size it with tolerances_e_ajustes.md (H7/k6 for a keyed hub).
+    plane: 'front' (gear axis = Z), 'top' (axis = Y), 'right' (axis = X), or
+        the name of a reference plane -- use one to put a gear at a given
+        offset along a shaft.
+    root_fillet_coefficient: root fillet as a multiple of the module; 0.38 is
+        the ISO 53 rack tip radius an actual hob leaves. Set 0 for a sharp
+        root. It is reduced automatically when the base circle or the tooth
+        gap leaves less room, and the result says by how much and why.
+    flank_points: involute samples per flank. The flanks are chords through
+        the true involute; ``profile.flank_chord_error`` in the result is how
+        far those chords sit from the real curve, and raising this drops the
+        error roughly with its square (at the cost of sketch segments: the
+        profile already holds 20-30 of them per tooth).
+    volume_tolerance: fractional agreement required between the measured solid
+        and the analytic gear volume.
+
+    THE TEETH ARE MEASURED, NOT ASSUMED. The outline's exact cross-section is
+    known analytically, so the extruded solid's real volume is compared with
+    it: ``verified`` is true only when they agree within ``volume_tolerance``,
+    and ``teeth_present`` is a separate, blunter check that the solid is
+    missing the material the tooth gaps should have removed -- that is the one
+    that catches "it came out smooth", which is the failure mode of every
+    other way of building a gear here.
+
+    NOT covered: helical, internal, bevel and worm gearing, profile shift
+    (x*m), crowning, and tip chamfers. This is an external, spur, unshifted
+    gear. There is also no FEA in this server, so no tooth-bending check --
+    see verificacao_e_qa.md if a load has to be confirmed.
+    """
+
+    if teeth < 6:
+        raise ValueError(f"teeth must be at least 6, got {teeth}.")
+    if thickness <= 0:
+        raise ValueError(f"thickness (face width) must be positive, got {thickness}.")
+    if bore_diameter < 0:
+        raise ValueError(f"bore_diameter cannot be negative, got {bore_diameter}.")
+    if not 0 < volume_tolerance < 1:
+        raise ValueError(
+            f"volume_tolerance is a fraction between 0 and 1, got {volume_tolerance}."
+        )
+
+    active_unit = unit or _default_unit
+    # gear_geometry works in millimetres; the API wants metres. Convert once,
+    # here, so neither side has to know about the caller's unit.
+    scale_mm = to_meters(1.0, unit) * 1000.0
+    module_mm = module * scale_mm
+    thickness_mm = thickness * scale_mm
+    bore_mm = bore_diameter * scale_mm
+
+    gear = gg.spur_gear_outline(
+        module_mm, teeth, pressure_angle,
+        addendum_coefficient, dedendum_coefficient, root_fillet_coefficient,
+        flank_points=flank_points,
+    )
+    table = gear.table
+    warnings = list(gear.warnings)
+
+    if bore_mm > 0.0:
+        if bore_mm >= table["root_diameter"]:
+            raise ValueError(
+                f"a bore of {bore_diameter} {active_unit} is wider than this gear's "
+                f"root diameter ({table['root_diameter'] / scale_mm:.3f} {active_unit}): "
+                f"there would be no material left under the teeth."
+            )
+        rim_mm = (table["root_diameter"] - bore_mm) / 2.0
+        if rim_mm < 1.5 * module_mm:
+            warnings.append(
+                f"only {rim_mm / scale_mm:.3f} {active_unit} of rim is left between the "
+                f"bore and the tooth roots ({rim_mm / module_mm:.2f}*module); below about "
+                f"1.5*module the rim flexes under load and the teeth lose contact. Use a "
+                f"hub, or a smaller bore"
+            )
+    if not 4.0 * module_mm <= thickness_mm <= 16.0 * module_mm:
+        warnings.append(
+            f"the face width is {thickness_mm / module_mm:.1f}*module; usual practice is "
+            f"6 to 12*module (narrower loses load capacity, wider needs very good "
+            f"alignment to load the whole tooth evenly)"
+        )
+
+    points_m = [(x / 1000.0, y / 1000.0) for x, y in gear.points]
+    segment_count = len(points_m)
+    completed: list = []
+    stage = "initialization"
+
+    async def _solid_volume_mm3():
+        """Volume of whatever solid is already in the document, or None."""
+
+        def _impl():
+            doc = _active_doc()
+            if not (doc.GetBodies2(0, True) or ()):
+                return None
+            volume = _measure_model_doc(doc, 1.0).get("volume_m3")
+            return None if volume is None else volume * 1e9
+
+        return await _run(_impl)
+
+    def _draw_closed_profile():
+        doc = _active_doc()
+        sketch = _active_sketch(doc)
+        returned = 0
+        # SetAddToDB puts geometry straight into the sketch database, with no
+        # inference and no automatic relations: this is what makes a
+        # tooth-scale point land where it was asked to instead of snapping
+        # onto its neighbour. DisplayWhenAdded(False) keeps several hundred
+        # segments from being redrawn one at a time.
+        doc.SetAddToDB(True)
+        doc.SetDisplayWhenAdded(False)
+        try:
+            for (x1, y1), (x2, y2) in zip(points_m, points_m[1:] + points_m[:1]):
+                if doc.CreateLine2(x1, y1, 0.0, x2, y2, 0.0) is not None:
+                    returned += 1
+        finally:
+            doc.SetDisplayWhenAdded(True)
+            doc.SetAddToDB(False)
+        stored = len(_sketch_segments(sketch))
+        if stored != segment_count:
+            raise RuntimeError(
+                f"the gear profile should hold {segment_count} segments "
+                f"({gear.points_per_tooth} per tooth x {teeth} teeth) but the sketch "
+                f"stored {stored}. An incomplete profile is an open profile, which "
+                f"cannot be extruded; delete the sketch and retry with fewer "
+                f"flank_points, or build the gear in a new empty part."
+            )
+        return {"segments": stored, "segments_returned_by_com": returned}
+
+    try:
+        stage = "gear profile sketch"
+        sketch_info = await create_sketch(plane)
+        profile_info = await _run(_draw_closed_profile)
+        await close_sketch()
+        completed.append(stage)
+
+        stage = "face width extrusion"
+        volume_before_mm3 = await _solid_volume_mm3()
+        extrusion = await extrude_sketch(thickness, both_directions=True, unit=unit)
+        completed.append(stage)
+
+        bore_cut = None
+        if bore_mm > 0.0:
+            stage = "shaft bore"
+            await create_sketch(plane)
+            bore_circle = await draw_circle(0, 0, bore_diameter / 2.0, unit)
+            await close_sketch()
+            bore_cut = await cut_extrude(through_all=True, both_directions=True, unit=unit)
+            if bore_circle.get("snapped"):
+                warnings.append(
+                    "the bore circle came back SNAPPED: SolidWorks moved it off the "
+                    "gear axis, so the bore is eccentric. Delete the cut and redraw it "
+                    "after zoom_to_area on the bore"
+                )
+            completed.append(stage)
+
+        stage = "verification"
+        measurement = await measure_body()
+        completed.append(stage)
+    except Exception as exc:
+        try:
+            active = await get_document_info()
+        except Exception:
+            active = {"title": "(no active document)", "type": "Unknown"}
+        raise RuntimeError(
+            f"Spur gear creation stopped during '{stage}'. Completed stages: "
+            f"{', '.join(completed) or '(none)'}. Active document: {active}. "
+            f"Root cause: {exc}"
+        ) from exc
+
+    # --- the measured half: is this solid actually the gear that was computed?
+    bore_area_mm2 = math.pi * (bore_mm / 2.0) ** 2
+    expected_volume_mm3 = (gear.area_mm2 - bore_area_mm2) * thickness_mm
+    blank_volume_mm3 = (gear.blank_area_mm2 - bore_area_mm2) * thickness_mm
+    measured_total_mm3 = measurement.get("volume_m3")
+    measured_total_mm3 = None if measured_total_mm3 is None else measured_total_mm3 * 1e9
+    pre_existing = volume_before_mm3 is not None
+    measured_gear_mm3 = (
+        None if measured_total_mm3 is None
+        else measured_total_mm3 - (volume_before_mm3 or 0.0)
+    )
+
+    verified = None
+    teeth_present = None
+    volume_ratio = None
+    if measured_gear_mm3 is not None and expected_volume_mm3 > 0:
+        volume_ratio = measured_gear_mm3 / expected_volume_mm3
+        verified = abs(volume_ratio - 1.0) <= volume_tolerance
+        # The blunt check: the tooth gaps must have taken material OUT of the
+        # blank. Half of the predicted cut-away is a wide margin on purpose --
+        # it is here to catch a smooth disc, not to re-check the volume.
+        cut_away_expected = blank_volume_mm3 - expected_volume_mm3
+        cut_away_measured = blank_volume_mm3 - measured_gear_mm3
+        teeth_present = cut_away_measured >= 0.5 * cut_away_expected
+        if not teeth_present:
+            warnings.append(
+                f"THIS GEAR CAME OUT SMOOTH: the solid holds {measured_gear_mm3:.1f} mm3, "
+                f"against {expected_volume_mm3:.1f} mm3 for a {teeth}-tooth gear and "
+                f"{blank_volume_mm3:.1f} mm3 for a plain disc at the tip diameter. The "
+                f"tooth gaps are not in the body -- do not report this part as a gear"
+            )
+        elif not verified:
+            warnings.append(
+                f"the solid holds {measured_gear_mm3:.1f} mm3 against "
+                f"{expected_volume_mm3:.1f} mm3 computed from the profile "
+                f"({volume_ratio:.4f}x): the teeth are there, but the body is not the "
+                f"gear that was asked for. Check the extrusion depth and whether the "
+                f"profile merged with geometry that was already in the part"
+            )
+        if pre_existing:
+            warnings.append(
+                f"the part already held {volume_before_mm3:.1f} mm3 of solid before the "
+                f"gear, so the volume check above is on the DIFFERENCE. If the gear "
+                f"merged with that body, or the bore cut through it too, the difference "
+                f"is not only the gear and the check is indicative, not conclusive"
+            )
+
+    # Shape check, independent of volume: the two large extents of the solid
+    # should be the tip diameter, and the small one the face width. Skipped
+    # when something else in the document pollutes the bounding box.
+    size_check = None
+    box = measurement.get("bounding_box") or {}
+    if (not pre_existing and box.get("min_m") and box.get("max_m")
+            and thickness_mm < gear.effective_tip_diameter * 0.98):
+        extents = sorted(
+            (abs(high - low) * 1000.0
+             for low, high in zip(box["min_m"], box["max_m"])),
+            reverse=True,
+        )
+        allowance = max(0.1, 0.01 * gear.effective_tip_diameter)
+        size_check = {
+            "measured_tip_diameter_mm": [round(extents[0], 4), round(extents[1], 4)],
+            "expected_tip_diameter_mm": round(gear.effective_tip_diameter, 4),
+            "measured_face_width_mm": round(extents[2], 4),
+            "expected_face_width_mm": round(thickness_mm, 4),
+            "allowance_mm": round(allowance, 4),
+        }
+        size_check["matches"] = (
+            abs(extents[0] - gear.effective_tip_diameter) <= allowance
+            and abs(extents[1] - gear.effective_tip_diameter) <= allowance
+            and abs(extents[2] - thickness_mm) <= allowance
+        )
+        if not size_check["matches"]:
+            verified = False
+            warnings.append(
+                f"the solid measures {extents[0]:.3f} x {extents[1]:.3f} x "
+                f"{extents[2]:.3f} mm, but a {teeth}-tooth gear of module {module_mm:g} mm "
+                f"and face width {thickness_mm:g} mm is "
+                f"{gear.effective_tip_diameter:.3f} x {gear.effective_tip_diameter:.3f} x "
+                f"{thickness_mm:.3f} mm"
+            )
+
+    def _in_unit(value_mm: float) -> float:
+        return round(value_mm / scale_mm, 6)
+
+    return {
+        "plane": sketch_info.get("plane", plane),
+        "unit": active_unit,
+        "gear": {
+            "module": _in_unit(module_mm),
+            "teeth": teeth,
+            "pressure_angle": pressure_angle,
+            "pitch_diameter": _in_unit(table["pitch_diameter"]),
+            "base_diameter": _in_unit(table["base_diameter"]),
+            "tip_diameter": _in_unit(table["tip_diameter"]),
+            "root_diameter": _in_unit(table["root_diameter"]),
+            "whole_depth": _in_unit(table["whole_depth"]),
+            "circular_pitch": _in_unit(table["circular_pitch"]),
+            "tooth_thickness_at_pitch_circle": _in_unit(table["tooth_thickness_at_pitch_circle"]),
+            "angular_pitch_degrees": round(table["angular_pitch_degrees"], 6),
+            "face_width": _in_unit(thickness_mm),
+            "bore_diameter": _in_unit(bore_mm) if bore_mm else None,
+        },
+        "meshing": {
+            "center_distance_with_equal_gear": _in_unit(
+                gg.center_distance(module_mm, teeth, teeth)),
+            "center_distance_formula": "module * (teeth_this + teeth_other) / 2",
+            "ratio_formula": "teeth_other / teeth_this",
+            "note": ("meshes with any external spur gear of the same module and "
+                     "pressure angle; this profile is cut for zero backlash, so give "
+                     "the pair the backlash it needs in the centre distance or in "
+                     "the mating gear's tooth thickness"),
+        },
+        "profile": {
+            "sketch_segments": profile_info["segments"],
+            "segments_per_tooth": gear.points_per_tooth,
+            "flank_chord_error": _in_unit(gear.chord_error_mm),
+            "tip_land": _in_unit(gear.tip_land_mm),
+            "effective_tip_diameter": _in_unit(gear.effective_tip_diameter),
+            "root_fillet_radius": _in_unit(gear.root_fillet_radius),
+            "root_fillet": gear.root_fillet_note,
+            "tooth_area_fraction_of_blank": round(gear.tooth_area_fraction, 6),
+        },
+        "extrusion": extrusion,
+        "bore_cut": bore_cut,
+        "measured": measurement,
+        "volume_mm3": {
+            "expected_from_profile": round(expected_volume_mm3, 4),
+            "measured": None if measured_gear_mm3 is None else round(measured_gear_mm3, 4),
+            "smooth_blank_at_tip_diameter": round(blank_volume_mm3, 4),
+            "ratio_measured_to_expected": None if volume_ratio is None else round(volume_ratio, 6),
+            "tolerance": volume_tolerance,
+        },
+        "size_check": size_check,
+        "teeth_present": teeth_present,
+        "verified": verified,
+        "warnings": warnings,
+        "completed_stages": completed,
+    }
+
+
+# ===========================================================================
 # Configuration tools
 # ===========================================================================
 
@@ -13895,6 +14267,12 @@ _KNOWLEDGE_RESOURCES = [
      "Parafusos metricos ISO (furo/broca/chave), rolamentos rigidos de "
      "esferas (serie 6000/6200/6300), chavetas DIN 6885, molas -- nunca "
      "invente essas dimensoes."),
+    ("engrenagens", "engrenagens.md", "engrenagens-cilindricas-de-dentes-retos",
+     "Modulo, numero de dentes e angulo de pressao; modulos preferenciais "
+     "ISO 54, limite de 17 dentes (undercut), largura do dente, folga, "
+     "distancia entre centros, montagem do par, e estimativa de flexao do "
+     "dente por Lewis (nao ha FEA aqui). Leia antes de qualquer engrenagem -- "
+     "e use create_spur_gear, nunca draw_* na mao."),
     ("chapa-metalica", "chapa_metalica.md", "chapa-metalica-regras-de-projeto",
      "Raio minimo de dobra por espessura, K-factor, flange minimo, "
      "distancia furo-dobra, sequencia pratica de ferramentas para chapa "
