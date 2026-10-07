@@ -1,7 +1,7 @@
 # SolidWorks MCP Server
 
 Servidor MCP em Python que controla o SolidWorks via COM (`win32com`), escrito
-com o SDK oficial (`mcp`, usando `FastMCP`). **151 ferramentas** (v5.17.0).
+com o SDK oficial (`mcp`, usando `FastMCP`). **157 ferramentas** (v5.19.0).
 
 ## Para quem so quer usar
 
@@ -38,8 +38,16 @@ Python e dependencias sozinho a partir do `pyproject.toml` -- necessario porque
 forma portatil.
 
 ```bash
-npx mcpb pack . solidworks-mcp-5.12.0.mcpb
+npx @anthropic-ai/mcpb pack . solidworks-mcp-5.18.0.mcpb
 ```
+
+O nome do pacote e **escopado**: `npx mcpb pack` falha com 404 (`mcpb` nao
+existe no registro npm), o que este README mandava fazer ate a v5.18.0.
+O `pack` valida o `manifest.json` antes de empacotar e respeita o
+`.mcpbignore` -- confira na listagem que `gear_geometry.py`, `alfa_drawing.py` e
+os onze arquivos de `.claude/knowledge/` entraram: o `server.py` importa os dois
+primeiros e expoe os outros como resources, entao um pacote sem eles instala e
+quebra em uso.
 
 Abra o SolidWorks (opcional -- o servidor consegue abrir sozinho) e peca para o
 Claude "conectar ao SolidWorks".
@@ -88,6 +96,21 @@ catalogo, mas permanece bloqueada ate
 `create_3d_sketch`, `draw_line`, `draw_line_3d`, `draw_circle`, `draw_rectangle`,
 `draw_arc`, `draw_polygon`, `add_sketch_dimension`, `add_sketch_relation`
 
+`draw_profile` (v5.18.0) e o caminho para qualquer **curva calculada** --
+involuto, lei de came, dente de polia HTD, trocoide, aerofolio: desenha a
+cadeia inteira com o motor de inferencia **desligado** (`SetAddToDB`) numa
+unica chamada e **confere a posicao de cada vertice** lida de volta do
+SolidWorks. Marcada EXP pelo mesmo motivo que `create_spur_gear` (o caminho
+COM nao foi rodado nesta instalacao); a diferenca e que agora uma geometria
+deslocada aparece em `displaced_points` em vez de virar peca errada.
+
+> Correcao de premissa (v5.18.0): o risco do snap de esboco **nao** e "peca
+> grande, feature pequena". O motor de inferencia junta um ponto novo ao ponto
+> **vizinho que ja existe** quando os dois estao a poucos pixels -- logo o que
+> decide e o **espacamento entre pontos consecutivos do proprio perfil**. Um
+> flanco involuto amostrado a 0,3 mm colapsa numa engrenagem de 44 mm, onde
+> nao ha peca grande nenhuma. Ver `.claude/knowledge/verificacao_e_qa.md`.
+
 ### Features 3D -- OK
 `extrude_sketch`, `cut_extrude`, `revolve_sketch`, `sweep_sketch`,
 `loft_sketches`, `fillet_edges`, `chamfer_edges`, `shell_body`,
@@ -116,6 +139,23 @@ instalacao, nao no codigo -- nao e encontrada),
 `create_reference_axis` (EXP -- InsertAxis2 depende de selecao valida),
 `combine_bodies` (EXP -- corpos precisam se tocar/interseccionar),
 `split_body` (EXP -- fluxo Pre/PostSplitBody), `add_rib` (EXP)
+
+### Engrenagens
+`create_spur_gear` (EXP -- ver a ressalva abaixo)
+
+A geometria do dente e **testada**: `gear_geometry.py` e Python puro e
+`tests/test_gear_geometry.py` tem 113 testes que conferem o involuto contra a
+sua propria definicao, a espessura pi*m/2 na circunferencia primitiva (a
+condicao de engrenamento), a tangencia do raio de pe, o fechamento do contorno
+e a prova de que ele nao pode se autointersectar. O que **nao** foi rodado
+nesta instalacao e o caminho COM: `SetAddToDB(True)` + umas 500 chamadas de
+`CreateLine2` num unico esboco. Por isso EXP, e nao OK.
+
+A propria ferramenta mede o resultado: compara o volume real do solido com o
+volume analitico do contorno e devolve `verified`, mais um `teeth_present` que
+existe so pra pegar o disco liso. Ou seja, se o caminho COM falhar nesta
+instalacao, a falha vem reportada em vez de silenciosa -- que era exatamente o
+problema. Para confirmar ao vivo: `python tests/run_gear_live_test.py`.
 
 ### Montagem
 `insert_component` (OK -- posicao conferida: devolve `actual_position` lido do
@@ -225,7 +265,12 @@ flat/folded).
 `add_cosmetic_thread` (EXP), `add_thread_feature` (delega para rosca cosmetica --
 roscas 3D reais NAO sao expostas pela API do SolidWorks),
 `create_helix` (EXP -- `InsertHelix` retorna None via COM nesta versao),
-`create_knurl` (EXP -- Wrap+Deboss).
+`create_knurl` (EXP -- Wrap+Deboss; desde a v5.18.0 desenha as celulas com a
+inferencia desligada e **confere cada vertice**: a celula tem 0,2 mm de largura
+com vertices a 0,1 mm, tres vezes mais apertado que o dente de engrenagem que
+colapsava, e a unica checagem era "o Wrap nao voltou None" -- uma celula
+achatada gravava nada e reportava sucesso. A PROFUNDIDADE gravada continua sem
+medicao: o Wrap nao expoe valor pra ler de volta, e o retorno diz isso).
 
 ### Desenho tecnico detalhado -- parcial
 `add_drawing_annotation` (OK), `insert_drawing_view` (OK -- validado ao vivo
@@ -283,18 +328,125 @@ nao esta disponivel", inclusive `connect_solidworks`, porque o caminho de
 reconexao nunca era alcancado. Agora `_com_is_alive()` invoca a chamada de
 fato, e o mesmo padrao de no-op foi corrigido no rebuild de `shell_body`.
 
-### Novas em v5.17.0 (dentes de engrenagem)
+### Novas em v5.19.0 (caixa de engrenagens: o que o teste ao vivo mostrou)
 
-- **`create_gear`**: engrenagem cilindrica de dentes retos com evolvente real
-  (blanco + um vao de dente + padrao circular), furo e rasgo de chaveta
-  opcionais. `phase` gira o primeiro vao; para duas engrenagens engrenarem, a
-  conduzida usa `phase = 180 + 180/dentes`.
-- **`draw_spline` corrigido no SolidWorks 2025 (API 33.4)**: `CreateSpline3`
-  le o array como triplas (x, y, z), nao pares. Com pares, 3 pontos viravam uma
-  reta e 10 pontos um emaranhado de 139 mm. Agora envia `x, y, 0`.
-- Contorno fechado por extremidades **identicas**: arcos calculados com
-  seno/cosseno diferem do spline arredondado em ~5e-8 m (acima da resolucao de
-  1e-8 m do SolidWorks) e o contorno fica aberto — corte e boss recusam.
+Testado ao vivo no SolidWorks 2025 (API 33.4) montando uma caixa de dois
+estagios (relatorio: `RELATORIO_CAIXA_ENGRENAGENS.md`).
+
+- **`create_spur_gear` ganhou o que a caixa precisava** (e `create_gear`, que
+  delega a ele, repassa): `phase` gira o contorno dentado em torno do eixo — o
+  motor fica em `phase = 0` (dente sobre +X) e a engrenagem conduzida, do lado
+  +X dele, usa `phase = 180 + 180/dentes` para ter um vao de frente para cada
+  ponta de dente; sem isso duas engrenagens de dentes pares batem dente contra
+  dente. `keyway_width`/`keyway_depth` abrem o rasgo de chaveta (lado +Y) com o
+  mesmo primitivo a prova de snap, e o volume esperado da verificacao ja o
+  desconta.
+- **`draw_spline` corrigido na API 33.4**: `CreateSpline3` le o array como
+  triplas (x, y, z), nao pares. Com pares, 3 pontos viravam uma reta e 10 pontos
+  um emaranhado de 139 mm. Agora envia `x, y, 0`.
+- Aprendizado do teste ao vivo: um contorno so fecha se as extremidades forem
+  numericamente **identicas** (arcos por seno/cosseno diferem do spline
+  arredondado em ~5e-8 m, acima da resolucao de 1e-8 m, e corte/boss recusam).
+  O `create_spur_gear` ja evita isso, pois desenha um unico contorno com a
+  inferencia desligada.
+
+### Novas em v5.18.0 (a classe inteira, nao uma forma: 155 -> 157)
+
+A v5.17.0 consertou **uma** forma. A analise do que mais sofria da mesma falha
+mostrou que o problema era outro, e maior.
+
+**1. O criterio documentado do snap estava errado.** `verificacao_e_qa.md` dizia
+"peca grande, feature pequena". Mas a engrenagem saia lisa numa peca de
+**44 mm** -- nao havia peca grande ali. O que o motor de inferencia junta e um
+ponto novo que cai a poucos pixels de um ponto **que ja esta no esboco**: o que
+decide e o **espacamento entre pontos consecutivos do perfil**, nao o tamanho da
+feature nem o da peca. Dente involuto amostrado a 0,3 mm num pinhao de 44 mm =
+0,7% da vista, dentro do raio de snap em qualquer zoom normal. Isso reclassifica
+todo perfil que seja **curva amostrada**, nao so engrenagem.
+
+**2. `draw_profile`** -- o primitivo que faltava. Recebe os pontos de uma curva
+calculada e desenha a cadeia inteira com a inferencia desligada, numa chamada
+(antes: 200 chamadas de `draw_line` pelo motor de inferencia, ou `draw_spline`,
+que verificava so as duas pontas). Depois **le cada vertice de volta** e compara:
+`max_point_deviation`, `displaced_points` com indice, `verified`. Perfil com
+segmento faltando nao volta, levanta erro -- perfil incompleto e perfil aberto.
+`create_spur_gear` foi refatorado para usar o mesmo primitivo, e agora **recusa**
+extrudar um perfil deslocado em vez de so avisar.
+
+**3. Tres falhas silenciosas achadas na auditoria, todas da mesma familia:**
+
+- **`create_knurl` estava quebrado** (ou a um zoom de estar): celulas de 0,2 mm
+  com vertices a 0,1 mm desenhadas direto pelo `SketchManager`, e a unica
+  verificacao era `InsertWrapFeature2 != None`. Uma celula achatada gravava nada
+  e a ferramenta dizia sucesso. Agora desenha pelo primitivo e confere vertice
+  por vertice.
+- **`draw_spline` verificava so as pontas** -- justamente os dois pontos que o
+  snap tem menos chance de mover. Um ponto de controle **interior** deslocado
+  deixava as duas pontas certas e a curva deformada voltava `verified: true`.
+  Agora le os pontos de controle de volta (`interior_points`); quando o
+  SolidWorks nao os expoe, o retorno diz que o interior esta **nao verificado**,
+  em vez de deixar as pontas passarem por prova.
+- **Canaletas de anel do `create_automotive_piston`:** dois circulos a 3 mm um do
+  outro, ambos pelo motor de inferencia. `draw_circle` ja media o proprio raio;
+  ninguem lia. Agora le, e levanta erro se a canaleta saiu rasa ou colapsada.
+
+**4. `create_gear` virou delegacao.** Um `create_gear` entrou na `main` em
+paralelo com este trabalho, construindo a engrenagem do jeito que se modela a
+mao: blank no diametro de topo, UM vao de dente involuto cortado, e
+`circular_pattern` desse corte. A aritmetica do involuto nele estava **certa** --
+nao era bug de matematica. O que faltava eram as duas coisas desta versao: os
+flancos iam por `CreateSpline3`, ou seja pelo motor de inferencia (12 amostras
+num flanco de 4,5 mm = pontos a 0,4 mm, dentro do raio de snap), e a unica
+verificacao era "o pattern nao voltou None" -- um vao achatado, repetido 20
+vezes, e um blank, e nada olhava. O nome continua (quem ja chamava `create_gear`
+nao quebra, e os argumentos e as chaves de retorno antigas seguem iguais), mas
+agora ele chama `create_spur_gear`. `tooth_gap_feature` volta `None`: nao existe
+corte-semente pra nomear, porque os dentes nao sao feitos cortando um.
+
+**5. Posicao das pecas na montagem.** `create_automotive_piston_assembly` nao
+tem mates por projeto -- os cinco offsets sao a unica coisa que posiciona as
+pecas. O `insert_component` ja devolvia `actual_position`/`deviation`/`verified`
+de cada uma, lido do SolidWorks; nada lia. Agora cada colocacao e conferida, a
+ferramenta levanta erro se alguma peca nao chegou onde foi posta, e o retorno
+traz `component_positions` com a pose medida de todas. O `position_check` tambem
+diz o que esperar do `verify_assembly_positions` aqui: M01 nos cinco (montagem
+deliberadamente sem mates) e M03 em `connecting_rod`/`wrist_pin`/`bearing`, que
+sao modeladas no lugar e compartilham a origem de insercao de proposito.
+
+### Novas em v5.17.0 (a engrenagem tem dentes, 154 -> 155)
+
+**O sintoma:** toda engrenagem modelada aqui saia lisa. Um cilindro com furo.
+
+**Nao era um bug, era a aritmetica.** Um flanco involuto precisa de uma duzia
+de pontos a decimos de milimetro um do outro. Toda chamada `draw_*` passa pelo
+motor de inferencia do SolidWorks, cujo raio de snap e medido em **pixels de
+tela** (ver "O esboco e onde o erro nasce" em
+`.claude/knowledge/verificacao_e_qa.md`), e dois pontos em escala de dente, um
+do lado do outro, e exatamente o que esse motor junta -- **movendo** o ponto,
+sem erro nenhum. O perfil do vao de dente chegava degenerado ao `cut_extrude`,
+e um vao achatado repetido 20 vezes pelo `circular_pattern` e um disco de novo.
+Nenhuma das 154 ferramentas avisava: `validate_model` passava, `measure_body`
+devolvia uma massa plausivel, e a peca era entregue como engrenagem.
+
+**O conserto:** `create_spur_gear`. O contorno **inteiro** -- todos os dentes,
+fechado -- e calculado analiticamente em `gear_geometry.py` (ISO 53, altura
+cheia: adendo 1,0*m, dedendo 1,25*m, 20 graus, sem correcao de perfil) e
+desenhado como **um** perfil com o motor de inferencia desligado
+(`SetAddToDB`), depois extrudado uma vez. Sem corte, sem padrao, nada pra
+snapar. Inclui raio de pe tangente (0,38*m, o raio de ponta do cremalheira da
+ISO 53), furo de eixo opcional e a distancia entre centros pro par engrenar.
+
+**E ele se mede.** A secao transversal exata do contorno e conhecida, entao o
+volume real do solido extrudado e comparado com ela: `verified` so vem `true`
+quando fecham dentro de `volume_tolerance`, e `teeth_present` e uma checagem
+separada e mais grosseira de que o material dos vaos saiu mesmo do blank --
+essa e a que pega "saiu lisa". Nao da pra uma engrenagem sair lisa e ser
+reportada como pronta.
+
+Limites declarados na docstring: so engrenagem cilindrica de dentes retos,
+externa, sem correcao de perfil. Helicoidal, interna, conica, coroa/rosca sem
+fim e chanfro de topo ficam de fora -- e, como sempre, nao ha FEA aqui pra
+conferir resistencia do dente.
 
 ### Novas em v5.16.0 (movimento: a mate de mecanismo conferida)
 
@@ -473,7 +625,7 @@ que deve ficar livre.
 - Late binding (dispatch dinamico) -- igual ao ambiente do Claude Desktop.
 
 ### Camada de metodologia (design-sandbox): instructions, resource e prompt
-As 150 ferramentas sao primitivas; sozinhas nao ensinam a IA a projetar bem.
+As 157 ferramentas sao primitivas; sozinhas nao ensinam a IA a projetar bem.
 O servidor expoe as outras duas primitivas do protocolo MCP para cobrir essa
 lacuna, codificando o metodo ja validado nas replicas de engenharia deste
 projeto (ver `RELATORIO_TESTES.md`) em vez de depender de disciplina manual
@@ -499,8 +651,9 @@ arquivos agora sao expostos tambem como resources
 `solidworks://knowledge/index` + `solidworks://knowledge/<topico>` (materiais,
 tolerancias-e-ajustes, gdt, elementos-de-maquina, chapa-metalica,
 soldas-e-perfis-estruturais, processos-de-fabricacao, verificacao-e-qa,
-roteiro-projetista, montagens-mecanicas-reais -- este ultimo adicionado em
-04/10/2026) -- mesma fonte, lida ao vivo, para os dois clientes
+roteiro-projetista, montagens-mecanicas-reais -- este adicionado em
+04/10/2026 --, engrenagens -- adicionado em 06/10/2026) -- mesma fonte, lida
+ao vivo, para os dois clientes
 nunca divergirem. Cobrem o que a IA precisa saber pra projetar como um
 projetista/engenheiro de verdade (nao so "como chamar a ferramenta"):
 material certo por aplicacao, ajuste ISO entre furo e eixo, GD&T, dimensao

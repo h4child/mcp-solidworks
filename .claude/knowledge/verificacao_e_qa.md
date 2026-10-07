@@ -27,8 +27,40 @@ aleatório. A recusa é a falha **ruidosa**. A **silenciosa** é a perigosa:
 quando o snap apenas *desloca* um ponto para um vértice vizinho, a chamada tem
 sucesso e devolve um segmento válido no lugar errado.
 
+**O critério NÃO é "peça grande, feature pequena" (corrigido na v5.18.0).**
+Essa era a leitura da tabela acima, e ela é incompleta. O que o motor junta é um
+ponto novo que cai a poucos pixels de um ponto **que já está no esboço** — então
+o que decide é o **espaçamento entre os pontos consecutivos do próprio perfil**,
+não o tamanho da feature nem o da peça. Prova: a engrenagem saía lisa numa peça
+de **44 mm**, onde não há peça grande nenhuma. O dente inteiro tem 4,5 mm (10%
+da vista, confortável); as amostras do flanco involuto estão a 0,3 mm uma da
+outra (0,7% da vista, dentro do raio de snap em qualquer zoom normal). O dente
+"cabia" e colapsava do mesmo jeito.
+
+Consequência prática: **toda curva amostrada corre esse risco**, em peça de
+qualquer tamanho — involuto, lei de came, dente de polia HTD/GT2, vão de roda
+dentada, trocoide, perfil de rosca, aerofólio, seção digitalizada de um desenho.
+
+**A saída, e ela é uma só: `draw_profile`.** Calcule a curva, passe a lista de
+pontos, e ela desenha a cadeia inteira com o motor de inferência **desligado**
+(`SetAddToDB`) numa única chamada — nada pode snapar — e depois **lê cada
+vértice de volta** do SolidWorks e compara: `max_point_deviation`,
+`displaced_points` com índice, `verified`. Se faltar segmento, ela levanta erro
+em vez de devolver: perfil incompleto é perfil aberto, e a extrusão seguinte
+falharia com uma mensagem muito pior. Chame uma vez por contorno fechado (duas
+chamadas = contorno externo + furo no mesmo esboço).
+
+Não use `draw_line` em laço (200 round-trips, todos pelo motor de inferência) e
+não use `draw_spline` para curva calculada — ela verifica os pontos de controle
+desde a v5.18.0, mas continua passando pelo motor de inferência, então o erro é
+detectado, não evitado. Spline é para forma livre (transição ergonômica, linha
+de estilo). Para engrenagem, nem uma nem outra: `create_spur_gear`.
+
 **O que fazer:**
 
+0. Se a geometria é uma **curva calculada**, use `draw_profile` e pare aqui —
+   os itens abaixo são sobre conviver com o motor de inferência, e o
+   `draw_profile` não passa por ele.
 1. Leia o campo **`snapped`** no retorno de qualquer `draw_*`. `snapped: true`
    significa que a geometria foi criada e o SolidWorks a pôs em outro lugar —
    apague e redesenhe, não compense no passo seguinte.
@@ -45,6 +77,13 @@ sucesso e devolve um segmento válido no lugar errado.
    falam de sólido, e sólido só existe depois da extrusão.
 5. Peça grande + feature pequena: `zoom_to_area` na região **antes** de
    desenhar. Barato, e evita a recusa.
+
+**Spline:** `draw_spline` reporta `interior_points` desde a v5.18.0. Um ponto de
+controle **interior** deslocado deixa as duas pontas exatamente onde foram
+pedidas — era o caso em que a curva saía deformada e o retorno dizia
+`verified: true`. Se `interior_points.verified` vier **`None`**, o SolidWorks não
+expôs os pontos de controle nesta versão: o interior está **não verificado**, não
+está certo.
 
 **Centerline:** `draw_centerline` devolve `is_construction`. Se vier `false`, o
 `revolve_sketch` não aceita aquilo como eixo — e se o perfil fechar em volta

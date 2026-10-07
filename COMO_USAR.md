@@ -46,7 +46,7 @@ mais.
 
 ## Passo 2 — Instalar o programa
 
-1. Dê **dois cliques** no arquivo `solidworks-mcp-5.12.0.mcpb`
+1. Dê **dois cliques** no arquivo `solidworks-mcp-5.18.0.mcpb`
 2. O Claude Desktop vai abrir e mostrar uma tela de instalação
 3. Clique em **Instalar**
 4. **Feche o Claude Desktop completamente** e abra de novo
