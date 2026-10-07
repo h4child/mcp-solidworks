@@ -1,7 +1,7 @@
 # SolidWorks MCP Server
 
 Servidor MCP em Python que controla o SolidWorks via COM (`win32com`), escrito
-com o SDK oficial (`mcp`, usando `FastMCP`). **150 ferramentas** (v5.13.0).
+com o SDK oficial (`mcp`, usando `FastMCP`). **151 ferramentas** (v5.17.0).
 
 ## Para quem so quer usar
 
@@ -282,6 +282,19 @@ fechar e reabrir o SolidWorks, *todas* as chamadas falhavam com "O servidor RPC
 nao esta disponivel", inclusive `connect_solidworks`, porque o caminho de
 reconexao nunca era alcancado. Agora `_com_is_alive()` invoca a chamada de
 fato, e o mesmo padrao de no-op foi corrigido no rebuild de `shell_body`.
+
+### Novas em v5.17.0 (dentes de engrenagem)
+
+- **`create_gear`**: engrenagem cilindrica de dentes retos com evolvente real
+  (blanco + um vao de dente + padrao circular), furo e rasgo de chaveta
+  opcionais. `phase` gira o primeiro vao; para duas engrenagens engrenarem, a
+  conduzida usa `phase = 180 + 180/dentes`.
+- **`draw_spline` corrigido no SolidWorks 2025 (API 33.4)**: `CreateSpline3`
+  le o array como triplas (x, y, z), nao pares. Com pares, 3 pontos viravam uma
+  reta e 10 pontos um emaranhado de 139 mm. Agora envia `x, y, 0`.
+- Contorno fechado por extremidades **identicas**: arcos calculados com
+  seno/cosseno diferem do spline arredondado em ~5e-8 m (acima da resolucao de
+  1e-8 m do SolidWorks) e o contorno fica aberto — corte e boss recusam.
 
 ### Novas em v5.16.0 (movimento: a mate de mecanismo conferida)
 

@@ -4677,8 +4677,6 @@ async def draw_spline(points: list[list[float]], natural_ends: bool = True,
             if not isinstance(point, (list, tuple)) or len(point) != 2:
                 raise ValueError(f"points[{index}] must be an [x, y] pair.")
             x, y = point
-            # CreateSpline3 expects XY pairs for a 2D sketch. Supplying Z
-            # values shifts every following point and makes the profile fail.
             flattened.extend((to_meters(float(x), unit), to_meters(float(y), unit)))
 
         doc = _active_doc()
@@ -4692,8 +4690,14 @@ async def draw_spline(points: list[list[float]], natural_ends: bool = True,
         status = win32com.client.VARIANT(pythoncom.VT_VARIANT | pythoncom.VT_BYREF, None)
         # Dynamic dispatch otherwise converts a Python tuple into SAFEARRAY of
         # VARIANT. SolidWorks 2025 requires SAFEARRAY(double) for PointData.
+        # PointData is read as (x, y, z) TRIPLES even for a 2D sketch: confirmed
+        # live on SolidWorks 2025 (API 33.4) -- XY pairs were reinterpreted as
+        # triples, so a 3-point spline came back as a 2-point straight line
+        # (length sqrt(5^2+20^2) instead of ~22) and a 10-point involute flank
+        # as a 139 mm tangle of loops.
         point_data = win32com.client.VARIANT(
-            pythoncom.VT_ARRAY | pythoncom.VT_R8, flattened
+            pythoncom.VT_ARRAY | pythoncom.VT_R8,
+            [c for xy in zip(flattened[0::2], flattened[1::2]) for c in (*xy, 0.0)],
         )
         # CreateSpline3's 4th argument is IsPeriodic (True = closed-loop
         # spline), not "natural ends". Passing natural_ends straight through
@@ -7175,6 +7179,9 @@ async def create_gear(
     bore_diameter: float = 0.0,
     plane: str = "front",
     unit: Optional[str] = None,
+    phase: float = 0.0,
+    keyway_width: float = 0.0,
+    keyway_depth: float = 0.0,
 ) -> dict:
     """Create a standard external spur gear with true involute teeth.
 
@@ -7189,9 +7196,19 @@ async def create_gear(
     pressure_angle: 14.5-30 degrees (20 is the modern standard).
     bore_diameter: optional center bore (0 = no bore).
     plane: 'front', 'top' or 'right'; the gear axis is that plane's normal.
+    phase: angle in degrees of the first tooth GAP centre, measured from the
+    sketch +X axis (0 = a gap on +X). Two gears on a line of centres mesh
+    when the driven one is built with phase = 180 + 180/teeth_of_that_gear.
+    keyway_width/keyway_depth: optional hub keyway on the sketch +Y side
+    (needs a bore); depth is measured from the bore surface outward.
 
     Proportions are the standard full-depth system: addendum = 1 module,
-    dedendum = 1.25 module. Open an empty part first (create_new_part)."""
+    dedendum = 1.25 module. Open an empty part first (create_new_part).
+
+    The gap profile is closed with straight chords whose endpoints are the
+    SAME numbers as the spline ends: sin/cos-computed arc ends differ from the
+    rounded spline ends by ~5e-8 m, above SolidWorks' 1e-8 m resolution, and
+    the contour then stays open (cut/boss refuse it)."""
 
     def _impl():
         if module <= 0:
@@ -7229,6 +7246,23 @@ async def create_gear(
         if len(plus) < 2:
             raise RuntimeError("_gear_flank_points returned fewer than two points.")
         minus = [(x, -y) for x, y in plus]
+        theta_root = math.atan2(plus[0][1], plus[0][0])
+        root_plus = (r_root * math.cos(theta_root), r_root * math.sin(theta_root))
+        root_minus = (root_plus[0], -root_plus[1])
+
+        if phase:
+            cp, sp = math.cos(math.radians(phase)), math.sin(math.radians(phase))
+
+            def _rot(p):
+                return (p[0] * cp - p[1] * sp, p[0] * sp + p[1] * cp)
+
+            plus = [_rot(p) for p in plus]
+            minus = [_rot(p) for p in minus]
+            root_plus, root_minus = _rot(root_plus), _rot(root_minus)
+        if keyway_width < 0 or keyway_depth < 0 or (keyway_width > 0) != (keyway_depth > 0):
+            raise ValueError("keyway_width and keyway_depth must both be positive, or both 0.")
+        if keyway_width > 0 and bore_diameter <= 0:
+            raise ValueError("A keyway needs a bore_diameter.")
 
         doc = _active_doc()
         empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
@@ -7241,17 +7275,15 @@ async def create_gear(
             _remember_active_sketch(doc)
 
         def _spline(points):
-            flat = [c for p in points for c in p]
+            flat = [c for p in points for c in (p[0], p[1], 0.0)]
             data = win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, flat)
             status = win32com.client.VARIANT(pythoncom.VT_VARIANT | pythoncom.VT_BYREF, None)
             if doc.SketchManager.CreateSpline3(data, None, None, False, status) is None:
                 raise RuntimeError("SolidWorks could not create an involute flank spline.")
 
-        def _arc(radius, half_angle):
-            p1 = (radius * math.cos(-half_angle), radius * math.sin(-half_angle))
-            p2 = (radius * math.cos(half_angle), radius * math.sin(half_angle))
-            if doc.SketchManager.CreateArc(0, 0, 0, p1[0], p1[1], 0, p2[0], p2[1], 0, 1) is None:
-                raise RuntimeError("SolidWorks could not create a gear arc.")
+        def _line(a, b):
+            if doc.SketchManager.CreateLine(a[0], a[1], 0, b[0], b[1], 0) is None:
+                raise RuntimeError("SolidWorks could not create a tooth gap line.")
 
         # 1) Blank cylinder at the addendum diameter.
         _open_sketch()
@@ -7268,20 +7300,17 @@ async def create_gear(
         if blank is None:
             raise RuntimeError("Gear blank extrusion failed.")
 
-        # 2) One tooth gap: two involute flanks, root arc, outer closing arc.
+        # 2) One tooth gap: two involute flanks, root chord, outer closing chord.
         _open_sketch()
         _spline(plus)
         _spline(minus)
-        theta_root = math.atan2(plus[0][1], plus[0][0])
         if r_root < r_base:
-            for sign in (1, -1):
-                if doc.SketchManager.CreateLine(
-                    r_root * math.cos(sign * theta_root), r_root * math.sin(sign * theta_root), 0,
-                    plus[0][0], sign * plus[0][1], 0,
-                ) is None:
-                    raise RuntimeError("Could not draw the radial root line of the tooth gap.")
-        _arc(r_root, theta_root)
-        _arc(r_cut_end, math.atan2(plus[-1][1], plus[-1][0]))
+            _line(plus[0], root_plus)
+            _line(root_plus, root_minus)
+            _line(root_minus, minus[0])
+        else:
+            _line(plus[0], minus[0])
+        _line(plus[-1], minus[-1])
         doc.InsertSketch2(True)
         _select_last_sketch(doc)
         cut = doc.FeatureManager.FeatureCut4(
@@ -7327,6 +7356,28 @@ async def create_gear(
             if bore is None:
                 raise RuntimeError("Bore cut failed.")
 
+        # 5) Optional keyway: a closed rectangle from inside the bore to
+        # bore_r + keyway_depth, on the +Y side.
+        if keyway_width > 0:
+            half_w = to_meters(keyway_width, unit) / 2.0
+            top = bore_r + to_meters(keyway_depth, unit)
+            corners = [(-half_w, 0.0), (half_w, 0.0), (half_w, top), (-half_w, top)]
+            _open_sketch()
+            for a, b in zip(corners, corners[1:] + corners[:1]):
+                _line(a, b)
+            doc.InsertSketch2(True)
+            _select_last_sketch(doc)
+            slot = doc.FeatureManager.FeatureCut4(
+                True, False, False, 2, 0, 0.0, 0,
+                False, False, False, False, 0.0, 0.0,
+                False, False, False, False,
+                False, True, True,
+                False, False, False,
+                0, 0.0, False, False,
+            )
+            if slot is None:
+                raise RuntimeError("Keyway cut failed.")
+
         active_unit, factor = _unit_factor(unit)
         return {
             "module": module, "teeth": teeth, "pressure_angle": pressure_angle,
@@ -7336,6 +7387,8 @@ async def create_gear(
             "root_diameter": 2 * r_root * factor,
             "base_diameter": 2 * r_base * factor,
             "tooth_gap_feature": cut_name,
+            "phase": phase,
+            "keyway": [keyway_width, keyway_depth] if keyway_width > 0 else None,
         }
 
     return await _run(_impl)
