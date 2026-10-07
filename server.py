@@ -42,6 +42,11 @@ from pydantic import ConfigDict
 # SolidWorks open -- see tests/test_alfa_drawing.py.
 import alfa_drawing as ad
 
+# Involute gear geometry, same reasoning as alfa_drawing: the whole reason a
+# gear came out smooth is arithmetic, not COM, so it lives in plain Python
+# where it can be tested without SolidWorks open -- see tests/test_gear_geometry.py.
+import gear_geometry as gg
+
 # Reject unknown tool arguments instead of silently ignoring them. Without
 # this, FastMCP's default Pydantic config (extra="ignore") means a caller
 # that misspells a parameter name (e.g. "x_center" instead of "cx") gets no
@@ -243,6 +248,14 @@ _BATCH_EXPORT_TIMEOUT_SECONDS = 900
 # the assembly-scale or the plain read/feature budget below.
 TIMEOUT_BUDGET_OVERRIDES = {
     "connect_solidworks": 240,
+    # One gear profile is 20-30 sketch segments per tooth, so a 40-tooth gear
+    # is over a thousand CreateLine2 calls in a single COM call. That is slow
+    # by construction, not stuck, and the 60s feature budget would cut it off
+    # halfway through an open profile.
+    "create_spur_gear": 300,
+    # Same reason: draw_profile is one COM call that draws, and then reads back,
+    # as many segments as the caller computed.
+    "draw_profile": 300,
 }
 
 # Reading the whole assembly tree, cross-component interference or a
@@ -1367,6 +1380,286 @@ def _sketch_create(doc, create, extents_m, what: str):
                    "something else is wrong: check get_sketch_status and "
                    "list_sketch_entities.")))
     return retried, True
+def _sketch_segment_endpoints(raw_segment) -> list:
+    """The (x, y) ends of one sketch segment, in metres.
+
+    The lean counterpart of _sketch_segment_geometry: no type, no radius, no
+    unit conversion. Reading back a 500-segment profile means thousands of COM
+    calls, so this reads the two points and nothing else.
+    """
+    segment = win32com.client.Dispatch(raw_segment)
+    ends = []
+    for member in ("GetStartPoint2", "GetEndPoint2"):
+        try:
+            raw_point = getattr(segment, member)()
+        except Exception:
+            continue
+        if raw_point is None:
+            continue
+        try:
+            point = win32com.client.Dispatch(raw_point)
+            ends.append((float(_com_member(point, "X")), float(_com_member(point, "Y"))))
+        except Exception:
+            continue
+    return ends
+
+
+def _nearest_stored_point(points_m, tolerance_m: float):
+    """Index stored sketch points for "where did this vertex actually land?".
+
+    A spatial hash rather than a scan: verifying every vertex of a gear is
+    O(n^2) distance tests done naively, and n is in the hundreds. Cell size is
+    the tolerance, so the true nearest point is always in the queried cell or
+    one of its eight neighbours.
+    """
+    cell = max(tolerance_m, 1e-9)
+    buckets: dict = {}
+    for x, y in points_m:
+        buckets.setdefault((int(math.floor(x / cell)), int(math.floor(y / cell))), []).append((x, y))
+
+    def nearest(x: float, y: float):
+        cx, cy = int(math.floor(x / cell)), int(math.floor(y / cell))
+        best, best_distance = None, float("inf")
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for candidate in buckets.get((cx + dx, cy + dy), ()):
+                    distance = math.dist((x, y), candidate)
+                    if distance < best_distance:
+                        best, best_distance = candidate, distance
+        return best, best_distance
+
+    return nearest
+
+
+def _draw_profile_points(doc, points_m, closed: bool, tolerance_m: float,
+                         verify_points: bool = True) -> dict:
+    """Draw a computed polyline with the sketch inference engine OFF, and
+    measure where every vertex actually landed.
+
+    This is the one safe way to put an analytically computed engineering
+    profile into a sketch, and the reason it exists is worth stating next to
+    the code: every ``ISketchManager.Create*`` call runs through SolidWorks'
+    inference engine, whose snap radius is a distance in SCREEN PIXELS. What
+    that engine collapses is a new point lying within a few pixels of a point
+    that is already there -- so the thing that decides whether a profile
+    survives is the spacing between its own consecutive vertices, NOT the size
+    of the feature and NOT the size of the part. An involute flank sampled
+    every 0.3 mm on a 44 mm gear is inside the snap radius at any normal zoom,
+    which is why gears came out smooth on parts small enough that nobody
+    thought to suspect the sketch.
+
+    ``SetAddToDB(True)`` writes geometry straight into the sketch database,
+    skipping inference and automatic relations entirely. The vertices then land
+    exactly where they were computed -- and this function proves it rather than
+    assuming it, by reading the stored ends back out and comparing.
+
+    The question it asks of each requested vertex is "is there a stored vertex
+    here?", against every segment in the sketch rather than only the new ones.
+    That is what makes it ordering-independent and safe to call several times
+    into one sketch (outer contour, then a bore). It has one blind spot, worth
+    knowing and not worth closing: if a DIFFERENT loop already happens to own a
+    vertex within ``tolerance_m`` of this one, a point that moved could match
+    that neighbour instead -- which means two loops sharing a vertex position,
+    degenerate geometry on its own terms.
+
+    Returns the measurement; raises when the profile came out incomplete,
+    because an incomplete profile is an open one and the extrusion that follows
+    would fail with a far less useful message.
+    """
+    sketch = _active_sketch(doc)
+    if len(points_m) < 2:
+        raise ValueError("A profile needs at least two points.")
+    chain = list(zip(points_m, points_m[1:] + points_m[:1])) if closed \
+        else list(zip(points_m, points_m[1:]))
+    before = len(_sketch_segments(sketch))
+
+    returned = 0
+    doc.SetAddToDB(True)
+    doc.SetDisplayWhenAdded(False)
+    try:
+        for (x1, y1), (x2, y2) in chain:
+            if doc.CreateLine2(x1, y1, 0.0, x2, y2, 0.0) is not None:
+                returned += 1
+    finally:
+        # Restored even on failure: left on, every later draw_* in the session
+        # silently loses inference and relations, which is a worse bug than the
+        # one this function fixes.
+        doc.SetDisplayWhenAdded(True)
+        doc.SetAddToDB(False)
+
+    segments = _sketch_segments(sketch)
+    stored = len(segments) - before
+    result = {
+        "points": len(points_m),
+        "closed": bool(closed),
+        "segments_expected": len(chain),
+        "segments_stored": stored,
+        "segments_returned_by_com": returned,
+    }
+    if stored != len(chain):
+        raise RuntimeError(
+            f"the profile should have added {len(chain)} segments to the sketch but "
+            f"{stored} arrived. An incomplete profile is an open profile and cannot be "
+            f"extruded: close the sketch, delete it, and redraw with fewer points, or "
+            f"check that the sketch was empty of conflicting geometry."
+        )
+
+    if not verify_points:
+        result["points_verified"] = 0
+        result["verified"] = None
+        result["verification_skipped"] = (
+            "verify_points=False: the vertices were not read back, so nothing here "
+            "says they landed where they were computed")
+        result["warnings"] = []
+        return result
+
+    stored_ends = []
+    unreadable = 0
+    for raw_segment in segments:
+        ends = _sketch_segment_endpoints(raw_segment)
+        if len(ends) < 2:
+            unreadable += 1
+        stored_ends.extend(ends)
+    nearest = _nearest_stored_point(stored_ends, tolerance_m)
+
+    displaced = []
+    worst = 0.0
+    # The hash only looks one cell out, so a vertex displaced by much more than
+    # the tolerance misses every bucket. Reporting that as "not found" would
+    # hide the number that matters -- how far it actually went -- so a miss
+    # falls back to a full scan. Budgeted, because once dozens of vertices have
+    # moved the profile is already condemned and the exact distances stop
+    # earning their O(n^2).
+    scans_left = 64
+    for index, (x, y) in enumerate(points_m):
+        _, distance = nearest(x, y)
+        if distance == float("inf") and stored_ends and scans_left > 0:
+            scans_left -= 1
+            distance = min(math.dist((x, y), candidate) for candidate in stored_ends)
+        if distance == float("inf"):
+            displaced.append({"index": index, "requested_m": [x, y], "distance_m": None})
+            continue
+        worst = max(worst, distance)
+        if distance > tolerance_m:
+            displaced.append({"index": index, "requested_m": [x, y],
+                              "distance_m": distance})
+    result["points_verified"] = len(points_m)
+    result["max_point_deviation_m"] = worst
+    result["displaced_points"] = displaced[:8]
+    result["displaced_point_count"] = len(displaced)
+    result["unreadable_segments"] = unreadable
+    result["snapped"] = bool(displaced)
+    result["verified"] = not displaced and unreadable == 0
+    warnings = []
+    if displaced:
+        unmatched = sum(1 for item in displaced if item["distance_m"] is None)
+        # Millimetres, not the metres this function works in: the message is
+        # read by whoever has to act on it, and every dimension they typed was
+        # in millimetres.
+        measured = (f"worst {worst * 1000.0:.4g} mm" if worst > 0.0
+                    else "none of them close enough to measure")
+        extra = (f"; {unmatched} of them have no stored vertex anywhere near, so the "
+                 f"geometry went somewhere else entirely" if unmatched else "")
+        warnings.append(
+            f"{len(displaced)} of {len(points_m)} vertices are NOT where they were "
+            f"computed ({measured}){extra}: the profile in the sketch is not the "
+            f"profile that was asked for. Do not extrude it -- delete the sketch "
+            f"and investigate, because the solid would look plausible and be wrong")
+    if unreadable:
+        warnings.append(
+            f"{unreadable} segment(s) would not report their ends, so those vertices "
+            f"are UNCHECKED rather than confirmed")
+    result["warnings"] = warnings
+    return result
+
+
+
+def _spline_interior_check(spline, requested, factor: float, tolerance: float,
+                           unit: Optional[str]) -> dict:
+    """Where the spline's own control points ended up, interior ones included.
+
+    draw_spline could only ever check its two ends, and the ends are the two
+    points the snap is LEAST likely to move: a displaced interior point leaves
+    both ends exactly where they were asked for, so a deformed curve came back
+    ``verified: true``. That matters most for the profiles a spline is actually
+    used for -- a cam displacement law, an airfoil -- where the interior IS the
+    geometry.
+
+    ISketchSpline exposes its points through a Get...Points member whose name
+    and array layout differ between SolidWorks versions, so each candidate is
+    tried and the result is only trusted when it decodes into at least as many
+    points as were requested. When none does, this says the interior is
+    UNCHECKED (``verified: None``) instead of leaving the caller to read the
+    ends as proof of the whole curve.
+    """
+    result = {"requested_points": len(requested), "warnings": []}
+    raw = None
+    for member in ("GetPoints3", "GetPoints2", "GetPoints"):
+        try:
+            value = _com_member(spline, member)
+        except Exception:
+            continue
+        if value:
+            raw, result["read_through"] = list(value), member
+            break
+    if raw is None:
+        result["verified"] = None
+        result["warnings"].append(
+            "the spline's control points could not be read back, so only its two "
+            "ENDS were checked and the interior of the curve is UNVERIFIED -- a "
+            "point moved by the sketch snap would leave both ends correct. For a "
+            "computed curve use draw_profile, which draws with inference off and "
+            "measures every vertex")
+        return result
+
+    numbers = []
+    for item in raw:
+        try:
+            numbers.append(float(item))
+        except (TypeError, ValueError):
+            numbers = []
+            break
+    stored = None
+    for stride in (3, 2):
+        if numbers and len(numbers) % stride == 0 and len(numbers) // stride >= len(requested):
+            stored = [(numbers[i] * factor, numbers[i + 1] * factor)
+                      for i in range(0, len(numbers), stride)]
+            result["decoded_as"] = f"{stride} doubles per point"
+            break
+    if not stored:
+        result["verified"] = None
+        result["warnings"].append(
+            f"the spline returned {len(raw)} value(s) through {result.get('read_through')}, "
+            f"which does not decode into at least the {len(requested)} points that were "
+            f"requested, so the interior of the curve is UNVERIFIED. For a computed "
+            f"curve use draw_profile, which measures every vertex")
+        return result
+
+    result["stored_points"] = len(stored)
+    displaced, worst = [], 0.0
+    for index, point in enumerate(requested):
+        target = (float(point[0]), float(point[1]))
+        distance = min(math.dist(target, candidate) for candidate in stored)
+        worst = max(worst, distance)
+        if distance > tolerance:
+            displaced.append({"index": index, "requested": list(target),
+                              "distance": distance})
+    result["max_deviation"] = worst
+    result["tolerance"] = tolerance
+    result["unit"] = unit or _default_unit
+    result["displaced_points"] = displaced[:8]
+    result["displaced_point_count"] = len(displaced)
+    result["verified"] = not displaced
+    if displaced:
+        interior = [item for item in displaced
+                    if 0 < item["index"] < len(requested) - 1]
+        result["warnings"].append(
+            f"{len(displaced)} of {len(requested)} control points are NOT where they "
+            f"were requested (worst {worst:.6g} {result['unit']}), "
+            f"{len(interior)} of them INTERIOR: the sketch snap moved them and the "
+            f"curve is deformed even where its ends look right. Delete it and use "
+            f"draw_profile for a computed curve")
+    return result
 
 
 def _sketch_verdict(what: str, points, scalars, tolerance: float,
@@ -4667,6 +4960,23 @@ async def draw_spline(points: list[list[float]], natural_ends: bool = True,
     PERIODIC (closed) spline, which loops back through the points instead of
     running through them once. That failure was previously only visible as a
     shape that looked wrong -- see the is_periodic inversion below.
+
+    THE INTERIOR IS CHECKED TOO, and it is the part that matters. The ends are
+    the two points the sketch snap is least likely to move; a displaced
+    INTERIOR control point leaves both ends exactly where they were asked for,
+    so this tool used to call a deformed curve verified. ``interior_points``
+    now reports every control point read back out of the spline, and
+    ``verified`` goes false when any of them moved. SolidWorks does not always
+    expose them: ``interior_points.verified`` comes back None with a reason
+    when they could not be read, which means the interior is UNCHECKED rather
+    than correct.
+
+    FOR A COMPUTED CURVE, PREFER draw_profile. A spline is the right tool for a
+    shape you want smooth and free (an ergonomic transition, a styling line).
+    For a curve you already worked out numerically -- an involute, a cam law,
+    an airfoil -- draw_profile draws the whole chain with the inference engine
+    switched OFF, so nothing can snap in the first place, and it measures every
+    vertex.
     """
 
     def _impl():
@@ -4714,6 +5024,7 @@ async def draw_spline(points: list[list[float]], natural_ends: bool = True,
             "a spline",
         )
         actual = _sketch_segment_geometry(spline, factor)
+        interior = _spline_interior_check(spline, points, factor, tolerance, unit)
         first = (float(points[0][0]), float(points[0][1]), 0.0)
         last = (float(points[-1][0]), float(points[-1][1]), 0.0)
         start, end = _match_endpoints(first, last, actual)
@@ -4747,6 +5058,18 @@ async def draw_spline(points: list[list[float]], natural_ends: bool = True,
                 verdict["verified"] = False
             result["actual_ends_apart"] = ends_apart
         result.update(verdict)
+        # The ends were never the whole story: an INTERIOR control point moved
+        # by the snap leaves both ends where they were asked to be, so the
+        # verdict above would call a deformed curve verified. Fold the interior
+        # reading into it -- including when it could not be read, which is
+        # reported rather than passed over.
+        result["interior_points"] = interior
+        if interior.get("verified") is False:
+            result["verified"] = False
+            result["snapped"] = True
+            result["warnings"] = list(result.get("warnings", ())) + interior["warnings"]
+        elif interior.get("verified") is None:
+            result["warnings"] = list(result.get("warnings", ())) + interior["warnings"]
         return result
 
     return await _run(_impl)
@@ -4835,6 +5158,125 @@ async def draw_polygon(cx: float = 0, cy: float = 0, radius: float = 25, sides: 
                 f"this is not the polygon that was asked for")
             verdict["verified"] = False
         result.update(verdict)
+        return result
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def draw_profile(points: list[list[float]], closed: bool = True,
+                       unit: Optional[str] = None, tolerance: float = 0.01,
+                       verify_points: bool = True) -> dict:
+    """Draw a COMPUTED curve as one chain of segments, snap-proof, in one call.
+
+    This is the tool for any engineering profile you worked out numerically and
+    now have as a list of points: an involute flank, a cycloidal or harmonic cam
+    law, a trochoid, an HTD/GT2 belt-pulley tooth, a chain-sprocket gap, an
+    airfoil, a cross-section digitised off a drawing. Pass the whole outline.
+
+    WHY NOT draw_line IN A LOOP, AND WHY NOT draw_spline. Every
+    ISketchManager.Create* call runs through SolidWorks' sketch inference
+    engine, whose snap radius is a distance in SCREEN PIXELS. What that engine
+    collapses is a new point that falls within a few pixels of a point already
+    in the sketch -- so what decides whether a curve survives is the spacing
+    between its OWN consecutive points, not the size of the feature and not the
+    size of the part. Sampling a curve finely is exactly the condition that
+    triggers it, and it triggers SILENTLY: the point is MOVED and the call
+    succeeds. That is how a 20-tooth gear on a 44 mm blank came out as a smooth
+    disc that rebuilt clean and measured plausibly. draw_spline has the same
+    exposure and can only verify its two end points, so a displaced interior
+    control point passes as verified. 200 draw_line calls also cost 200 round
+    trips.
+
+    This tool switches the inference engine off (SetAddToDB) for the whole
+    chain, so nothing can snap, and it is one call regardless of point count.
+
+    EVERY VERTEX IS MEASURED, NOT ECHOED. The stored segment ends are read back
+    out of SolidWorks and matched against the points that were requested:
+    ``max_point_deviation`` is the worst one, ``displaced_points`` names the
+    offenders with their index, and ``verified`` is true only when every vertex
+    landed inside ``tolerance`` and every segment arrived. A profile short of
+    segments raises instead of returning, because a short profile is an open
+    profile and the extrusion afterwards would fail with a worse message.
+
+    points: [[x, y], ...] in ``unit``, in order along the curve. For a closed
+        outline do NOT repeat the first point -- ``closed=True`` adds the
+        segment back to it.
+    closed: True for a profile to extrude or cut (needs a closed loop), False
+        for an open chain (a sweep path, a construction run of segments).
+    verify_points: leave True. False skips the read-back on a very large
+        profile and says so in the result; nothing then confirms the geometry.
+
+    A sketch must already be open (create_sketch / create_sketch_on_face). Call
+    it once per loop: a second call adds another closed loop to the same sketch,
+    which is how you put a bore, a window or a repeated cell in one profile.
+
+    LIMITS. Straight segments only -- a curve arrives as chords, so sample it
+    finely enough for the job (the chord sits inside the true curve, so a cut
+    comes out slightly large and a boss slightly small). It does not dimension
+    or constrain anything: the geometry has no relations at all, which is what
+    makes it exact and also means a later drag would deform it. For a gear, do
+    not sample it by hand -- create_spur_gear already does all of this.
+    """
+
+    def _impl():
+        if not isinstance(points, (list, tuple)) or len(points) < 2:
+            raise ValueError("points must be a list of at least two [x, y] pairs.")
+        points_m = []
+        for index, point in enumerate(points):
+            if not isinstance(point, (list, tuple)) or len(point) != 2:
+                raise ValueError(
+                    f"points[{index}] must be an [x, y] pair, got {point!r}. A 2D "
+                    f"sketch profile has no z: a third value would shift every "
+                    f"following coordinate.")
+            x, y = point
+            points_m.append((to_meters(float(x), unit), to_meters(float(y), unit)))
+
+        # A duplicated first/last point on a closed loop makes a zero-length
+        # segment, which SolidWorks accepts and the contour solver then trips
+        # over. Say so rather than silently dropping it.
+        if closed and math.dist(points_m[0], points_m[-1]) <= to_meters(tolerance, unit):
+            raise ValueError(
+                "the first and last point are the same and closed=True, which asks "
+                "for a zero-length closing segment. Drop the repeated last point, "
+                "or pass closed=False.")
+        shortest = min(math.dist(a, b) for a, b in zip(points_m, points_m[1:]))
+        if shortest <= 0.0:
+            raise ValueError(
+                "two consecutive points are identical, which makes a zero-length "
+                "segment. Remove the duplicate before drawing.")
+
+        doc = _active_doc()
+        active_unit, factor = _unit_factor(unit)
+        tolerance_m = to_meters(tolerance, unit)
+        measurement = _draw_profile_points(doc, points_m, closed, tolerance_m,
+                                           verify_points)
+        result = {
+            "unit": active_unit,
+            "point_count": len(points_m),
+            "closed": bool(closed),
+            "segments": measurement["segments_stored"],
+            "shortest_segment": shortest * factor,
+            "points_verified": measurement.get("points_verified"),
+            "verified": measurement.get("verified"),
+            "warnings": list(measurement.get("warnings", [])),
+        }
+        if "verification_skipped" in measurement:
+            result["verification_skipped"] = measurement["verification_skipped"]
+        if "max_point_deviation_m" in measurement:
+            result["max_point_deviation"] = measurement["max_point_deviation_m"] * factor
+            result["deviation_tolerance"] = tolerance
+            result["snapped"] = measurement["snapped"]
+            result["displaced_point_count"] = measurement["displaced_point_count"]
+            result["displaced_points"] = [
+                {"index": item["index"],
+                 "requested": [coordinate * factor for coordinate in item["requested_m"]],
+                 "distance": None if item["distance_m"] is None
+                 else item["distance_m"] * factor}
+                for item in measurement["displaced_points"]
+            ]
+            if measurement["unreadable_segments"]:
+                result["unreadable_segments"] = measurement["unreadable_segments"]
         return result
 
     return await _run(_impl)
@@ -7030,7 +7472,19 @@ async def create_knurl(
     pattern: 'diamond' (crossed lines) or 'straight' (axial grooves only).
     pitch: distance between neighboring grooves.
     depth: groove depth (typically 0.2–0.5 mm).
-    angle: helix angle for diamond pattern (30 = standard)."""
+    angle: helix angle for diamond pattern (30 = standard).
+    THE PROFILE IS MEASURED. A knurl cell is about 0.2 mm across, with its
+    vertices a tenth of a millimetre apart -- well inside the inference
+    engine's screen-space snap radius, and three times tighter than the
+    gear-tooth spacing that was confirmed to collapse. The cells are therefore
+    drawn with inference OFF and every vertex is read back: ``profile.verified``
+    is false, and the call raises, if any of them moved. Before this, the only
+    check was that InsertWrapFeature2 returned non-None, so a cell snapped flat
+    engraved nothing and the tool reported success.
+
+    What is still NOT measured is the engraved DEPTH -- the Wrap feature
+    exposes none to read back. The result says so in ``warnings`` rather than
+    implying the grooves were checked."""
 
     def _impl():
         if pitch <= 0:
@@ -7070,6 +7524,7 @@ async def create_knurl(
             doc.InsertSketch2(True)
             sketch_open = True
 
+            cells = []
             center_u = 2.5 * p_m
             center_v = 2.5 * p_m
             half_width = max(p_m * 0.22, to_meters(0.1, "mm"))
@@ -7093,9 +7548,25 @@ async def create_knurl(
                         (cell_u + half_width * 0.45, center_v - half_height),
                         (cell_u - half_width * 0.45, center_v - half_height),
                     ]
-                for start, end in zip(points, points[1:] + points[:1]):
-                    if doc.SketchManager.CreateLine(start[0], start[1], 0, end[0], end[1], 0) is None:
-                        raise RuntimeError("SolidWorks could not create a closed knurl profile cell.")
+                # A knurl cell is 0.2 mm across, with its points a tenth of a
+                # millimetre apart -- three times tighter than the gear-tooth
+                # spacing that was confirmed to collapse under the inference
+                # engine's screen-space snap. Drawn through SketchManager this
+                # was the smooth-gear failure all over again, and worse: the
+                # only check was that InsertWrapFeature2 returned non-None, so
+                # a cell snapped flat engraved nothing and reported success.
+                # _draw_profile_points draws it with inference OFF and reads
+                # every vertex back.
+                cell = _draw_profile_points(
+                    doc, points, True, to_meters(0.0005, "mm"))
+                cells.append(cell)
+                if cell["warnings"]:
+                    raise RuntimeError(
+                        "the knurl cell profile did not land where it was computed: "
+                        + " | ".join(cell["warnings"])
+                        + f". The cell is {2 * half_width * 1000:.3f} mm wide; a coarser "
+                        f"pitch gives the sketch more room."
+                    )
 
             doc.InsertSketch2(True)
             sketch_open = False
@@ -7139,31 +7610,26 @@ async def create_knurl(
             "depth": depth,
             "angle": angle,
             "unit": unit or _default_unit,
+            "profile": {
+                "cells": len(cells),
+                "segments": sum(cell["segments_stored"] for cell in cells),
+                "vertices_verified": sum(cell["points_verified"] for cell in cells),
+                "max_vertex_deviation_mm": max(
+                    (cell["max_point_deviation_m"] * 1000.0 for cell in cells),
+                    default=0.0),
+                "cell_width_mm": 2 * half_width * 1000.0,
+                "verified": all(cell["verified"] for cell in cells),
+            },
+            "warnings": [
+                "the engraved DEPTH is not measured: InsertWrapFeature2 reports no "
+                "depth to read back, so this result confirms the profile landed "
+                "correctly and the Wrap feature was created -- not how deep the "
+                "grooves came out. Check it with list_faces or a section view if it "
+                "matters."
+            ],
         }
 
     return await _run(_impl)
-
-
-def _gear_flank_points(r_base: float, r_start: float, r_end: float,
-                       theta0: float, samples: int = 12) -> list:
-    """Points (x, y) along the +side involute flank of a tooth gap, root -> tip.
-
-    All lengths are in meters. The flank is the involute of the base circle of
-    radius ``r_base``: it leaves the base circle at polar angle ``theta0``
-    (radians, measured from the gap centerline on the +X axis) and, at radius
-    r, sits at polar angle ``theta0 + inv(alpha_r)`` where
-    ``alpha_r = acos(r_base / r)`` and ``inv(a) = tan(a) - a``.
-
-    Return ``samples`` points from radius ``r_start`` to ``r_end`` (inclusive),
-    evenly spaced in radius, as a list of (x, y) tuples.
-    """
-    points = []
-    for i in range(samples):
-        r = max(r_base, r_start + (r_end - r_start) * i / (samples - 1))
-        alpha = math.acos(min(1.0, r_base / r))
-        phi = theta0 + math.tan(alpha) - alpha
-        points.append((r * math.cos(phi), r * math.sin(phi)))
-    return points
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
@@ -7178,167 +7644,69 @@ async def create_gear(
 ) -> dict:
     """Create a standard external spur gear with true involute teeth.
 
-    SolidWorks has no gear feature in its COM API (Toolbox gears are not
-    scriptable), so the gear is built the way it is modeled by hand: a blank
-    cylinder at the addendum diameter, one involute tooth GAP cut through it,
-    and that cut repeated ``teeth`` times in a circular pattern.
+    Kept for callers already bound to this name; it builds the gear through
+    create_spur_gear, which is the tool to use directly. Everything below is
+    about why this one no longer builds it itself.
 
-    module: gear module in mm-equivalent units (pitch diameter = module * teeth).
-    teeth: number of teeth (6-200).
-    face_width: gear thickness along the axis, extruded from the sketch plane.
-    pressure_angle: 14.5-30 degrees (20 is the modern standard).
-    bore_diameter: optional center bore (0 = no bore).
-    plane: 'front', 'top' or 'right'; the gear axis is that plane's normal.
+    This was a blank cylinder, ONE involute tooth-gap cut, and a circular
+    pattern of that cut -- the way a gear is modelled by hand, and the way it
+    comes out SMOOTH here. The gap profile's involute flanks were drawn through
+    ISketchManager.CreateSpline3, which runs through SolidWorks' sketch
+    inference engine, whose snap radius is a distance in SCREEN PIXELS. Twelve
+    samples across a 4.5 mm flank sit 0.4 mm apart, inside that radius at any
+    normal zoom, and what the engine does is MOVE the point and report success.
+    One flattened gap patterned 20 times around the blank is a blank again --
+    and nothing in the old code looked: the pattern returning non-None was the
+    whole check, so a toothless gear rebuilt clean, measured plausibly, and was
+    handed over as a gear.
 
-    Proportions are the standard full-depth system: addendum = 1 module,
-    dedendum = 1.25 module. Open an empty part first (create_new_part)."""
+    The involute arithmetic in it was right, which is the point: this was never
+    a maths bug. What it lacked was a drawing path the snap cannot reach, and a
+    measurement afterwards. create_spur_gear has both -- the whole toothed
+    outline computed in gear_geometry.py (113 off-line tests), drawn as ONE
+    closed profile with inference OFF and every vertex read back, extruded
+    once, then checked by comparing the solid's real volume against the
+    analytic cross-section. No seed cut, no pattern, nothing to snap.
 
-    def _impl():
-        if module <= 0:
-            raise ValueError(f"Module must be positive, got {module}.")
-        if not 6 <= teeth <= 200:
-            raise ValueError(f"Teeth must be between 6 and 200, got {teeth}.")
-        if face_width <= 0:
-            raise ValueError(f"Face width must be positive, got {face_width}.")
-        if not 14.5 <= pressure_angle <= 30:
-            raise ValueError(f"Pressure angle must be between 14.5 and 30 degrees, got {pressure_angle}.")
-        plane_key = plane.lower()
-        axis_for_plane = {"front": "z", "top": "y", "right": "x"}
-        if plane_key not in axis_for_plane:
-            raise ValueError("plane must be 'front', 'top' or 'right'.")
+    Arguments are unchanged; ``face_width`` is create_spur_gear's
+    ``thickness``. The result is create_spur_gear's, with this tool's original
+    keys kept alongside it. Read ``teeth_present`` and ``verified``.
+    ``tooth_gap_feature`` is None now: there is no seed cut to name, because
+    the teeth are not made by cutting one.
+    """
 
-        m = to_meters(module, unit)
-        alpha = math.radians(pressure_angle)
-        r_pitch = m * teeth / 2.0
-        r_add = r_pitch + m
-        r_root = r_pitch - 1.25 * m
-        r_base = r_pitch * math.cos(alpha)
-        bore_r = to_meters(bore_diameter, unit) / 2.0
-        if bore_diameter < 0 or (bore_diameter > 0 and bore_r >= r_root * 0.9):
-            raise ValueError("bore_diameter must be >= 0 and leave material below the tooth roots.")
+    if not 6 <= teeth <= 200:
+        # The upper bound is this tool's own contract and worth keeping: a
+        # 200-tooth gear is already a 4000-segment profile.
+        raise ValueError(f"Teeth must be between 6 and 200, got {teeth}.")
 
-        # Gap half-angle at the pitch circle is pi/(2z); the involute leaves
-        # the base circle theta0 earlier than that by inv(alpha).
-        inv_alpha = math.tan(alpha) - alpha
-        theta0 = math.pi / (2.0 * teeth) - inv_alpha
-        r_flank_start = max(r_root, r_base)
-        r_cut_end = r_add * 1.1
-        samples = 12
-
-        plus = _gear_flank_points(r_base, r_flank_start, r_cut_end, theta0, samples)
-        if len(plus) < 2:
-            raise RuntimeError("_gear_flank_points returned fewer than two points.")
-        minus = [(x, -y) for x, y in plus]
-
-        doc = _active_doc()
-        empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
-
-        def _open_sketch():
-            doc.ClearSelection2(True)
-            if not _select_by_id(doc, _standard_plane_name(doc, plane_key), "PLANE"):
-                raise RuntimeError(f"Could not select the {plane_key} plane.")
-            doc.InsertSketch2(True)
-            _remember_active_sketch(doc)
-
-        def _spline(points):
-            flat = [c for p in points for c in p]
-            data = win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, flat)
-            status = win32com.client.VARIANT(pythoncom.VT_VARIANT | pythoncom.VT_BYREF, None)
-            if doc.SketchManager.CreateSpline3(data, None, None, False, status) is None:
-                raise RuntimeError("SolidWorks could not create an involute flank spline.")
-
-        def _arc(radius, half_angle):
-            p1 = (radius * math.cos(-half_angle), radius * math.sin(-half_angle))
-            p2 = (radius * math.cos(half_angle), radius * math.sin(half_angle))
-            if doc.SketchManager.CreateArc(0, 0, 0, p1[0], p1[1], 0, p2[0], p2[1], 0, 1) is None:
-                raise RuntimeError("SolidWorks could not create a gear arc.")
-
-        # 1) Blank cylinder at the addendum diameter.
-        _open_sketch()
-        if doc.SketchManager.CreateCircle(0, 0, 0, r_add, 0, 0) is None:
-            raise RuntimeError("Could not draw the gear blank circle.")
-        doc.InsertSketch2(True)
-        _select_last_sketch(doc)
-        blank = doc.FeatureManager.FeatureExtrusion2(
-            True, False, False, 0, 0, to_meters(face_width, unit), 0.0,
-            False, False, False, False, 0.0, 0.0,
-            False, False, False, False,
-            True, True, True, 0, 0.0, False,
-        )
-        if blank is None:
-            raise RuntimeError("Gear blank extrusion failed.")
-
-        # 2) One tooth gap: two involute flanks, root arc, outer closing arc.
-        _open_sketch()
-        _spline(plus)
-        _spline(minus)
-        theta_root = math.atan2(plus[0][1], plus[0][0])
-        if r_root < r_base:
-            for sign in (1, -1):
-                if doc.SketchManager.CreateLine(
-                    r_root * math.cos(sign * theta_root), r_root * math.sin(sign * theta_root), 0,
-                    plus[0][0], sign * plus[0][1], 0,
-                ) is None:
-                    raise RuntimeError("Could not draw the radial root line of the tooth gap.")
-        _arc(r_root, theta_root)
-        _arc(r_cut_end, math.atan2(plus[-1][1], plus[-1][0]))
-        doc.InsertSketch2(True)
-        _select_last_sketch(doc)
-        cut = doc.FeatureManager.FeatureCut4(
-            True, False, False, 2, 0, 0.0, 0,
-            False, False, False, False, 0.0, 0.0,
-            False, False, False, False,
-            False, True, True,
-            False, False, False,
-            0, 0.0, False, False,
-        )
-        if cut is None:
-            raise RuntimeError("Tooth gap cut failed; the gap profile is not a closed loop.")
-        cut_name = win32com.client.Dispatch(cut).Name
-
-        # 3) Repeat the gap around the gear axis.
-        axis_name = _ensure_pattern_axis(doc, axis_for_plane[plane_key])
-        doc.ClearSelection2(True)
-        if not doc.Extension.SelectByID2(axis_name, "AXIS", 0, 0, 0, False, 1, empty, 0):
-            raise RuntimeError("Could not select the gear axis for the pattern.")
-        if not doc.Extension.SelectByID2(cut_name, "BODYFEATURE", 0, 0, 0, True, 4, empty, 0):
-            raise RuntimeError(f"Could not select tooth gap feature '{cut_name}'.")
-        pattern = doc.FeatureManager.FeatureCircularPattern4(
-            teeth, 2 * math.pi, False, "", False, True, False)
-        doc.ClearSelection2(True)
-        if pattern is None:
-            raise RuntimeError("Circular pattern of the tooth gap failed.")
-
-        # 4) Optional bore.
-        if bore_diameter > 0:
-            _open_sketch()
-            if doc.SketchManager.CreateCircle(0, 0, 0, bore_r, 0, 0) is None:
-                raise RuntimeError("Could not draw the bore circle.")
-            doc.InsertSketch2(True)
-            _select_last_sketch(doc)
-            bore = doc.FeatureManager.FeatureCut4(
-                True, False, False, 2, 0, 0.0, 0,
-                False, False, False, False, 0.0, 0.0,
-                False, False, False, False,
-                False, True, True,
-                False, False, False,
-                0, 0.0, False, False,
-            )
-            if bore is None:
-                raise RuntimeError("Bore cut failed.")
-
-        active_unit, factor = _unit_factor(unit)
-        return {
-            "module": module, "teeth": teeth, "pressure_angle": pressure_angle,
-            "face_width": face_width, "unit": active_unit,
-            "pitch_diameter": 2 * r_pitch * factor,
-            "outside_diameter": 2 * r_add * factor,
-            "root_diameter": 2 * r_root * factor,
-            "base_diameter": 2 * r_base * factor,
-            "tooth_gap_feature": cut_name,
-        }
-
-    return await _run(_impl)
+    gear = await create_spur_gear(
+        module=module, teeth=teeth, thickness=face_width,
+        pressure_angle=pressure_angle, bore_diameter=bore_diameter,
+        plane=plane, unit=unit,
+    )
+    table = gear["gear"]
+    result = dict(gear)
+    result.update({
+        "module": table["module"],
+        "teeth": table["teeth"],
+        "pressure_angle": table["pressure_angle"],
+        "face_width": table["face_width"],
+        "unit": gear["unit"],
+        "pitch_diameter": table["pitch_diameter"],
+        "outside_diameter": table["tip_diameter"],
+        "root_diameter": table["root_diameter"],
+        "base_diameter": table["base_diameter"],
+        "tooth_gap_feature": None,
+        "built_by": "create_spur_gear",
+        "note": (
+            "create_gear now delegates to create_spur_gear: the teeth are one "
+            "computed closed profile extruded once, not a seed gap cut and "
+            "patterned, so there is no tooth_gap_feature to name. Call "
+            "create_spur_gear directly in new code."
+        ),
+    })
+    return result
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
@@ -11596,11 +11964,46 @@ async def create_automotive_piston(
         # Offset planes let each annular cut start at its intended axial height.
         # This avoids relying on a revolved cut's local-plane orientation.
         stage = "three ring grooves"
+        # The groove is the gap between two circles whose radii differ by
+        # 2 * ring_depth -- 3 mm by default. Both go through the sketch
+        # inference engine, and the second circle's defining point lands that
+        # close to the first one's: inside the snap radius at an unlucky zoom,
+        # the two radii collapse, the annulus has no width, and the cut removes
+        # nothing. draw_circle measures its own radius and centre, so the
+        # failure is detectable -- it just was not being read. It is now.
+        groove_checks = []
         for ring_bottom in reversed(ring_bottoms):
             plane = await create_reference_plane("front", ring_bottom, unit=unit)
             await create_sketch(plane["plane"])
-            await draw_circle(0, 0, radius + ring_depth, unit)
-            await draw_circle(0, 0, radius - ring_depth, unit)
+            outer = await draw_circle(0, 0, radius + ring_depth, unit)
+            inner = await draw_circle(0, 0, radius - ring_depth, unit)
+            for which, circle in (("outer", outer), ("inner", inner)):
+                if circle.get("verified") is False:
+                    raise RuntimeError(
+                        f"the {which} circle of the ring groove at {ring_bottom} "
+                        f"{unit or _default_unit} is not the circle that was asked for "
+                        f"({circle.get('deviation')}). The groove would come out with "
+                        f"the wrong depth, or with none at all, and the piston would "
+                        f"still look right: "
+                        + " | ".join(circle.get("warnings", ())))
+            measured_width = None
+            outer_radius = (outer.get("actual") or {}).get("radius")
+            inner_radius = (inner.get("actual") or {}).get("radius")
+            if outer_radius is not None and inner_radius is not None:
+                measured_width = outer_radius - inner_radius
+                if measured_width < ring_depth:
+                    raise RuntimeError(
+                        f"the ring groove at {ring_bottom} {unit or _default_unit} "
+                        f"measures {measured_width:.4g} radially where "
+                        f"{2 * ring_depth:.4g} was asked for: the two circles came out "
+                        f"closer together than requested, so the groove is too shallow "
+                        f"to be a ring groove."
+                    )
+            groove_checks.append({
+                "axial_position": ring_bottom,
+                "requested_radial_width": 2 * ring_depth,
+                "measured_radial_width": measured_width,
+            })
             await close_sketch()
             await cut_extrude(ring_width, unit=unit)
         completed.append(stage)
@@ -11647,6 +12050,7 @@ async def create_automotive_piston(
                 "unit": unit or _default_unit,
             },
             "features": ["extruded skirt/crown", "three ring grooves", "hollow underside", "wrist-pin bore"],
+            "ring_grooves": groove_checks,
             "completed_stages": completed,
         }
     except Exception as exc:
@@ -11831,15 +12235,48 @@ async def create_automotive_piston_assembly(
 
         stage = "assembly insertion"
         assembly = await create_new_assembly()
-        await insert_component(part_paths["piston"], unit=unit)
-        # The piston itself begins at the Front plane.  Shift the rod group a
-        # controlled positive distance toward the viewing side of that plane so its
-        # beam is visible below the skirt instead of being occluded by it.
-        # The long wrist pin still spans this offset and the piston body.
-        await insert_component(part_paths["connecting_rod"], z=front_offset, unit=unit)
-        await insert_component(part_paths["wrist_pin"], z=front_offset, unit=unit)
-        await insert_component(part_paths["bearing"], z=front_offset, unit=unit)
-        await insert_component(part_paths["rod_cap"], x=rod_width + 4, z=front_offset, unit=unit)
+        # insert_component reads each component's pose back out of SolidWorks
+        # and returns actual_position/deviation/verified. Nothing here was
+        # reading it: a component that did not land where it was placed left
+        # the assembly looking plausible, and the five offsets below are the
+        # only thing holding this assembly together -- there are no mates. So
+        # every placement is checked, and the measured poses are reported.
+        placements = [
+            # The piston itself begins at the Front plane. The rod group is
+            # shifted a controlled positive distance toward the viewing side of
+            # that plane so its beam is visible below the skirt instead of
+            # being occluded by it. The long wrist pin still spans this offset
+            # and the piston body.
+            ("piston", {}),
+            ("connecting_rod", {"z": front_offset}),
+            ("wrist_pin", {"z": front_offset}),
+            ("bearing", {"z": front_offset}),
+            ("rod_cap", {"x": rod_width + 4, "z": front_offset}),
+        ]
+        component_positions = []
+        misplaced = []
+        for key, offsets in placements:
+            placed = await insert_component(part_paths[key], unit=unit, **offsets)
+            component_positions.append({
+                "part": key,
+                "component": placed.get("name"),
+                "requested_position": placed.get("requested_position"),
+                "actual_position": placed.get("actual_position"),
+                "deviation": placed.get("deviation"),
+                "fixed": placed.get("fixed"),
+                "verified": placed.get("verified"),
+            })
+            if placed.get("verified") is not True:
+                misplaced.append(
+                    f"{key} ({placed.get('name')}): {placed.get('deviation')}")
+        if misplaced:
+            raise RuntimeError(
+                "components did not land where they were placed, and this assembly "
+                "has no mates to pull them back: "
+                + " | ".join(misplaced)
+                + ". Do not build on this assembly -- check it with "
+                "verify_assembly_positions and get_component_transform."
+            )
         completed.append(stage)
 
         stage = "assembly save and view"
@@ -11853,6 +12290,19 @@ async def create_automotive_piston_assembly(
             "assembly": assembly["title"],
             "save_path": assembly_path,
             "components": part_paths,
+            "component_positions": component_positions,
+            "position_check": {
+                "method": ("every insert_component pose was read back out of "
+                           "SolidWorks and compared with the requested offset"),
+                "all_verified": True,
+                "next_step": (
+                    "verify_assembly_positions(require_constrained=False) for the "
+                    "assembly-wide checks. Expect M01 on all five (this assembly is "
+                    "deliberately unmated) and M03 on connecting_rod, wrist_pin and "
+                    "bearing: those three are modelled in place and share the insert "
+                    "origin on purpose, so sharing a position is correct here, not a "
+                    "stack of parts in the wrong spot"),
+            },
             "features": [
                 "piston crown/skirt with three ring grooves",
                 "hollow underside and wrist-pin bore",
@@ -12272,6 +12722,366 @@ async def create_pedestal_fan_propeller(
             f"Completed stages: {', '.join(completed) or '(none)'}. "
             f"Active document: {active}. Root cause: {exc}"
         ) from exc
+
+
+# ===========================================================================
+# Involute gearing
+# ===========================================================================
+# A gear is the one shape this server could not build with its generic sketch
+# tools, and it failed in the worst possible way: silently, as a smooth disc.
+# See create_spur_gear's docstring and gear_geometry.py for why, and
+# .claude/knowledge/engrenagens.md for the design side of it.
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def create_spur_gear(
+    module: float = 2.0,
+    teeth: int = 20,
+    thickness: float = 10.0,
+    pressure_angle: float = 20.0,
+    bore_diameter: float = 0.0,
+    plane: str = "front",
+    addendum_coefficient: float = 1.0,
+    dedendum_coefficient: float = 1.25,
+    root_fillet_coefficient: float = gg.DEFAULT_ROOT_FILLET_COEFFICIENT,
+    flank_points: int = 7,
+    unit: Optional[str] = None,
+    volume_tolerance: float = 0.02,
+) -> dict:
+    """Create an involute spur gear WITH REAL TEETH in the ACTIVE part document.
+
+    Use this for any gear. Drawing one by hand with draw_line/draw_arc plus
+    cut_extrude and circular_pattern is what produces the smooth disc this tool
+    exists to replace: a single involute flank needs a dozen points a fraction
+    of a millimetre apart, every draw_* call goes through SolidWorks' inference
+    engine whose snap radius is in SCREEN PIXELS, and tooth-scale points next
+    to each other are exactly what that engine collapses -- by MOVING the
+    point, with no error (verificacao_e_qa.md, section 0). A flattened tooth
+    gap patterned 20 times around the blank is a blank. Here the whole closed
+    outline -- every tooth -- is computed analytically and drawn as ONE profile
+    with the inference engine switched off (SetAddToDB), then extruded once.
+    No cut, no pattern, nothing to snap.
+
+    It does NOT create a document: call create_new_part first for a standalone
+    gear, or leave the shaft/hub part active to merge the gear onto it.
+
+    Geometry is ISO 53 standard full depth: addendum 1.0*module, dedendum
+    1.25*module, 20-degree pressure angle, no profile shift, zero backlash.
+    Tooth thickness at the pitch circle is exactly pi*module/2, so the result
+    meshes with any other gear of the same module and pressure angle at centre
+    distance module*(z1+z2)/2 -- that number comes back in the result.
+
+    module: the module m in ``unit`` (ISO 54 preferred values: 1, 1.25, 1.5, 2,
+        2.5, 3, 4, 5, 6, 8, 10). Pitch diameter is module*teeth; module and
+        pressure_angle are what decide whether two gears can mesh at all.
+    teeth: tooth count. Below 17 at 20 degrees a hobbed gear would be
+        undercut; the result says so instead of pretending otherwise.
+    thickness: face width, extruded symmetrically about ``plane`` so the gear
+        is centred on it (one coincident mate then aligns it with a shaft).
+    bore_diameter: optional through bore for the shaft, cut concentric. 0 for
+        none. Size it with tolerances_e_ajustes.md (H7/k6 for a keyed hub).
+    plane: 'front' (gear axis = Z), 'top' (axis = Y), 'right' (axis = X), or
+        the name of a reference plane -- use one to put a gear at a given
+        offset along a shaft.
+    root_fillet_coefficient: root fillet as a multiple of the module; 0.38 is
+        the ISO 53 rack tip radius an actual hob leaves. Set 0 for a sharp
+        root. It is reduced automatically when the base circle or the tooth
+        gap leaves less room, and the result says by how much and why.
+    flank_points: involute samples per flank. The flanks are chords through
+        the true involute; ``profile.flank_chord_error`` in the result is how
+        far those chords sit from the real curve, and raising this drops the
+        error roughly with its square (at the cost of sketch segments: the
+        profile already holds 20-30 of them per tooth).
+    volume_tolerance: fractional agreement required between the measured solid
+        and the analytic gear volume.
+
+    THE TEETH ARE MEASURED, NOT ASSUMED. The outline's exact cross-section is
+    known analytically, so the extruded solid's real volume is compared with
+    it: ``verified`` is true only when they agree within ``volume_tolerance``,
+    and ``teeth_present`` is a separate, blunter check that the solid is
+    missing the material the tooth gaps should have removed -- that is the one
+    that catches "it came out smooth", which is the failure mode of every
+    other way of building a gear here.
+
+    NOT covered: helical, internal, bevel and worm gearing, profile shift
+    (x*m), crowning, and tip chamfers. This is an external, spur, unshifted
+    gear. There is also no FEA in this server, so no tooth-bending check --
+    see verificacao_e_qa.md if a load has to be confirmed.
+    """
+
+    if teeth < 6:
+        raise ValueError(f"teeth must be at least 6, got {teeth}.")
+    if thickness <= 0:
+        raise ValueError(f"thickness (face width) must be positive, got {thickness}.")
+    if bore_diameter < 0:
+        raise ValueError(f"bore_diameter cannot be negative, got {bore_diameter}.")
+    if not 0 < volume_tolerance < 1:
+        raise ValueError(
+            f"volume_tolerance is a fraction between 0 and 1, got {volume_tolerance}."
+        )
+
+    active_unit = unit or _default_unit
+    # gear_geometry works in millimetres; the API wants metres. Convert once,
+    # here, so neither side has to know about the caller's unit.
+    scale_mm = to_meters(1.0, unit) * 1000.0
+    module_mm = module * scale_mm
+    thickness_mm = thickness * scale_mm
+    bore_mm = bore_diameter * scale_mm
+
+    gear = gg.spur_gear_outline(
+        module_mm, teeth, pressure_angle,
+        addendum_coefficient, dedendum_coefficient, root_fillet_coefficient,
+        flank_points=flank_points,
+    )
+    table = gear.table
+    warnings = list(gear.warnings)
+
+    if bore_mm > 0.0:
+        if bore_mm >= table["root_diameter"]:
+            raise ValueError(
+                f"a bore of {bore_diameter} {active_unit} is wider than this gear's "
+                f"root diameter ({table['root_diameter'] / scale_mm:.3f} {active_unit}): "
+                f"there would be no material left under the teeth."
+            )
+        rim_mm = (table["root_diameter"] - bore_mm) / 2.0
+        if rim_mm < 1.5 * module_mm:
+            warnings.append(
+                f"only {rim_mm / scale_mm:.3f} {active_unit} of rim is left between the "
+                f"bore and the tooth roots ({rim_mm / module_mm:.2f}*module); below about "
+                f"1.5*module the rim flexes under load and the teeth lose contact. Use a "
+                f"hub, or a smaller bore"
+            )
+    if not 4.0 * module_mm <= thickness_mm <= 16.0 * module_mm:
+        warnings.append(
+            f"the face width is {thickness_mm / module_mm:.1f}*module; usual practice is "
+            f"6 to 12*module (narrower loses load capacity, wider needs very good "
+            f"alignment to load the whole tooth evenly)"
+        )
+
+    points_m = [(x / 1000.0, y / 1000.0) for x, y in gear.points]
+    segment_count = len(points_m)
+    completed: list = []
+    stage = "initialization"
+
+    async def _solid_volume_mm3():
+        """Volume of whatever solid is already in the document, or None."""
+
+        def _impl():
+            doc = _active_doc()
+            if not (doc.GetBodies2(0, True) or ()):
+                return None
+            volume = _measure_model_doc(doc, 1.0).get("volume_m3")
+            return None if volume is None else volume * 1e9
+
+        return await _run(_impl)
+
+    def _draw_closed_profile():
+        # _draw_profile_points is the shared snap-proof primitive (also exposed
+        # as the draw_profile tool): inference engine off for the whole chain,
+        # then every vertex read back and compared. The gear profile is what it
+        # was written for, and keeping one implementation means a fix to the
+        # drawing path reaches every computed profile, not just this one.
+        doc = _active_doc()
+        measurement = _draw_profile_points(
+            doc, points_m, True, to_meters(0.001, "mm"))
+        if measurement["segments_stored"] != segment_count:
+            raise RuntimeError(
+                f"the gear profile should hold {segment_count} segments "
+                f"({gear.points_per_tooth} per tooth x {teeth} teeth) but the sketch "
+                f"stored {measurement['segments_stored']}."
+            )
+        return measurement
+
+    try:
+        stage = "gear profile sketch"
+        sketch_info = await create_sketch(plane)
+        profile_info = await _run(_draw_closed_profile)
+        if profile_info.get("warnings"):
+            # A displaced vertex here is the original failure of this whole
+            # tool. Refusing beats extruding a profile that is not the gear.
+            raise RuntimeError(
+                "the gear profile did not land where it was computed: "
+                + " | ".join(profile_info["warnings"])
+            )
+        await close_sketch()
+        completed.append(stage)
+
+        stage = "face width extrusion"
+        volume_before_mm3 = await _solid_volume_mm3()
+        extrusion = await extrude_sketch(thickness, both_directions=True, unit=unit)
+        completed.append(stage)
+
+        bore_cut = None
+        if bore_mm > 0.0:
+            stage = "shaft bore"
+            await create_sketch(plane)
+            bore_circle = await draw_circle(0, 0, bore_diameter / 2.0, unit)
+            await close_sketch()
+            bore_cut = await cut_extrude(through_all=True, both_directions=True, unit=unit)
+            if bore_circle.get("snapped"):
+                warnings.append(
+                    "the bore circle came back SNAPPED: SolidWorks moved it off the "
+                    "gear axis, so the bore is eccentric. Delete the cut and redraw it "
+                    "after zoom_to_area on the bore"
+                )
+            completed.append(stage)
+
+        stage = "verification"
+        measurement = await measure_body()
+        completed.append(stage)
+    except Exception as exc:
+        try:
+            active = await get_document_info()
+        except Exception:
+            active = {"title": "(no active document)", "type": "Unknown"}
+        raise RuntimeError(
+            f"Spur gear creation stopped during '{stage}'. Completed stages: "
+            f"{', '.join(completed) or '(none)'}. Active document: {active}. "
+            f"Root cause: {exc}"
+        ) from exc
+
+    # --- the measured half: is this solid actually the gear that was computed?
+    bore_area_mm2 = math.pi * (bore_mm / 2.0) ** 2
+    expected_volume_mm3 = (gear.area_mm2 - bore_area_mm2) * thickness_mm
+    blank_volume_mm3 = (gear.blank_area_mm2 - bore_area_mm2) * thickness_mm
+    measured_total_mm3 = measurement.get("volume_m3")
+    measured_total_mm3 = None if measured_total_mm3 is None else measured_total_mm3 * 1e9
+    pre_existing = volume_before_mm3 is not None
+    measured_gear_mm3 = (
+        None if measured_total_mm3 is None
+        else measured_total_mm3 - (volume_before_mm3 or 0.0)
+    )
+
+    verified = None
+    teeth_present = None
+    volume_ratio = None
+    if measured_gear_mm3 is not None and expected_volume_mm3 > 0:
+        volume_ratio = measured_gear_mm3 / expected_volume_mm3
+        verified = abs(volume_ratio - 1.0) <= volume_tolerance
+        # The blunt check: the tooth gaps must have taken material OUT of the
+        # blank. Half of the predicted cut-away is a wide margin on purpose --
+        # it is here to catch a smooth disc, not to re-check the volume.
+        cut_away_expected = blank_volume_mm3 - expected_volume_mm3
+        cut_away_measured = blank_volume_mm3 - measured_gear_mm3
+        teeth_present = cut_away_measured >= 0.5 * cut_away_expected
+        if not teeth_present:
+            warnings.append(
+                f"THIS GEAR CAME OUT SMOOTH: the solid holds {measured_gear_mm3:.1f} mm3, "
+                f"against {expected_volume_mm3:.1f} mm3 for a {teeth}-tooth gear and "
+                f"{blank_volume_mm3:.1f} mm3 for a plain disc at the tip diameter. The "
+                f"tooth gaps are not in the body -- do not report this part as a gear"
+            )
+        elif not verified:
+            warnings.append(
+                f"the solid holds {measured_gear_mm3:.1f} mm3 against "
+                f"{expected_volume_mm3:.1f} mm3 computed from the profile "
+                f"({volume_ratio:.4f}x): the teeth are there, but the body is not the "
+                f"gear that was asked for. Check the extrusion depth and whether the "
+                f"profile merged with geometry that was already in the part"
+            )
+        if pre_existing:
+            warnings.append(
+                f"the part already held {volume_before_mm3:.1f} mm3 of solid before the "
+                f"gear, so the volume check above is on the DIFFERENCE. If the gear "
+                f"merged with that body, or the bore cut through it too, the difference "
+                f"is not only the gear and the check is indicative, not conclusive"
+            )
+
+    # Shape check, independent of volume: the two large extents of the solid
+    # should be the tip diameter, and the small one the face width. Skipped
+    # when something else in the document pollutes the bounding box.
+    size_check = None
+    box = measurement.get("bounding_box") or {}
+    if (not pre_existing and box.get("min_m") and box.get("max_m")
+            and thickness_mm < gear.effective_tip_diameter * 0.98):
+        extents = sorted(
+            (abs(high - low) * 1000.0
+             for low, high in zip(box["min_m"], box["max_m"])),
+            reverse=True,
+        )
+        allowance = max(0.1, 0.01 * gear.effective_tip_diameter)
+        size_check = {
+            "measured_tip_diameter_mm": [round(extents[0], 4), round(extents[1], 4)],
+            "expected_tip_diameter_mm": round(gear.effective_tip_diameter, 4),
+            "measured_face_width_mm": round(extents[2], 4),
+            "expected_face_width_mm": round(thickness_mm, 4),
+            "allowance_mm": round(allowance, 4),
+        }
+        size_check["matches"] = (
+            abs(extents[0] - gear.effective_tip_diameter) <= allowance
+            and abs(extents[1] - gear.effective_tip_diameter) <= allowance
+            and abs(extents[2] - thickness_mm) <= allowance
+        )
+        if not size_check["matches"]:
+            verified = False
+            warnings.append(
+                f"the solid measures {extents[0]:.3f} x {extents[1]:.3f} x "
+                f"{extents[2]:.3f} mm, but a {teeth}-tooth gear of module {module_mm:g} mm "
+                f"and face width {thickness_mm:g} mm is "
+                f"{gear.effective_tip_diameter:.3f} x {gear.effective_tip_diameter:.3f} x "
+                f"{thickness_mm:.3f} mm"
+            )
+
+    def _in_unit(value_mm: float) -> float:
+        return round(value_mm / scale_mm, 6)
+
+    return {
+        "plane": sketch_info.get("plane", plane),
+        "unit": active_unit,
+        "gear": {
+            "module": _in_unit(module_mm),
+            "teeth": teeth,
+            "pressure_angle": pressure_angle,
+            "pitch_diameter": _in_unit(table["pitch_diameter"]),
+            "base_diameter": _in_unit(table["base_diameter"]),
+            "tip_diameter": _in_unit(table["tip_diameter"]),
+            "root_diameter": _in_unit(table["root_diameter"]),
+            "whole_depth": _in_unit(table["whole_depth"]),
+            "circular_pitch": _in_unit(table["circular_pitch"]),
+            "tooth_thickness_at_pitch_circle": _in_unit(table["tooth_thickness_at_pitch_circle"]),
+            "angular_pitch_degrees": round(table["angular_pitch_degrees"], 6),
+            "face_width": _in_unit(thickness_mm),
+            "bore_diameter": _in_unit(bore_mm) if bore_mm else None,
+        },
+        "meshing": {
+            "center_distance_with_equal_gear": _in_unit(
+                gg.center_distance(module_mm, teeth, teeth)),
+            "center_distance_formula": "module * (teeth_this + teeth_other) / 2",
+            "ratio_formula": "teeth_other / teeth_this",
+            "note": ("meshes with any external spur gear of the same module and "
+                     "pressure angle; this profile is cut for zero backlash, so give "
+                     "the pair the backlash it needs in the centre distance or in "
+                     "the mating gear's tooth thickness"),
+        },
+        "profile": {
+            "sketch_segments": profile_info["segments_stored"],
+            "vertices_verified": profile_info.get("points_verified"),
+            "max_vertex_deviation": _in_unit(
+                profile_info.get("max_point_deviation_m", 0.0) * 1000.0),
+            "segments_per_tooth": gear.points_per_tooth,
+            "flank_chord_error": _in_unit(gear.chord_error_mm),
+            "tip_land": _in_unit(gear.tip_land_mm),
+            "effective_tip_diameter": _in_unit(gear.effective_tip_diameter),
+            "root_fillet_radius": _in_unit(gear.root_fillet_radius),
+            "root_fillet": gear.root_fillet_note,
+            "tooth_area_fraction_of_blank": round(gear.tooth_area_fraction, 6),
+        },
+        "extrusion": extrusion,
+        "bore_cut": bore_cut,
+        "measured": measurement,
+        "volume_mm3": {
+            "expected_from_profile": round(expected_volume_mm3, 4),
+            "measured": None if measured_gear_mm3 is None else round(measured_gear_mm3, 4),
+            "smooth_blank_at_tip_diameter": round(blank_volume_mm3, 4),
+            "ratio_measured_to_expected": None if volume_ratio is None else round(volume_ratio, 6),
+            "tolerance": volume_tolerance,
+        },
+        "size_check": size_check,
+        "teeth_present": teeth_present,
+        "verified": verified,
+        "warnings": warnings,
+        "completed_stages": completed,
+    }
 
 
 # ===========================================================================
@@ -14092,6 +14902,12 @@ _KNOWLEDGE_RESOURCES = [
      "Parafusos metricos ISO (furo/broca/chave), rolamentos rigidos de "
      "esferas (serie 6000/6200/6300), chavetas DIN 6885, molas -- nunca "
      "invente essas dimensoes."),
+    ("engrenagens", "engrenagens.md", "engrenagens-cilindricas-de-dentes-retos",
+     "Modulo, numero de dentes e angulo de pressao; modulos preferenciais "
+     "ISO 54, limite de 17 dentes (undercut), largura do dente, folga, "
+     "distancia entre centros, montagem do par, e estimativa de flexao do "
+     "dente por Lewis (nao ha FEA aqui). Leia antes de qualquer engrenagem -- "
+     "e use create_spur_gear, nunca draw_* na mao."),
     ("chapa-metalica", "chapa_metalica.md", "chapa-metalica-regras-de-projeto",
      "Raio minimo de dobra por espessura, K-factor, flange minimo, "
      "distancia furo-dobra, sequencia pratica de ferramentas para chapa "

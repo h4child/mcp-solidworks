@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "solidworks-mcp",
   "display_name": "SolidWorks MCP",
-  "version": "5.16.0",
+  "version": "5.18.0",
   "description": "MCP server for SolidWorks automation through the Windows COM API, built with FastMCP.",
   "long_description": "Controls SolidWorks via COM for parts, assemblies, sketches, features, drawings, appearances, validation, and selected mechanical mates. Designed for trusted local desktop automation.",
   "author": {
@@ -212,7 +212,7 @@
     },
     {
       "name": "create_gear",
-      "description": "Create a standard external spur gear with true involute teeth (blank, tooth gap cut, circular pattern, optional bore)."
+      "description": "Create an external spur gear with involute teeth. Kept for callers bound to this name; builds the gear through create_spur_gear, which is the tool to use directly."
     },
     {
       "name": "create_knurl",
@@ -253,6 +253,10 @@
     {
       "name": "create_sketch_on_face",
       "description": "Create a sketch on an existing body face."
+    },
+    {
+      "name": "create_spur_gear",
+      "description": "Create an involute spur gear with real teeth: the whole toothed profile is computed analytically and drawn as one closed sketch, then verified by volume."
     },
     {
       "name": "create_weldment_profile",
@@ -313,6 +317,10 @@
     {
       "name": "draw_polygon",
       "description": "Draw a regular polygon in the active sketch."
+    },
+    {
+      "name": "draw_profile",
+      "description": "Draw a computed curve as one chain of segments with the sketch inference engine off, and measure where every vertex actually landed."
     },
     {
       "name": "draw_rectangle",
