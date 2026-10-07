@@ -1,7 +1,7 @@
 # SolidWorks MCP Server
 
 Servidor MCP em Python que controla o SolidWorks via COM (`win32com`), escrito
-com o SDK oficial (`mcp`, usando `FastMCP`). **155 ferramentas** (v5.17.0).
+com o SDK oficial (`mcp`, usando `FastMCP`). **156 ferramentas** (v5.18.0).
 
 ## Para quem so quer usar
 
@@ -87,6 +87,21 @@ catalogo, mas permanece bloqueada ate
 `create_sketch`, `create_sketch_on_face`, `close_sketch`, `get_sketch_status`,
 `create_3d_sketch`, `draw_line`, `draw_line_3d`, `draw_circle`, `draw_rectangle`,
 `draw_arc`, `draw_polygon`, `add_sketch_dimension`, `add_sketch_relation`
+
+`draw_profile` (v5.18.0) e o caminho para qualquer **curva calculada** --
+involuto, lei de came, dente de polia HTD, trocoide, aerofolio: desenha a
+cadeia inteira com o motor de inferencia **desligado** (`SetAddToDB`) numa
+unica chamada e **confere a posicao de cada vertice** lida de volta do
+SolidWorks. Marcada EXP pelo mesmo motivo que `create_spur_gear` (o caminho
+COM nao foi rodado nesta instalacao); a diferenca e que agora uma geometria
+deslocada aparece em `displaced_points` em vez de virar peca errada.
+
+> Correcao de premissa (v5.18.0): o risco do snap de esboco **nao** e "peca
+> grande, feature pequena". O motor de inferencia junta um ponto novo ao ponto
+> **vizinho que ja existe** quando os dois estao a poucos pixels -- logo o que
+> decide e o **espacamento entre pontos consecutivos do proprio perfil**. Um
+> flanco involuto amostrado a 0,3 mm colapsa numa engrenagem de 44 mm, onde
+> nao ha peca grande nenhuma. Ver `.claude/knowledge/verificacao_e_qa.md`.
 
 ### Features 3D -- OK
 `extrude_sketch`, `cut_extrude`, `revolve_sketch`, `sweep_sketch`,
@@ -242,7 +257,12 @@ flat/folded).
 `add_cosmetic_thread` (EXP), `add_thread_feature` (delega para rosca cosmetica --
 roscas 3D reais NAO sao expostas pela API do SolidWorks),
 `create_helix` (EXP -- `InsertHelix` retorna None via COM nesta versao),
-`create_knurl` (EXP -- Wrap+Deboss).
+`create_knurl` (EXP -- Wrap+Deboss; desde a v5.18.0 desenha as celulas com a
+inferencia desligada e **confere cada vertice**: a celula tem 0,2 mm de largura
+com vertices a 0,1 mm, tres vezes mais apertado que o dente de engrenagem que
+colapsava, e a unica checagem era "o Wrap nao voltou None" -- uma celula
+achatada gravava nada e reportava sucesso. A PROFUNDIDADE gravada continua sem
+medicao: o Wrap nao expoe valor pra ler de volta, e o retorno diz isso).
 
 ### Desenho tecnico detalhado -- parcial
 `add_drawing_annotation` (OK), `insert_drawing_view` (OK -- validado ao vivo
@@ -299,6 +319,56 @@ fechar e reabrir o SolidWorks, *todas* as chamadas falhavam com "O servidor RPC
 nao esta disponivel", inclusive `connect_solidworks`, porque o caminho de
 reconexao nunca era alcancado. Agora `_com_is_alive()` invoca a chamada de
 fato, e o mesmo padrao de no-op foi corrigido no rebuild de `shell_body`.
+
+### Novas em v5.18.0 (a classe inteira, nao uma forma: 155 -> 156)
+
+A v5.17.0 consertou **uma** forma. A analise do que mais sofria da mesma falha
+mostrou que o problema era outro, e maior.
+
+**1. O criterio documentado do snap estava errado.** `verificacao_e_qa.md` dizia
+"peca grande, feature pequena". Mas a engrenagem saia lisa numa peca de
+**44 mm** -- nao havia peca grande ali. O que o motor de inferencia junta e um
+ponto novo que cai a poucos pixels de um ponto **que ja esta no esboco**: o que
+decide e o **espacamento entre pontos consecutivos do perfil**, nao o tamanho da
+feature nem o da peca. Dente involuto amostrado a 0,3 mm num pinhao de 44 mm =
+0,7% da vista, dentro do raio de snap em qualquer zoom normal. Isso reclassifica
+todo perfil que seja **curva amostrada**, nao so engrenagem.
+
+**2. `draw_profile`** -- o primitivo que faltava. Recebe os pontos de uma curva
+calculada e desenha a cadeia inteira com a inferencia desligada, numa chamada
+(antes: 200 chamadas de `draw_line` pelo motor de inferencia, ou `draw_spline`,
+que verificava so as duas pontas). Depois **le cada vertice de volta** e compara:
+`max_point_deviation`, `displaced_points` com indice, `verified`. Perfil com
+segmento faltando nao volta, levanta erro -- perfil incompleto e perfil aberto.
+`create_spur_gear` foi refatorado para usar o mesmo primitivo, e agora **recusa**
+extrudar um perfil deslocado em vez de so avisar.
+
+**3. Tres falhas silenciosas achadas na auditoria, todas da mesma familia:**
+
+- **`create_knurl` estava quebrado** (ou a um zoom de estar): celulas de 0,2 mm
+  com vertices a 0,1 mm desenhadas direto pelo `SketchManager`, e a unica
+  verificacao era `InsertWrapFeature2 != None`. Uma celula achatada gravava nada
+  e a ferramenta dizia sucesso. Agora desenha pelo primitivo e confere vertice
+  por vertice.
+- **`draw_spline` verificava so as pontas** -- justamente os dois pontos que o
+  snap tem menos chance de mover. Um ponto de controle **interior** deslocado
+  deixava as duas pontas certas e a curva deformada voltava `verified: true`.
+  Agora le os pontos de controle de volta (`interior_points`); quando o
+  SolidWorks nao os expoe, o retorno diz que o interior esta **nao verificado**,
+  em vez de deixar as pontas passarem por prova.
+- **Canaletas de anel do `create_automotive_piston`:** dois circulos a 3 mm um do
+  outro, ambos pelo motor de inferencia. `draw_circle` ja media o proprio raio;
+  ninguem lia. Agora le, e levanta erro se a canaleta saiu rasa ou colapsada.
+
+**4. Posicao das pecas na montagem.** `create_automotive_piston_assembly` nao
+tem mates por projeto -- os cinco offsets sao a unica coisa que posiciona as
+pecas. O `insert_component` ja devolvia `actual_position`/`deviation`/`verified`
+de cada uma, lido do SolidWorks; nada lia. Agora cada colocacao e conferida, a
+ferramenta levanta erro se alguma peca nao chegou onde foi posta, e o retorno
+traz `component_positions` com a pose medida de todas. O `position_check` tambem
+diz o que esperar do `verify_assembly_positions` aqui: M01 nos cinco (montagem
+deliberadamente sem mates) e M03 em `connecting_rod`/`wrist_pin`/`bearing`, que
+sao modeladas no lugar e compartilham a origem de insercao de proposito.
 
 ### Novas em v5.17.0 (a engrenagem tem dentes, 154 -> 155)
 
@@ -512,7 +582,7 @@ que deve ficar livre.
 - Late binding (dispatch dinamico) -- igual ao ambiente do Claude Desktop.
 
 ### Camada de metodologia (design-sandbox): instructions, resource e prompt
-As 155 ferramentas sao primitivas; sozinhas nao ensinam a IA a projetar bem.
+As 156 ferramentas sao primitivas; sozinhas nao ensinam a IA a projetar bem.
 O servidor expoe as outras duas primitivas do protocolo MCP para cobrir essa
 lacuna, codificando o metodo ja validado nas replicas de engenharia deste
 projeto (ver `RELATORIO_TESTES.md`) em vez de depender de disciplina manual

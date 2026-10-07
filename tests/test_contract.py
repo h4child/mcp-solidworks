@@ -877,18 +877,50 @@ def test_the_gear_tool_declares_what_it_does_not_cut():
         assert absent in description, f"the docstring does not mention {absent}"
 
 
-def test_the_gear_tool_draws_its_profile_with_the_inference_engine_off():
-    """SetAddToDB is the load-bearing line of the whole tool.
+def test_the_gear_tool_draws_its_profile_through_the_shared_primitive():
+    """The snap-proof drawing path is one implementation, not a copy per tool.
 
-    With it, a tooth-scale point lands where it was asked to; without it, the
-    point goes through the screen-space snap and the teeth collapse. It must
-    also be switched back off, or every later draw_* call in the session
-    silently stops getting inference and relations.
+    It started inside create_spur_gear; a gear is just the first caller. A
+    second copy is how one of them keeps the inference engine on, or forgets to
+    switch it back off, while the tests still pass on the other.
     """
     source = inspect.getsource(TOOLS["create_spur_gear"].fn)
+    assert "_draw_profile_points(" in source
+    # The docstring names SetAddToDB to explain the mechanism; what must not
+    # be here is the CALL.
+    assert "SetAddToDB(" not in source, (
+        "create_spur_gear should go through _draw_profile_points, not drive "
+        "SetAddToDB itself"
+    )
+
+
+def test_the_shared_primitive_draws_with_the_inference_engine_off():
+    """SetAddToDB is the load-bearing line of the whole gear/profile layer.
+
+    With it, a tooth-scale point lands where it was asked to; without it, the
+    point goes through the screen-space snap and the geometry collapses. It
+    must also be switched back off in a finally, or every later draw_* call in
+    the session silently stops getting inference and relations -- a worse bug
+    than the one it fixes.
+    """
+    source = inspect.getsource(server._draw_profile_points)
     assert "SetAddToDB(True)" in source
     assert "SetAddToDB(False)" in source
-    assert "finally:" in source, "SetAddToDB must be restored even on failure"
+    finally_at = source.index("finally:")
+    assert finally_at < source.index("SetAddToDB(False)"), (
+        "SetAddToDB must be restored from a finally, not on the happy path only"
+    )
+
+
+def test_the_gear_tool_refuses_a_profile_that_did_not_land():
+    """Measuring the vertices is pointless if the result is then extruded anyway.
+
+    A displaced vertex is the original smooth-gear failure, and the solid built
+    on it looks plausible -- so this one raises rather than warns.
+    """
+    source = inspect.getsource(TOOLS["create_spur_gear"].fn)
+    assert "did not land where it was computed" in source
+    assert "raise RuntimeError" in source
 
 
 def test_the_gear_tool_does_not_pattern_a_tooth():
@@ -951,3 +983,128 @@ def test_the_gear_knowledge_is_advertised_and_routed():
     with open(os.path.join(ROOT, ".claude", "CLAUDE.md"), encoding="utf-8") as handle:
         routing = handle.read()
     assert "knowledge/engrenagens.md" in routing
+
+
+# ---------------------------------------------------------------------------
+# draw_profile: the primitive the whole class of computed profiles needs
+# ---------------------------------------------------------------------------
+
+
+def test_draw_profile_is_registered_and_annotated():
+    assert "draw_profile" in TOOLS
+    annotations = TOOLS["draw_profile"].annotations
+    assert annotations.readOnlyHint is not True
+    assert annotations.openWorldHint is False
+
+
+def test_draw_profile_explains_the_failure_it_prevents():
+    """A model picks between draw_line-in-a-loop, draw_spline and this one.
+
+    If the docstring does not say what the snap radius is measured in, the
+    choice gets made on convenience and the geometry collapses silently.
+    """
+    description = TOOLS["draw_profile"].description.lower()
+    assert "pixel" in description
+    assert "draw_spline" in description
+    assert "silently" in description or "silent" in description
+
+
+def test_draw_profile_measures_every_vertex():
+    source = inspect.getsource(TOOLS["draw_profile"].fn)
+    assert "_draw_profile_points(" in source
+    parameters = inspect.signature(TOOLS["draw_profile"].fn).parameters
+    assert "tolerance" in parameters
+    assert "verify_points" in parameters
+    description = TOOLS["draw_profile"].description
+    assert "MEASURED, NOT ECHOED" in description
+
+
+def test_draw_profile_gets_room_for_a_large_profile():
+    assert server.TIMEOUT_BUDGET_OVERRIDES.get("draw_profile", 0) >= 300
+
+
+def test_the_spatial_index_finds_the_nearest_stored_vertex():
+    """The verification is only as good as this lookup.
+
+    Called directly -- it touches no COM -- because an index that silently
+    misses turns "this vertex moved 0.3 mm" into "this vertex is fine".
+    """
+    stored = [(0.0, 0.0), (0.010, 0.0), (0.0, 0.010)]
+    nearest = server._nearest_stored_point(stored, 1e-6)
+    point, distance = nearest(0.010, 0.0)
+    assert point == (0.010, 0.0)
+    assert distance == pytest.approx(0.0)
+    # Just inside and just outside the tolerance cell, from the same origin.
+    _, close = nearest(0.0, 5e-7)
+    assert close == pytest.approx(5e-7)
+    _, far = nearest(0.005, 0.005)
+    assert far == float("inf"), "a vertex nowhere near anything must not match"
+
+
+def test_the_spatial_index_is_empty_safe():
+    nearest = server._nearest_stored_point([], 1e-6)
+    assert nearest(0.0, 0.0)[1] == float("inf")
+
+
+# ---------------------------------------------------------------------------
+# The silent-failure audit that came with it
+# ---------------------------------------------------------------------------
+
+
+def test_the_knurl_draws_its_cells_with_inference_off():
+    """A knurl cell is 0.2 mm across with vertices 0.1 mm apart -- three times
+    tighter than the gear-tooth spacing that was confirmed to collapse. It was
+    drawn straight through SketchManager, and the only check was that the Wrap
+    feature came back non-None, so a flattened cell engraved nothing and
+    reported success."""
+    source = inspect.getsource(TOOLS["create_knurl"].fn)
+    assert "_draw_profile_points(" in source
+    assert "SketchManager.CreateLine(" not in source
+    assert "did not land where it was computed" in source
+
+
+def test_the_knurl_admits_the_depth_is_not_measured():
+    """Honesty about what the new check does NOT cover: the profile is
+    verified, the engraved depth is not readable from the Wrap feature."""
+    source = inspect.getsource(TOOLS["create_knurl"].fn)
+    assert "not measured" in source
+    description = TOOLS["create_knurl"].description
+    assert "MEASURED" in description
+
+
+def test_draw_spline_checks_its_interior_points():
+    """The ends are the two points the snap is least likely to move, so
+    checking only them called a deformed curve verified."""
+    source = inspect.getsource(TOOLS["draw_spline"].fn)
+    assert "_spline_interior_check(" in source
+    description = TOOLS["draw_spline"].description
+    assert "INTERIOR" in description
+    assert "draw_profile" in description
+
+
+def test_the_spline_interior_check_says_so_when_it_cannot_read_them():
+    """Unreadable must not be reported as correct -- that is the whole bug
+    pattern this release is about."""
+    source = inspect.getsource(server._spline_interior_check)
+    assert "UNVERIFIED" in source
+    assert 'result["verified"] = None' in source
+
+
+def test_the_piston_reads_back_its_ring_groove_circles():
+    """The groove is the gap between two circles 3 mm apart in radius, both
+    drawn through the inference engine. draw_circle measures its own radius;
+    nothing was reading it, so a collapsed groove removed no material and the
+    piston still looked right."""
+    source = inspect.getsource(TOOLS["create_automotive_piston"].fn)
+    assert 'circle.get("verified") is False' in source
+    assert "measured_radial_width" in source
+
+
+def test_the_piston_assembly_verifies_where_every_component_landed():
+    """The five offsets are the only thing holding this assembly together --
+    it has no mates by design -- so an unread placement is the whole assembly
+    unverified."""
+    source = inspect.getsource(TOOLS["create_automotive_piston_assembly"].fn)
+    assert "component_positions" in source
+    assert 'placed.get("verified") is not True' in source
+    assert "raise RuntimeError" in source

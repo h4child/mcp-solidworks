@@ -137,6 +137,12 @@ verificação por AGMA/ISO 6336 ou ensaio se a aplicação for crítica.
 
 Helicoidal, interna, cônica, coroa e rosca sem fim, cremalheira, correção de
 perfil (x·m), abaulamento (crowning) e chanfro de topo. Nenhuma dessas sai de
-`create_spur_gear` — e nenhuma delas sai de `draw_*` na mão, pelo mesmo motivo
-do snap. Se o pedido exige uma delas, diga ao usuário o que falta em vez de
-entregar um cilindro.
+`create_spur_gear`. Se o pedido exige uma delas, diga ao usuário o que falta em
+vez de entregar um cilindro.
+
+Se você mesmo for calcular um desses perfis (uma cremalheira é trapézio reto
+repetido; um estriado DIN 5480 é o mesmo involuto com α=30° e adendo menor),
+**desenhe com `draw_profile`** — uma chamada, inferência desligada, cada vértice
+conferido. É o mesmo primitivo que a `create_spur_gear` usa por dentro. O que
+não funciona é `draw_line` em laço ou `draw_spline`: ambos passam pelo motor de
+inferência, e é por isso que dente desenhado à mão sai liso.

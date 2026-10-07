@@ -70,6 +70,7 @@
   "draw_line",
   "draw_line_3d",
   "draw_polygon",
+  "draw_profile",
   "draw_rectangle",
   "draw_spline",
   "execute_python",

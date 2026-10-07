@@ -253,6 +253,9 @@ TIMEOUT_BUDGET_OVERRIDES = {
     # by construction, not stuck, and the 60s feature budget would cut it off
     # halfway through an open profile.
     "create_spur_gear": 300,
+    # Same reason: draw_profile is one COM call that draws, and then reads back,
+    # as many segments as the caller computed.
+    "draw_profile": 300,
 }
 
 # Reading the whole assembly tree, cross-component interference or a
@@ -1377,6 +1380,286 @@ def _sketch_create(doc, create, extents_m, what: str):
                    "something else is wrong: check get_sketch_status and "
                    "list_sketch_entities.")))
     return retried, True
+def _sketch_segment_endpoints(raw_segment) -> list:
+    """The (x, y) ends of one sketch segment, in metres.
+
+    The lean counterpart of _sketch_segment_geometry: no type, no radius, no
+    unit conversion. Reading back a 500-segment profile means thousands of COM
+    calls, so this reads the two points and nothing else.
+    """
+    segment = win32com.client.Dispatch(raw_segment)
+    ends = []
+    for member in ("GetStartPoint2", "GetEndPoint2"):
+        try:
+            raw_point = getattr(segment, member)()
+        except Exception:
+            continue
+        if raw_point is None:
+            continue
+        try:
+            point = win32com.client.Dispatch(raw_point)
+            ends.append((float(_com_member(point, "X")), float(_com_member(point, "Y"))))
+        except Exception:
+            continue
+    return ends
+
+
+def _nearest_stored_point(points_m, tolerance_m: float):
+    """Index stored sketch points for "where did this vertex actually land?".
+
+    A spatial hash rather than a scan: verifying every vertex of a gear is
+    O(n^2) distance tests done naively, and n is in the hundreds. Cell size is
+    the tolerance, so the true nearest point is always in the queried cell or
+    one of its eight neighbours.
+    """
+    cell = max(tolerance_m, 1e-9)
+    buckets: dict = {}
+    for x, y in points_m:
+        buckets.setdefault((int(math.floor(x / cell)), int(math.floor(y / cell))), []).append((x, y))
+
+    def nearest(x: float, y: float):
+        cx, cy = int(math.floor(x / cell)), int(math.floor(y / cell))
+        best, best_distance = None, float("inf")
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for candidate in buckets.get((cx + dx, cy + dy), ()):
+                    distance = math.dist((x, y), candidate)
+                    if distance < best_distance:
+                        best, best_distance = candidate, distance
+        return best, best_distance
+
+    return nearest
+
+
+def _draw_profile_points(doc, points_m, closed: bool, tolerance_m: float,
+                         verify_points: bool = True) -> dict:
+    """Draw a computed polyline with the sketch inference engine OFF, and
+    measure where every vertex actually landed.
+
+    This is the one safe way to put an analytically computed engineering
+    profile into a sketch, and the reason it exists is worth stating next to
+    the code: every ``ISketchManager.Create*`` call runs through SolidWorks'
+    inference engine, whose snap radius is a distance in SCREEN PIXELS. What
+    that engine collapses is a new point lying within a few pixels of a point
+    that is already there -- so the thing that decides whether a profile
+    survives is the spacing between its own consecutive vertices, NOT the size
+    of the feature and NOT the size of the part. An involute flank sampled
+    every 0.3 mm on a 44 mm gear is inside the snap radius at any normal zoom,
+    which is why gears came out smooth on parts small enough that nobody
+    thought to suspect the sketch.
+
+    ``SetAddToDB(True)`` writes geometry straight into the sketch database,
+    skipping inference and automatic relations entirely. The vertices then land
+    exactly where they were computed -- and this function proves it rather than
+    assuming it, by reading the stored ends back out and comparing.
+
+    The question it asks of each requested vertex is "is there a stored vertex
+    here?", against every segment in the sketch rather than only the new ones.
+    That is what makes it ordering-independent and safe to call several times
+    into one sketch (outer contour, then a bore). It has one blind spot, worth
+    knowing and not worth closing: if a DIFFERENT loop already happens to own a
+    vertex within ``tolerance_m`` of this one, a point that moved could match
+    that neighbour instead -- which means two loops sharing a vertex position,
+    degenerate geometry on its own terms.
+
+    Returns the measurement; raises when the profile came out incomplete,
+    because an incomplete profile is an open one and the extrusion that follows
+    would fail with a far less useful message.
+    """
+    sketch = _active_sketch(doc)
+    if len(points_m) < 2:
+        raise ValueError("A profile needs at least two points.")
+    chain = list(zip(points_m, points_m[1:] + points_m[:1])) if closed \
+        else list(zip(points_m, points_m[1:]))
+    before = len(_sketch_segments(sketch))
+
+    returned = 0
+    doc.SetAddToDB(True)
+    doc.SetDisplayWhenAdded(False)
+    try:
+        for (x1, y1), (x2, y2) in chain:
+            if doc.CreateLine2(x1, y1, 0.0, x2, y2, 0.0) is not None:
+                returned += 1
+    finally:
+        # Restored even on failure: left on, every later draw_* in the session
+        # silently loses inference and relations, which is a worse bug than the
+        # one this function fixes.
+        doc.SetDisplayWhenAdded(True)
+        doc.SetAddToDB(False)
+
+    segments = _sketch_segments(sketch)
+    stored = len(segments) - before
+    result = {
+        "points": len(points_m),
+        "closed": bool(closed),
+        "segments_expected": len(chain),
+        "segments_stored": stored,
+        "segments_returned_by_com": returned,
+    }
+    if stored != len(chain):
+        raise RuntimeError(
+            f"the profile should have added {len(chain)} segments to the sketch but "
+            f"{stored} arrived. An incomplete profile is an open profile and cannot be "
+            f"extruded: close the sketch, delete it, and redraw with fewer points, or "
+            f"check that the sketch was empty of conflicting geometry."
+        )
+
+    if not verify_points:
+        result["points_verified"] = 0
+        result["verified"] = None
+        result["verification_skipped"] = (
+            "verify_points=False: the vertices were not read back, so nothing here "
+            "says they landed where they were computed")
+        result["warnings"] = []
+        return result
+
+    stored_ends = []
+    unreadable = 0
+    for raw_segment in segments:
+        ends = _sketch_segment_endpoints(raw_segment)
+        if len(ends) < 2:
+            unreadable += 1
+        stored_ends.extend(ends)
+    nearest = _nearest_stored_point(stored_ends, tolerance_m)
+
+    displaced = []
+    worst = 0.0
+    # The hash only looks one cell out, so a vertex displaced by much more than
+    # the tolerance misses every bucket. Reporting that as "not found" would
+    # hide the number that matters -- how far it actually went -- so a miss
+    # falls back to a full scan. Budgeted, because once dozens of vertices have
+    # moved the profile is already condemned and the exact distances stop
+    # earning their O(n^2).
+    scans_left = 64
+    for index, (x, y) in enumerate(points_m):
+        _, distance = nearest(x, y)
+        if distance == float("inf") and stored_ends and scans_left > 0:
+            scans_left -= 1
+            distance = min(math.dist((x, y), candidate) for candidate in stored_ends)
+        if distance == float("inf"):
+            displaced.append({"index": index, "requested_m": [x, y], "distance_m": None})
+            continue
+        worst = max(worst, distance)
+        if distance > tolerance_m:
+            displaced.append({"index": index, "requested_m": [x, y],
+                              "distance_m": distance})
+    result["points_verified"] = len(points_m)
+    result["max_point_deviation_m"] = worst
+    result["displaced_points"] = displaced[:8]
+    result["displaced_point_count"] = len(displaced)
+    result["unreadable_segments"] = unreadable
+    result["snapped"] = bool(displaced)
+    result["verified"] = not displaced and unreadable == 0
+    warnings = []
+    if displaced:
+        unmatched = sum(1 for item in displaced if item["distance_m"] is None)
+        # Millimetres, not the metres this function works in: the message is
+        # read by whoever has to act on it, and every dimension they typed was
+        # in millimetres.
+        measured = (f"worst {worst * 1000.0:.4g} mm" if worst > 0.0
+                    else "none of them close enough to measure")
+        extra = (f"; {unmatched} of them have no stored vertex anywhere near, so the "
+                 f"geometry went somewhere else entirely" if unmatched else "")
+        warnings.append(
+            f"{len(displaced)} of {len(points_m)} vertices are NOT where they were "
+            f"computed ({measured}){extra}: the profile in the sketch is not the "
+            f"profile that was asked for. Do not extrude it -- delete the sketch "
+            f"and investigate, because the solid would look plausible and be wrong")
+    if unreadable:
+        warnings.append(
+            f"{unreadable} segment(s) would not report their ends, so those vertices "
+            f"are UNCHECKED rather than confirmed")
+    result["warnings"] = warnings
+    return result
+
+
+
+def _spline_interior_check(spline, requested, factor: float, tolerance: float,
+                           unit: Optional[str]) -> dict:
+    """Where the spline's own control points ended up, interior ones included.
+
+    draw_spline could only ever check its two ends, and the ends are the two
+    points the snap is LEAST likely to move: a displaced interior point leaves
+    both ends exactly where they were asked for, so a deformed curve came back
+    ``verified: true``. That matters most for the profiles a spline is actually
+    used for -- a cam displacement law, an airfoil -- where the interior IS the
+    geometry.
+
+    ISketchSpline exposes its points through a Get...Points member whose name
+    and array layout differ between SolidWorks versions, so each candidate is
+    tried and the result is only trusted when it decodes into at least as many
+    points as were requested. When none does, this says the interior is
+    UNCHECKED (``verified: None``) instead of leaving the caller to read the
+    ends as proof of the whole curve.
+    """
+    result = {"requested_points": len(requested), "warnings": []}
+    raw = None
+    for member in ("GetPoints3", "GetPoints2", "GetPoints"):
+        try:
+            value = _com_member(spline, member)
+        except Exception:
+            continue
+        if value:
+            raw, result["read_through"] = list(value), member
+            break
+    if raw is None:
+        result["verified"] = None
+        result["warnings"].append(
+            "the spline's control points could not be read back, so only its two "
+            "ENDS were checked and the interior of the curve is UNVERIFIED -- a "
+            "point moved by the sketch snap would leave both ends correct. For a "
+            "computed curve use draw_profile, which draws with inference off and "
+            "measures every vertex")
+        return result
+
+    numbers = []
+    for item in raw:
+        try:
+            numbers.append(float(item))
+        except (TypeError, ValueError):
+            numbers = []
+            break
+    stored = None
+    for stride in (3, 2):
+        if numbers and len(numbers) % stride == 0 and len(numbers) // stride >= len(requested):
+            stored = [(numbers[i] * factor, numbers[i + 1] * factor)
+                      for i in range(0, len(numbers), stride)]
+            result["decoded_as"] = f"{stride} doubles per point"
+            break
+    if not stored:
+        result["verified"] = None
+        result["warnings"].append(
+            f"the spline returned {len(raw)} value(s) through {result.get('read_through')}, "
+            f"which does not decode into at least the {len(requested)} points that were "
+            f"requested, so the interior of the curve is UNVERIFIED. For a computed "
+            f"curve use draw_profile, which measures every vertex")
+        return result
+
+    result["stored_points"] = len(stored)
+    displaced, worst = [], 0.0
+    for index, point in enumerate(requested):
+        target = (float(point[0]), float(point[1]))
+        distance = min(math.dist(target, candidate) for candidate in stored)
+        worst = max(worst, distance)
+        if distance > tolerance:
+            displaced.append({"index": index, "requested": list(target),
+                              "distance": distance})
+    result["max_deviation"] = worst
+    result["tolerance"] = tolerance
+    result["unit"] = unit or _default_unit
+    result["displaced_points"] = displaced[:8]
+    result["displaced_point_count"] = len(displaced)
+    result["verified"] = not displaced
+    if displaced:
+        interior = [item for item in displaced
+                    if 0 < item["index"] < len(requested) - 1]
+        result["warnings"].append(
+            f"{len(displaced)} of {len(requested)} control points are NOT where they "
+            f"were requested (worst {worst:.6g} {result['unit']}), "
+            f"{len(interior)} of them INTERIOR: the sketch snap moved them and the "
+            f"curve is deformed even where its ends look right. Delete it and use "
+            f"draw_profile for a computed curve")
+    return result
 
 
 def _sketch_verdict(what: str, points, scalars, tolerance: float,
@@ -4677,6 +4960,23 @@ async def draw_spline(points: list[list[float]], natural_ends: bool = True,
     PERIODIC (closed) spline, which loops back through the points instead of
     running through them once. That failure was previously only visible as a
     shape that looked wrong -- see the is_periodic inversion below.
+
+    THE INTERIOR IS CHECKED TOO, and it is the part that matters. The ends are
+    the two points the sketch snap is least likely to move; a displaced
+    INTERIOR control point leaves both ends exactly where they were asked for,
+    so this tool used to call a deformed curve verified. ``interior_points``
+    now reports every control point read back out of the spline, and
+    ``verified`` goes false when any of them moved. SolidWorks does not always
+    expose them: ``interior_points.verified`` comes back None with a reason
+    when they could not be read, which means the interior is UNCHECKED rather
+    than correct.
+
+    FOR A COMPUTED CURVE, PREFER draw_profile. A spline is the right tool for a
+    shape you want smooth and free (an ergonomic transition, a styling line).
+    For a curve you already worked out numerically -- an involute, a cam law,
+    an airfoil -- draw_profile draws the whole chain with the inference engine
+    switched OFF, so nothing can snap in the first place, and it measures every
+    vertex.
     """
 
     def _impl():
@@ -4724,6 +5024,7 @@ async def draw_spline(points: list[list[float]], natural_ends: bool = True,
             "a spline",
         )
         actual = _sketch_segment_geometry(spline, factor)
+        interior = _spline_interior_check(spline, points, factor, tolerance, unit)
         first = (float(points[0][0]), float(points[0][1]), 0.0)
         last = (float(points[-1][0]), float(points[-1][1]), 0.0)
         start, end = _match_endpoints(first, last, actual)
@@ -4757,6 +5058,18 @@ async def draw_spline(points: list[list[float]], natural_ends: bool = True,
                 verdict["verified"] = False
             result["actual_ends_apart"] = ends_apart
         result.update(verdict)
+        # The ends were never the whole story: an INTERIOR control point moved
+        # by the snap leaves both ends where they were asked to be, so the
+        # verdict above would call a deformed curve verified. Fold the interior
+        # reading into it -- including when it could not be read, which is
+        # reported rather than passed over.
+        result["interior_points"] = interior
+        if interior.get("verified") is False:
+            result["verified"] = False
+            result["snapped"] = True
+            result["warnings"] = list(result.get("warnings", ())) + interior["warnings"]
+        elif interior.get("verified") is None:
+            result["warnings"] = list(result.get("warnings", ())) + interior["warnings"]
         return result
 
     return await _run(_impl)
@@ -4845,6 +5158,125 @@ async def draw_polygon(cx: float = 0, cy: float = 0, radius: float = 25, sides: 
                 f"this is not the polygon that was asked for")
             verdict["verified"] = False
         result.update(verdict)
+        return result
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def draw_profile(points: list[list[float]], closed: bool = True,
+                       unit: Optional[str] = None, tolerance: float = 0.01,
+                       verify_points: bool = True) -> dict:
+    """Draw a COMPUTED curve as one chain of segments, snap-proof, in one call.
+
+    This is the tool for any engineering profile you worked out numerically and
+    now have as a list of points: an involute flank, a cycloidal or harmonic cam
+    law, a trochoid, an HTD/GT2 belt-pulley tooth, a chain-sprocket gap, an
+    airfoil, a cross-section digitised off a drawing. Pass the whole outline.
+
+    WHY NOT draw_line IN A LOOP, AND WHY NOT draw_spline. Every
+    ISketchManager.Create* call runs through SolidWorks' sketch inference
+    engine, whose snap radius is a distance in SCREEN PIXELS. What that engine
+    collapses is a new point that falls within a few pixels of a point already
+    in the sketch -- so what decides whether a curve survives is the spacing
+    between its OWN consecutive points, not the size of the feature and not the
+    size of the part. Sampling a curve finely is exactly the condition that
+    triggers it, and it triggers SILENTLY: the point is MOVED and the call
+    succeeds. That is how a 20-tooth gear on a 44 mm blank came out as a smooth
+    disc that rebuilt clean and measured plausibly. draw_spline has the same
+    exposure and can only verify its two end points, so a displaced interior
+    control point passes as verified. 200 draw_line calls also cost 200 round
+    trips.
+
+    This tool switches the inference engine off (SetAddToDB) for the whole
+    chain, so nothing can snap, and it is one call regardless of point count.
+
+    EVERY VERTEX IS MEASURED, NOT ECHOED. The stored segment ends are read back
+    out of SolidWorks and matched against the points that were requested:
+    ``max_point_deviation`` is the worst one, ``displaced_points`` names the
+    offenders with their index, and ``verified`` is true only when every vertex
+    landed inside ``tolerance`` and every segment arrived. A profile short of
+    segments raises instead of returning, because a short profile is an open
+    profile and the extrusion afterwards would fail with a worse message.
+
+    points: [[x, y], ...] in ``unit``, in order along the curve. For a closed
+        outline do NOT repeat the first point -- ``closed=True`` adds the
+        segment back to it.
+    closed: True for a profile to extrude or cut (needs a closed loop), False
+        for an open chain (a sweep path, a construction run of segments).
+    verify_points: leave True. False skips the read-back on a very large
+        profile and says so in the result; nothing then confirms the geometry.
+
+    A sketch must already be open (create_sketch / create_sketch_on_face). Call
+    it once per loop: a second call adds another closed loop to the same sketch,
+    which is how you put a bore, a window or a repeated cell in one profile.
+
+    LIMITS. Straight segments only -- a curve arrives as chords, so sample it
+    finely enough for the job (the chord sits inside the true curve, so a cut
+    comes out slightly large and a boss slightly small). It does not dimension
+    or constrain anything: the geometry has no relations at all, which is what
+    makes it exact and also means a later drag would deform it. For a gear, do
+    not sample it by hand -- create_spur_gear already does all of this.
+    """
+
+    def _impl():
+        if not isinstance(points, (list, tuple)) or len(points) < 2:
+            raise ValueError("points must be a list of at least two [x, y] pairs.")
+        points_m = []
+        for index, point in enumerate(points):
+            if not isinstance(point, (list, tuple)) or len(point) != 2:
+                raise ValueError(
+                    f"points[{index}] must be an [x, y] pair, got {point!r}. A 2D "
+                    f"sketch profile has no z: a third value would shift every "
+                    f"following coordinate.")
+            x, y = point
+            points_m.append((to_meters(float(x), unit), to_meters(float(y), unit)))
+
+        # A duplicated first/last point on a closed loop makes a zero-length
+        # segment, which SolidWorks accepts and the contour solver then trips
+        # over. Say so rather than silently dropping it.
+        if closed and math.dist(points_m[0], points_m[-1]) <= to_meters(tolerance, unit):
+            raise ValueError(
+                "the first and last point are the same and closed=True, which asks "
+                "for a zero-length closing segment. Drop the repeated last point, "
+                "or pass closed=False.")
+        shortest = min(math.dist(a, b) for a, b in zip(points_m, points_m[1:]))
+        if shortest <= 0.0:
+            raise ValueError(
+                "two consecutive points are identical, which makes a zero-length "
+                "segment. Remove the duplicate before drawing.")
+
+        doc = _active_doc()
+        active_unit, factor = _unit_factor(unit)
+        tolerance_m = to_meters(tolerance, unit)
+        measurement = _draw_profile_points(doc, points_m, closed, tolerance_m,
+                                           verify_points)
+        result = {
+            "unit": active_unit,
+            "point_count": len(points_m),
+            "closed": bool(closed),
+            "segments": measurement["segments_stored"],
+            "shortest_segment": shortest * factor,
+            "points_verified": measurement.get("points_verified"),
+            "verified": measurement.get("verified"),
+            "warnings": list(measurement.get("warnings", [])),
+        }
+        if "verification_skipped" in measurement:
+            result["verification_skipped"] = measurement["verification_skipped"]
+        if "max_point_deviation_m" in measurement:
+            result["max_point_deviation"] = measurement["max_point_deviation_m"] * factor
+            result["deviation_tolerance"] = tolerance
+            result["snapped"] = measurement["snapped"]
+            result["displaced_point_count"] = measurement["displaced_point_count"]
+            result["displaced_points"] = [
+                {"index": item["index"],
+                 "requested": [coordinate * factor for coordinate in item["requested_m"]],
+                 "distance": None if item["distance_m"] is None
+                 else item["distance_m"] * factor}
+                for item in measurement["displaced_points"]
+            ]
+            if measurement["unreadable_segments"]:
+                result["unreadable_segments"] = measurement["unreadable_segments"]
         return result
 
     return await _run(_impl)
@@ -7040,7 +7472,19 @@ async def create_knurl(
     pattern: 'diamond' (crossed lines) or 'straight' (axial grooves only).
     pitch: distance between neighboring grooves.
     depth: groove depth (typically 0.2–0.5 mm).
-    angle: helix angle for diamond pattern (30 = standard)."""
+    angle: helix angle for diamond pattern (30 = standard).
+    THE PROFILE IS MEASURED. A knurl cell is about 0.2 mm across, with its
+    vertices a tenth of a millimetre apart -- well inside the inference
+    engine's screen-space snap radius, and three times tighter than the
+    gear-tooth spacing that was confirmed to collapse. The cells are therefore
+    drawn with inference OFF and every vertex is read back: ``profile.verified``
+    is false, and the call raises, if any of them moved. Before this, the only
+    check was that InsertWrapFeature2 returned non-None, so a cell snapped flat
+    engraved nothing and the tool reported success.
+
+    What is still NOT measured is the engraved DEPTH -- the Wrap feature
+    exposes none to read back. The result says so in ``warnings`` rather than
+    implying the grooves were checked."""
 
     def _impl():
         if pitch <= 0:
@@ -7080,6 +7524,7 @@ async def create_knurl(
             doc.InsertSketch2(True)
             sketch_open = True
 
+            cells = []
             center_u = 2.5 * p_m
             center_v = 2.5 * p_m
             half_width = max(p_m * 0.22, to_meters(0.1, "mm"))
@@ -7103,9 +7548,25 @@ async def create_knurl(
                         (cell_u + half_width * 0.45, center_v - half_height),
                         (cell_u - half_width * 0.45, center_v - half_height),
                     ]
-                for start, end in zip(points, points[1:] + points[:1]):
-                    if doc.SketchManager.CreateLine(start[0], start[1], 0, end[0], end[1], 0) is None:
-                        raise RuntimeError("SolidWorks could not create a closed knurl profile cell.")
+                # A knurl cell is 0.2 mm across, with its points a tenth of a
+                # millimetre apart -- three times tighter than the gear-tooth
+                # spacing that was confirmed to collapse under the inference
+                # engine's screen-space snap. Drawn through SketchManager this
+                # was the smooth-gear failure all over again, and worse: the
+                # only check was that InsertWrapFeature2 returned non-None, so
+                # a cell snapped flat engraved nothing and reported success.
+                # _draw_profile_points draws it with inference OFF and reads
+                # every vertex back.
+                cell = _draw_profile_points(
+                    doc, points, True, to_meters(0.0005, "mm"))
+                cells.append(cell)
+                if cell["warnings"]:
+                    raise RuntimeError(
+                        "the knurl cell profile did not land where it was computed: "
+                        + " | ".join(cell["warnings"])
+                        + f". The cell is {2 * half_width * 1000:.3f} mm wide; a coarser "
+                        f"pitch gives the sketch more room."
+                    )
 
             doc.InsertSketch2(True)
             sketch_open = False
@@ -7149,6 +7610,23 @@ async def create_knurl(
             "depth": depth,
             "angle": angle,
             "unit": unit or _default_unit,
+            "profile": {
+                "cells": len(cells),
+                "segments": sum(cell["segments_stored"] for cell in cells),
+                "vertices_verified": sum(cell["points_verified"] for cell in cells),
+                "max_vertex_deviation_mm": max(
+                    (cell["max_point_deviation_m"] * 1000.0 for cell in cells),
+                    default=0.0),
+                "cell_width_mm": 2 * half_width * 1000.0,
+                "verified": all(cell["verified"] for cell in cells),
+            },
+            "warnings": [
+                "the engraved DEPTH is not measured: InsertWrapFeature2 reports no "
+                "depth to read back, so this result confirms the profile landed "
+                "correctly and the Wrap feature was created -- not how deep the "
+                "grooves came out. Check it with list_faces or a section view if it "
+                "matters."
+            ],
         }
 
     return await _run(_impl)
@@ -11409,11 +11887,46 @@ async def create_automotive_piston(
         # Offset planes let each annular cut start at its intended axial height.
         # This avoids relying on a revolved cut's local-plane orientation.
         stage = "three ring grooves"
+        # The groove is the gap between two circles whose radii differ by
+        # 2 * ring_depth -- 3 mm by default. Both go through the sketch
+        # inference engine, and the second circle's defining point lands that
+        # close to the first one's: inside the snap radius at an unlucky zoom,
+        # the two radii collapse, the annulus has no width, and the cut removes
+        # nothing. draw_circle measures its own radius and centre, so the
+        # failure is detectable -- it just was not being read. It is now.
+        groove_checks = []
         for ring_bottom in reversed(ring_bottoms):
             plane = await create_reference_plane("front", ring_bottom, unit=unit)
             await create_sketch(plane["plane"])
-            await draw_circle(0, 0, radius + ring_depth, unit)
-            await draw_circle(0, 0, radius - ring_depth, unit)
+            outer = await draw_circle(0, 0, radius + ring_depth, unit)
+            inner = await draw_circle(0, 0, radius - ring_depth, unit)
+            for which, circle in (("outer", outer), ("inner", inner)):
+                if circle.get("verified") is False:
+                    raise RuntimeError(
+                        f"the {which} circle of the ring groove at {ring_bottom} "
+                        f"{unit or _default_unit} is not the circle that was asked for "
+                        f"({circle.get('deviation')}). The groove would come out with "
+                        f"the wrong depth, or with none at all, and the piston would "
+                        f"still look right: "
+                        + " | ".join(circle.get("warnings", ())))
+            measured_width = None
+            outer_radius = (outer.get("actual") or {}).get("radius")
+            inner_radius = (inner.get("actual") or {}).get("radius")
+            if outer_radius is not None and inner_radius is not None:
+                measured_width = outer_radius - inner_radius
+                if measured_width < ring_depth:
+                    raise RuntimeError(
+                        f"the ring groove at {ring_bottom} {unit or _default_unit} "
+                        f"measures {measured_width:.4g} radially where "
+                        f"{2 * ring_depth:.4g} was asked for: the two circles came out "
+                        f"closer together than requested, so the groove is too shallow "
+                        f"to be a ring groove."
+                    )
+            groove_checks.append({
+                "axial_position": ring_bottom,
+                "requested_radial_width": 2 * ring_depth,
+                "measured_radial_width": measured_width,
+            })
             await close_sketch()
             await cut_extrude(ring_width, unit=unit)
         completed.append(stage)
@@ -11460,6 +11973,7 @@ async def create_automotive_piston(
                 "unit": unit or _default_unit,
             },
             "features": ["extruded skirt/crown", "three ring grooves", "hollow underside", "wrist-pin bore"],
+            "ring_grooves": groove_checks,
             "completed_stages": completed,
         }
     except Exception as exc:
@@ -11644,15 +12158,48 @@ async def create_automotive_piston_assembly(
 
         stage = "assembly insertion"
         assembly = await create_new_assembly()
-        await insert_component(part_paths["piston"], unit=unit)
-        # The piston itself begins at the Front plane.  Shift the rod group a
-        # controlled positive distance toward the viewing side of that plane so its
-        # beam is visible below the skirt instead of being occluded by it.
-        # The long wrist pin still spans this offset and the piston body.
-        await insert_component(part_paths["connecting_rod"], z=front_offset, unit=unit)
-        await insert_component(part_paths["wrist_pin"], z=front_offset, unit=unit)
-        await insert_component(part_paths["bearing"], z=front_offset, unit=unit)
-        await insert_component(part_paths["rod_cap"], x=rod_width + 4, z=front_offset, unit=unit)
+        # insert_component reads each component's pose back out of SolidWorks
+        # and returns actual_position/deviation/verified. Nothing here was
+        # reading it: a component that did not land where it was placed left
+        # the assembly looking plausible, and the five offsets below are the
+        # only thing holding this assembly together -- there are no mates. So
+        # every placement is checked, and the measured poses are reported.
+        placements = [
+            # The piston itself begins at the Front plane. The rod group is
+            # shifted a controlled positive distance toward the viewing side of
+            # that plane so its beam is visible below the skirt instead of
+            # being occluded by it. The long wrist pin still spans this offset
+            # and the piston body.
+            ("piston", {}),
+            ("connecting_rod", {"z": front_offset}),
+            ("wrist_pin", {"z": front_offset}),
+            ("bearing", {"z": front_offset}),
+            ("rod_cap", {"x": rod_width + 4, "z": front_offset}),
+        ]
+        component_positions = []
+        misplaced = []
+        for key, offsets in placements:
+            placed = await insert_component(part_paths[key], unit=unit, **offsets)
+            component_positions.append({
+                "part": key,
+                "component": placed.get("name"),
+                "requested_position": placed.get("requested_position"),
+                "actual_position": placed.get("actual_position"),
+                "deviation": placed.get("deviation"),
+                "fixed": placed.get("fixed"),
+                "verified": placed.get("verified"),
+            })
+            if placed.get("verified") is not True:
+                misplaced.append(
+                    f"{key} ({placed.get('name')}): {placed.get('deviation')}")
+        if misplaced:
+            raise RuntimeError(
+                "components did not land where they were placed, and this assembly "
+                "has no mates to pull them back: "
+                + " | ".join(misplaced)
+                + ". Do not build on this assembly -- check it with "
+                "verify_assembly_positions and get_component_transform."
+            )
         completed.append(stage)
 
         stage = "assembly save and view"
@@ -11666,6 +12213,19 @@ async def create_automotive_piston_assembly(
             "assembly": assembly["title"],
             "save_path": assembly_path,
             "components": part_paths,
+            "component_positions": component_positions,
+            "position_check": {
+                "method": ("every insert_component pose was read back out of "
+                           "SolidWorks and compared with the requested offset"),
+                "all_verified": True,
+                "next_step": (
+                    "verify_assembly_positions(require_constrained=False) for the "
+                    "assembly-wide checks. Expect M01 on all five (this assembly is "
+                    "deliberately unmated) and M03 on connecting_rod, wrist_pin and "
+                    "bearing: those three are modelled in place and share the insert "
+                    "origin on purpose, so sharing a position is correct here, not a "
+                    "stack of parts in the wrong spot"),
+            },
             "features": [
                 "piston crown/skirt with three ring grooves",
                 "hollow underside and wrist-pin bore",
@@ -12239,38 +12799,33 @@ async def create_spur_gear(
         return await _run(_impl)
 
     def _draw_closed_profile():
+        # _draw_profile_points is the shared snap-proof primitive (also exposed
+        # as the draw_profile tool): inference engine off for the whole chain,
+        # then every vertex read back and compared. The gear profile is what it
+        # was written for, and keeping one implementation means a fix to the
+        # drawing path reaches every computed profile, not just this one.
         doc = _active_doc()
-        sketch = _active_sketch(doc)
-        returned = 0
-        # SetAddToDB puts geometry straight into the sketch database, with no
-        # inference and no automatic relations: this is what makes a
-        # tooth-scale point land where it was asked to instead of snapping
-        # onto its neighbour. DisplayWhenAdded(False) keeps several hundred
-        # segments from being redrawn one at a time.
-        doc.SetAddToDB(True)
-        doc.SetDisplayWhenAdded(False)
-        try:
-            for (x1, y1), (x2, y2) in zip(points_m, points_m[1:] + points_m[:1]):
-                if doc.CreateLine2(x1, y1, 0.0, x2, y2, 0.0) is not None:
-                    returned += 1
-        finally:
-            doc.SetDisplayWhenAdded(True)
-            doc.SetAddToDB(False)
-        stored = len(_sketch_segments(sketch))
-        if stored != segment_count:
+        measurement = _draw_profile_points(
+            doc, points_m, True, to_meters(0.001, "mm"))
+        if measurement["segments_stored"] != segment_count:
             raise RuntimeError(
                 f"the gear profile should hold {segment_count} segments "
                 f"({gear.points_per_tooth} per tooth x {teeth} teeth) but the sketch "
-                f"stored {stored}. An incomplete profile is an open profile, which "
-                f"cannot be extruded; delete the sketch and retry with fewer "
-                f"flank_points, or build the gear in a new empty part."
+                f"stored {measurement['segments_stored']}."
             )
-        return {"segments": stored, "segments_returned_by_com": returned}
+        return measurement
 
     try:
         stage = "gear profile sketch"
         sketch_info = await create_sketch(plane)
         profile_info = await _run(_draw_closed_profile)
+        if profile_info.get("warnings"):
+            # A displaced vertex here is the original failure of this whole
+            # tool. Refusing beats extruding a profile that is not the gear.
+            raise RuntimeError(
+                "the gear profile did not land where it was computed: "
+                + " | ".join(profile_info["warnings"])
+            )
         await close_sketch()
         completed.append(stage)
 
@@ -12422,7 +12977,10 @@ async def create_spur_gear(
                      "the mating gear's tooth thickness"),
         },
         "profile": {
-            "sketch_segments": profile_info["segments"],
+            "sketch_segments": profile_info["segments_stored"],
+            "vertices_verified": profile_info.get("points_verified"),
+            "max_vertex_deviation": _in_unit(
+                profile_info.get("max_point_deviation_m", 0.0) * 1000.0),
             "segments_per_tooth": gear.points_per_tooth,
             "flank_chord_error": _in_unit(gear.chord_error_mm),
             "tip_land": _in_unit(gear.tip_land_mm),

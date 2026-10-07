@@ -1,4 +1,7 @@
-"""Live verification of create_spur_gear: does the gear actually have teeth?
+"""Live verification of the snap-proof profile layer: draw_profile, the gear
+built on it, and the knurl whose cells are smaller than a gear tooth.
+
+The first question is still the blunt one -- does the gear actually have teeth?
 
 The profile maths is covered off-line by tests/test_gear_geometry.py. What
 this script checks is the part only a running SolidWorks can answer: that
@@ -6,9 +9,15 @@ SetAddToDB + several hundred CreateLine2 calls really do land a complete,
 closed, un-snapped profile, that it extrudes, and that the solid's measured
 volume matches the analytic cross-section of the outline that drew it.
 
+The later sections check the same primitive on a curve that is not a gear (a
+180-point cam outline, whose extruded volume is compared with the shoelace area
+of the points that were sent) and on create_knurl, whose 0.2 mm cells are three
+times tighter than the tooth spacing that collapsed.
+
 Run on Windows with SolidWorks installed:  python tests/run_gear_live_test.py
 """
 import asyncio
+import math
 import sys
 from pathlib import Path
 
@@ -131,6 +140,51 @@ async def main():
         print(f"\nthe hand-drawn attempt failed outright: {exc}")
         check("the hand-drawn attempt does not silently produce a gear", True,
               "it raised instead of returning a disc")
+    await server.close_document(save=False)
+
+    # --- draw_profile: the same primitive, on a curve that is not a gear ----
+    # A cam-like outline, so the check is on the drawing path rather than on
+    # gear_geometry: the extruded volume is compared with the shoelace area of
+    # the very points that were sent.
+    await server.create_new_part()
+    cam = [
+        [26 * math.cos(math.radians(a)) + 4 * math.cos(math.radians(2 * a)),
+         26 * math.sin(math.radians(a))]
+        for a in range(0, 360, 2)
+    ]
+    await server.create_sketch("front")
+    profile = await server.draw_profile(cam, closed=True, unit="mm")
+    print("\ndraw_profile(180-point cam outline):", {
+        key: profile[key] for key in
+        ("segments", "points_verified", "max_point_deviation", "snapped", "verified")
+    })
+    check("every vertex of a 180-point curve landed where it was computed",
+          profile["verified"] is True,
+          f"worst deviation {profile.get('max_point_deviation')} mm")
+    check("one call drew one segment per point",
+          profile["segments"] == len(cam))
+    await server.close_sketch()
+    await server.extrude_sketch(8, unit="mm")
+    cam_solid = await server.measure_body()
+    expected_mm3 = gg.polygon_area([(x, y) for x, y in cam]) * 8.0
+    measured_mm3 = cam_solid["volume_m3"] * 1e9
+    check("the extruded cam matches the area of the points that drew it",
+          abs(measured_mm3 / expected_mm3 - 1) < 0.01,
+          f"{measured_mm3:.1f} vs {expected_mm3:.1f} mm3")
+    await server.close_document(save=False)
+
+    # --- create_knurl: the cell profile is 0.2 mm across -------------------
+    await server.create_new_part()
+    await server.create_sketch("front")
+    await server.draw_circle(0, 0, 12, "mm")
+    await server.close_sketch()
+    await server.extrude_sketch(30, unit="mm")
+    knurl = await server.create_knurl(12, 0, 15, "diamond", 0.8, 0.3, 30, "mm")
+    print("\ncreate_knurl:", knurl.get("profile"))
+    check("the knurl cells landed where they were computed",
+          (knurl.get("profile") or {}).get("verified") is True, str(knurl.get("profile")))
+    print("The engraved DEPTH is not readable from the Wrap feature -- look at the "
+          "part, or section it, before calling the knurl good.")
     await server.close_document(save=False)
 
     server._shutdown()
