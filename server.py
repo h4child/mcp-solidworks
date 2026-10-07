@@ -7144,6 +7144,203 @@ async def create_knurl(
     return await _run(_impl)
 
 
+def _gear_flank_points(r_base: float, r_start: float, r_end: float,
+                       theta0: float, samples: int = 12) -> list:
+    """Points (x, y) along the +side involute flank of a tooth gap, root -> tip.
+
+    All lengths are in meters. The flank is the involute of the base circle of
+    radius ``r_base``: it leaves the base circle at polar angle ``theta0``
+    (radians, measured from the gap centerline on the +X axis) and, at radius
+    r, sits at polar angle ``theta0 + inv(alpha_r)`` where
+    ``alpha_r = acos(r_base / r)`` and ``inv(a) = tan(a) - a``.
+
+    Return ``samples`` points from radius ``r_start`` to ``r_end`` (inclusive),
+    evenly spaced in radius, as a list of (x, y) tuples.
+    """
+    points = []
+    for i in range(samples):
+        r = max(r_base, r_start + (r_end - r_start) * i / (samples - 1))
+        alpha = math.acos(min(1.0, r_base / r))
+        phi = theta0 + math.tan(alpha) - alpha
+        points.append((r * math.cos(phi), r * math.sin(phi)))
+    return points
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def create_gear(
+    module: float = 2.0,
+    teeth: int = 20,
+    face_width: float = 10.0,
+    pressure_angle: float = 20.0,
+    bore_diameter: float = 0.0,
+    plane: str = "front",
+    unit: Optional[str] = None,
+) -> dict:
+    """Create a standard external spur gear with true involute teeth.
+
+    SolidWorks has no gear feature in its COM API (Toolbox gears are not
+    scriptable), so the gear is built the way it is modeled by hand: a blank
+    cylinder at the addendum diameter, one involute tooth GAP cut through it,
+    and that cut repeated ``teeth`` times in a circular pattern.
+
+    module: gear module in mm-equivalent units (pitch diameter = module * teeth).
+    teeth: number of teeth (6-200).
+    face_width: gear thickness along the axis, extruded from the sketch plane.
+    pressure_angle: 14.5-30 degrees (20 is the modern standard).
+    bore_diameter: optional center bore (0 = no bore).
+    plane: 'front', 'top' or 'right'; the gear axis is that plane's normal.
+
+    Proportions are the standard full-depth system: addendum = 1 module,
+    dedendum = 1.25 module. Open an empty part first (create_new_part)."""
+
+    def _impl():
+        if module <= 0:
+            raise ValueError(f"Module must be positive, got {module}.")
+        if not 6 <= teeth <= 200:
+            raise ValueError(f"Teeth must be between 6 and 200, got {teeth}.")
+        if face_width <= 0:
+            raise ValueError(f"Face width must be positive, got {face_width}.")
+        if not 14.5 <= pressure_angle <= 30:
+            raise ValueError(f"Pressure angle must be between 14.5 and 30 degrees, got {pressure_angle}.")
+        plane_key = plane.lower()
+        axis_for_plane = {"front": "z", "top": "y", "right": "x"}
+        if plane_key not in axis_for_plane:
+            raise ValueError("plane must be 'front', 'top' or 'right'.")
+
+        m = to_meters(module, unit)
+        alpha = math.radians(pressure_angle)
+        r_pitch = m * teeth / 2.0
+        r_add = r_pitch + m
+        r_root = r_pitch - 1.25 * m
+        r_base = r_pitch * math.cos(alpha)
+        bore_r = to_meters(bore_diameter, unit) / 2.0
+        if bore_diameter < 0 or (bore_diameter > 0 and bore_r >= r_root * 0.9):
+            raise ValueError("bore_diameter must be >= 0 and leave material below the tooth roots.")
+
+        # Gap half-angle at the pitch circle is pi/(2z); the involute leaves
+        # the base circle theta0 earlier than that by inv(alpha).
+        inv_alpha = math.tan(alpha) - alpha
+        theta0 = math.pi / (2.0 * teeth) - inv_alpha
+        r_flank_start = max(r_root, r_base)
+        r_cut_end = r_add * 1.1
+        samples = 12
+
+        plus = _gear_flank_points(r_base, r_flank_start, r_cut_end, theta0, samples)
+        if len(plus) < 2:
+            raise RuntimeError("_gear_flank_points returned fewer than two points.")
+        minus = [(x, -y) for x, y in plus]
+
+        doc = _active_doc()
+        empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+
+        def _open_sketch():
+            doc.ClearSelection2(True)
+            if not _select_by_id(doc, _standard_plane_name(doc, plane_key), "PLANE"):
+                raise RuntimeError(f"Could not select the {plane_key} plane.")
+            doc.InsertSketch2(True)
+            _remember_active_sketch(doc)
+
+        def _spline(points):
+            flat = [c for p in points for c in p]
+            data = win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, flat)
+            status = win32com.client.VARIANT(pythoncom.VT_VARIANT | pythoncom.VT_BYREF, None)
+            if doc.SketchManager.CreateSpline3(data, None, None, False, status) is None:
+                raise RuntimeError("SolidWorks could not create an involute flank spline.")
+
+        def _arc(radius, half_angle):
+            p1 = (radius * math.cos(-half_angle), radius * math.sin(-half_angle))
+            p2 = (radius * math.cos(half_angle), radius * math.sin(half_angle))
+            if doc.SketchManager.CreateArc(0, 0, 0, p1[0], p1[1], 0, p2[0], p2[1], 0, 1) is None:
+                raise RuntimeError("SolidWorks could not create a gear arc.")
+
+        # 1) Blank cylinder at the addendum diameter.
+        _open_sketch()
+        if doc.SketchManager.CreateCircle(0, 0, 0, r_add, 0, 0) is None:
+            raise RuntimeError("Could not draw the gear blank circle.")
+        doc.InsertSketch2(True)
+        _select_last_sketch(doc)
+        blank = doc.FeatureManager.FeatureExtrusion2(
+            True, False, False, 0, 0, to_meters(face_width, unit), 0.0,
+            False, False, False, False, 0.0, 0.0,
+            False, False, False, False,
+            True, True, True, 0, 0.0, False,
+        )
+        if blank is None:
+            raise RuntimeError("Gear blank extrusion failed.")
+
+        # 2) One tooth gap: two involute flanks, root arc, outer closing arc.
+        _open_sketch()
+        _spline(plus)
+        _spline(minus)
+        theta_root = math.atan2(plus[0][1], plus[0][0])
+        if r_root < r_base:
+            for sign in (1, -1):
+                if doc.SketchManager.CreateLine(
+                    r_root * math.cos(sign * theta_root), r_root * math.sin(sign * theta_root), 0,
+                    plus[0][0], sign * plus[0][1], 0,
+                ) is None:
+                    raise RuntimeError("Could not draw the radial root line of the tooth gap.")
+        _arc(r_root, theta_root)
+        _arc(r_cut_end, math.atan2(plus[-1][1], plus[-1][0]))
+        doc.InsertSketch2(True)
+        _select_last_sketch(doc)
+        cut = doc.FeatureManager.FeatureCut4(
+            True, False, False, 2, 0, 0.0, 0,
+            False, False, False, False, 0.0, 0.0,
+            False, False, False, False,
+            False, True, True,
+            False, False, False,
+            0, 0.0, False, False,
+        )
+        if cut is None:
+            raise RuntimeError("Tooth gap cut failed; the gap profile is not a closed loop.")
+        cut_name = win32com.client.Dispatch(cut).Name
+
+        # 3) Repeat the gap around the gear axis.
+        axis_name = _ensure_pattern_axis(doc, axis_for_plane[plane_key])
+        doc.ClearSelection2(True)
+        if not doc.Extension.SelectByID2(axis_name, "AXIS", 0, 0, 0, False, 1, empty, 0):
+            raise RuntimeError("Could not select the gear axis for the pattern.")
+        if not doc.Extension.SelectByID2(cut_name, "BODYFEATURE", 0, 0, 0, True, 4, empty, 0):
+            raise RuntimeError(f"Could not select tooth gap feature '{cut_name}'.")
+        pattern = doc.FeatureManager.FeatureCircularPattern4(
+            teeth, 2 * math.pi, False, "", False, True, False)
+        doc.ClearSelection2(True)
+        if pattern is None:
+            raise RuntimeError("Circular pattern of the tooth gap failed.")
+
+        # 4) Optional bore.
+        if bore_diameter > 0:
+            _open_sketch()
+            if doc.SketchManager.CreateCircle(0, 0, 0, bore_r, 0, 0) is None:
+                raise RuntimeError("Could not draw the bore circle.")
+            doc.InsertSketch2(True)
+            _select_last_sketch(doc)
+            bore = doc.FeatureManager.FeatureCut4(
+                True, False, False, 2, 0, 0.0, 0,
+                False, False, False, False, 0.0, 0.0,
+                False, False, False, False,
+                False, True, True,
+                False, False, False,
+                0, 0.0, False, False,
+            )
+            if bore is None:
+                raise RuntimeError("Bore cut failed.")
+
+        active_unit, factor = _unit_factor(unit)
+        return {
+            "module": module, "teeth": teeth, "pressure_angle": pressure_angle,
+            "face_width": face_width, "unit": active_unit,
+            "pitch_diameter": 2 * r_pitch * factor,
+            "outside_diameter": 2 * r_add * factor,
+            "root_diameter": 2 * r_root * factor,
+            "base_diameter": 2 * r_base * factor,
+            "tooth_gap_feature": cut_name,
+        }
+
+    return await _run(_impl)
+
+
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def add_rib(
     thickness: float = 3,

@@ -211,6 +211,10 @@
       "description": "Create a helix/spiral curve from a circle sketch (for threads, springs, worms)."
     },
     {
+      "name": "create_gear",
+      "description": "Create a standard external spur gear with true involute teeth (blank, tooth gap cut, circular pattern, optional bore)."
+    },
+    {
       "name": "create_knurl",
       "description": "Create a knurled diamond/straight pattern on a cylindrical face (grip texture)."
     },
