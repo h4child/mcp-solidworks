@@ -38,8 +38,16 @@ Python e dependencias sozinho a partir do `pyproject.toml` -- necessario porque
 forma portatil.
 
 ```bash
-npx mcpb pack . solidworks-mcp-5.12.0.mcpb
+npx @anthropic-ai/mcpb pack . solidworks-mcp-5.18.0.mcpb
 ```
+
+O nome do pacote e **escopado**: `npx mcpb pack` falha com 404 (`mcpb` nao
+existe no registro npm), o que este README mandava fazer ate a v5.18.0.
+O `pack` valida o `manifest.json` antes de empacotar e respeita o
+`.mcpbignore` -- confira na listagem que `gear_geometry.py`, `alfa_drawing.py` e
+os onze arquivos de `.claude/knowledge/` entraram: o `server.py` importa os dois
+primeiros e expoe os outros como resources, entao um pacote sem eles instala e
+quebra em uso.
 
 Abra o SolidWorks (opcional -- o servidor consegue abrir sozinho) e peca para o
 Claude "conectar ao SolidWorks".
@@ -320,7 +328,7 @@ nao esta disponivel", inclusive `connect_solidworks`, porque o caminho de
 reconexao nunca era alcancado. Agora `_com_is_alive()` invoca a chamada de
 fato, e o mesmo padrao de no-op foi corrigido no rebuild de `shell_body`.
 
-### Novas em v5.18.0 (a classe inteira, nao uma forma: 155 -> 156)
+### Novas em v5.18.0 (a classe inteira, nao uma forma: 155 -> 157)
 
 A v5.17.0 consertou **uma** forma. A analise do que mais sofria da mesma falha
 mostrou que o problema era outro, e maior.
