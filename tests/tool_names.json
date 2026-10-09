@@ -61,6 +61,7 @@
   "create_tube_part",
   "create_weldment_profile",
   "cut_extrude",
+  "cut_part_end",
   "delete_component",
   "delete_configuration",
   "delete_display_state",

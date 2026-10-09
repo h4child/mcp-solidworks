@@ -256,6 +256,8 @@ TIMEOUT_BUDGET_OVERRIDES = {
     # Same reason: draw_profile is one COM call that draws, and then reads back,
     # as many segments as the caller computed.
     "draw_profile": 300,
+    # Orchestrates open + sketch + cut + rebuild + measure + save on a real part.
+    "cut_part_end": 180,
 }
 
 # Reading the whole assembly tree, cross-component interference or a
@@ -15580,6 +15582,314 @@ async def set_view_direction(
         return result
 
     return await _run(_impl)
+
+
+# ---------------------------------------------------------------------------
+# End cuts (v5.21.0)
+# ---------------------------------------------------------------------------
+# Revealed by the industrial stair: a stringer and a handrail were stored as
+# square-ended prisms, so where they met a leg / a rail they only touched along
+# a line or at a point. A real fabricator cuts the tube end at the angle of the
+# joint (miter / flat seat) so the two members share a FACE.
+
+# Sketch plane -> (sketch x axis, sketch y axis, extrusion axis), as unit
+# vectors in PART coordinates. Front: sketch (x, y) = global (X, Y). Top: sketch
+# y is global -Z. Right: sketch x is global -Z. (Same convention as
+# create_profile_part's docstring; confirmed live while building this tool.)
+_CUT_PLANE_FRAMES = {
+    "top": ((1.0, 0.0, 0.0), (0.0, 0.0, -1.0), (0.0, 1.0, 0.0)),
+    "front": ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+    "right": ((0.0, 0.0, -1.0), (0.0, 1.0, 0.0), (1.0, 0.0, 0.0)),
+}
+
+
+def _unit_vector(vec, label: str = "normal") -> tuple:
+    if not isinstance(vec, (list, tuple)) or len(vec) != 3:
+        raise ValueError(f"{label} must be a list of 3 numbers [x, y, z], got {vec!r}.")
+    length = math.sqrt(sum(float(c) * float(c) for c in vec))
+    if length < 1e-12:
+        raise ValueError(f"{label} must be a non-zero vector.")
+    return tuple(float(c) / length for c in vec)
+
+
+def _end_cut_distance(normal, offset, point, origin) -> tuple:
+    """(unit normal, signed plane distance from the PART origin), no COM.
+
+    The plane is n.p = distance; material with n.p > distance is removed.
+    Give the plane either as ``offset`` (distance along the unit normal from
+    the frame origin) or as a ``point`` on it. ``origin`` is where the part
+    origin sits in the frame the offset/point are written in (e.g. the
+    assembly), so a joint plane can be given in assembly coordinates.
+    """
+    n = _unit_vector(normal, "normal")
+    if (offset is None) == (point is None):
+        raise ValueError("give exactly one of 'offset' (distance along the normal) or 'point' (a point on the plane).")
+    if point is not None:
+        if not isinstance(point, (list, tuple)) or len(point) != 3:
+            raise ValueError(f"point must be [x, y, z], got {point!r}.")
+        distance = sum(n[i] * float(point[i]) for i in range(3))
+    else:
+        distance = float(offset)
+    if origin is not None:
+        if not isinstance(origin, (list, tuple)) or len(origin) != 3:
+            raise ValueError(f"origin must be [x, y, z], got {origin!r}.")
+        distance -= sum(n[i] * float(origin[i]) for i in range(3))
+    return n, distance
+
+
+def _end_cut_plan(normal, distance: float, reach: float) -> dict:
+    """Sketch + extrusion plan that removes the half-space n.p > distance.
+
+    The cutter is a big rectangle on the standard plane that CONTAINS the
+    normal (the sketch plane's extrusion axis must be perpendicular to the
+    normal), extruded mid-plane through the whole part. Raises when the normal
+    is not perpendicular to any global axis (a compound angle), because there
+    is then no standard plane to sketch the cutter on.
+    """
+    n = _unit_vector(normal, "normal")
+    if reach <= 0:
+        raise ValueError(f"reach must be positive, got {reach}.")
+    for key in ("top", "front", "right"):
+        u, v, w = _CUT_PLANE_FRAMES[key]
+        if abs(sum(n[i] * w[i] for i in range(3))) < 1e-6:
+            n2 = (sum(n[i] * u[i] for i in range(3)), sum(n[i] * v[i] for i in range(3)))
+            norm = math.hypot(*n2)
+            n2 = (n2[0] / norm, n2[1] / norm)
+            t = (-n2[1], n2[0])
+            c = (distance * n2[0], distance * n2[1])
+            m = reach
+            corners = [
+                (c[0] - t[0] * m, c[1] - t[1] * m),
+                (c[0] + t[0] * m, c[1] + t[1] * m),
+                (c[0] + t[0] * m + n2[0] * m, c[1] + t[1] * m + n2[1] * m),
+                (c[0] - t[0] * m + n2[0] * m, c[1] - t[1] * m + n2[1] * m),
+            ]
+            return {"plane": key, "normal": n, "distance": distance,
+                    "sketch_normal": n2, "polygon": [list(p) for p in corners],
+                    "depth": 2.0 * m}
+    raise ValueError(
+        f"normal {tuple(round(c, 4) for c in n)} is not perpendicular to any global axis "
+        "(compound angle): the end cut needs a normal lying in the XY, XZ or YZ plane of the part. "
+        "Orient the part (e.g. create_tube_part tilt) so the cut normal lies in one of them.")
+
+
+def _extreme_along(doc, n) -> Optional[float]:
+    """max over every solid body of n.p, via IBody2.GetExtremePoint (metres), or None."""
+    best = None
+    for raw in doc.GetBodies2(0, True) or ():
+        body = win32com.client.Dispatch(raw)
+        try:
+            pt = _com_member(body, "GetExtremePoint", n[0], n[1], n[2])
+        except Exception:
+            return None
+        if pt and len(pt) == 4 and isinstance(pt[0], bool):
+            # Live (SolidWorks 2025): (success, x, y, z) -- the flag comes first.
+            if not pt[0]:
+                return None
+            pt = pt[1:]
+        if not pt or len(pt) < 3:
+            return None
+        value = sum(n[i] * float(pt[i]) for i in range(3))
+        best = value if best is None else max(best, value)
+    return best
+
+
+def _planar_faces_on(doc, n, distance_m: float, tol_m: float = 1e-6) -> list:
+    """Planar faces whose plane is n.p = distance (either orientation): [{area_m2}]."""
+    found = []
+    for raw_body in doc.GetBodies2(0, True) or ():
+        body = win32com.client.Dispatch(raw_body)
+        for raw_face in body.GetFaces() or ():
+            face = win32com.client.Dispatch(raw_face)
+            try:
+                if _classify_surface(win32com.client.Dispatch(face.GetSurface)) != "plane":
+                    continue
+                fn = tuple(_com_member(face, "Normal"))
+                if abs(abs(sum(fn[i] * n[i] for i in range(3))) - 1.0) > 1e-6:
+                    continue
+                box = tuple(_com_member(face, "GetBox"))
+                centre = ((box[0] + box[3]) / 2, (box[1] + box[4]) / 2, (box[2] + box[5]) / 2)
+                on = tuple(face.GetClosestPointOn(*centre))
+                if abs(sum(on[i] * n[i] for i in range(3)) - distance_m) <= tol_m:
+                    found.append({"area_m2": float(_com_member(face, "GetArea"))})
+            except Exception:
+                continue
+    return found
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False))
+async def cut_part_end(
+    normal: list[float],
+    offset: Optional[float] = None,
+    point: Optional[list[float]] = None,
+    origin: Optional[list[float]] = None,
+    part_path: Optional[str] = None,
+    save: bool = True,
+    close_after: bool = False,
+    unit: Optional[str] = None,
+    tolerance: float = 0.01,
+) -> dict:
+    """End cut / miter: slice a tube or profile part with a PLANE so its end becomes
+    one flat face at the angle of the joint, ready to sit face-to-face on another member.
+
+    The plane is given as a ``normal`` plus either ``offset`` or ``point``, in PART
+    coordinates (``unit``): n.p = offset (n is normalised first). Material on the
+    side the normal points to (n.p > offset) is REMOVED -- point the normal out of
+    the end you are trimming. Examples: normal=[1,0,0], offset=120 trims everything
+    beyond x=120; normal=[0.74,0,0.67] gives a mitre whose face is tilted 42 deg.
+    ``origin`` = where the part origin sits in the frame your offset/point are
+    written in (e.g. the part's insertion point in the assembly), so a joint plane
+    can be given directly in assembly coordinates (offset is then n.p in that frame).
+
+    How it cuts: a big rectangle is sketched on the global plane (XY, XZ or YZ)
+    that contains the normal and cut-extruded mid-plane through the whole part, so
+    the new end is a true planar face. Limitation: the normal must be perpendicular
+    to one global axis (no compound angles) -- build the tilted member with
+    create_tube_part ``tilt`` so its joint plane obeys that. The plane must cross
+    the solid: a plane that removes nothing, or everything, is an error. To MITRE a
+    tube end flush to a wall, the blank must be long enough that the whole
+    cross-section is beyond the plane before cutting (leave stock).
+
+    part_path: .sldprt to open, cut, save (and optionally close); omit to cut the
+    ACTIVE part. save=True saves in place (backup the file first: this edits it).
+    close_after=True closes a part this call opened. On any error a part this call
+    opened is closed WITHOUT saving.
+
+    THE RESULT IS MEASURED: volume and bounding box before/after, ``removed_mm3``,
+    the farthest point of the solid along the normal (must equal the plane within
+    ``tolerance``: ``end_on_plane``), the number of bodies (a cut that splits the
+    part is reported) and ``cut_face_area_mm2`` -- the area of the new flat end face
+    read back from the solid."""
+    n, distance = _end_cut_distance(normal, offset, point, origin)
+    active_unit, factor = _unit_factor(unit)
+    to_m = UNIT_TO_METERS[active_unit]
+    if part_path is not None and os.path.splitext(part_path)[1].lower() != ".sldprt":
+        raise ValueError("part_path must end in .sldprt.")
+    if part_path is not None and not os.path.exists(part_path):
+        raise FileNotFoundError(f"File not found: {part_path}")
+    # Fails now (not mid-cut) when the normal is a compound angle.
+    _end_cut_plan(n, distance, 1.0)
+
+    def _open_or_use():
+        app = _connect()
+        if part_path is None:
+            doc = _active_doc()
+            opened = False
+        else:
+            doc = None
+            with contextlib.suppress(Exception):
+                doc = _com_member(app, "GetOpenDocumentByName", part_path)
+            opened = doc is None
+            if doc is None:
+                doc, errors, _w = _open_doc6(app, part_path, 1)
+                if doc is None:
+                    raise RuntimeError(f"Failed to open '{part_path}' (error code {errors}).")
+            _activate_doc3(app, _doc_title(doc), True)
+            doc = app.ActiveDoc
+        if int(_doc_type(doc)) != 1:
+            raise RuntimeError("cut_part_end works on a part document (.sldprt).")
+        return doc, opened
+
+    def _before():
+        doc, opened = _open_or_use()
+        try:
+            box, count = _bodies_bounding_box(doc)
+            if box is None or count != 1:
+                raise RuntimeError(
+                    f"expected exactly 1 solid body, found {count}: cut_part_end trims a single "
+                    "tube/profile body (use split_body or a multibody-aware cut for weldments).")
+            measured = _measure_model_doc(doc, 1.0 / UNIT_TO_METERS.get(_default_unit, 0.001))
+            return opened, box, measured, _doc_title(doc), _doc_path(doc)
+        except Exception:
+            if opened:
+                with contextlib.suppress(Exception):
+                    _connect().CloseDoc(_doc_title(doc))
+            raise
+
+    opened, box, before, title, path = await _run(_before)
+    vol_before = before["volume_m3"] * 1e9
+    reach_m = 2.0 * (math.sqrt(3.0) * max(abs(v) for v in box) + abs(distance) * to_m) + 0.02
+    plan = _end_cut_plan(n, distance, reach_m / to_m)
+    extent = lambda lo, hi: [(h - l) * 1000.0 for l, h in zip(lo, hi)]
+    try:
+        # The extreme point along n must lie beyond the plane or nothing is removed.
+        probe = await _run(lambda: _extreme_along(_active_doc(), n))
+        if probe is not None and probe <= distance * to_m + 1e-7:
+            raise ValueError(
+                f"the plane does not cut the part: its farthest point along the normal is at "
+                f"{probe / to_m:.4f} {active_unit}, not beyond the plane at {distance:.4f} {active_unit}. "
+                "Check the normal's sign (it must point toward the end to remove) and the offset.")
+        if probe is not None:
+            low_probe = await _run(lambda: _extreme_along(_active_doc(), tuple(-c for c in n)))
+            if low_probe is not None and -low_probe >= distance * to_m - 1e-7:
+                raise ValueError("the plane is beyond the whole part (nothing would remain on the keep side).")
+        await create_sketch(plan["plane"])
+        sketch = await draw_profile(plan["polygon"], True, unit, tolerance)
+        await close_sketch()
+        cut = await cut_extrude(plan["depth"], False, True, unit, tolerance)
+
+        def _after():
+            doc = _active_doc()
+            doc.ForceRebuild3(False)
+            box2, count2 = _bodies_bounding_box(doc)
+            measured = _measure_model_doc(doc, 1.0 / UNIT_TO_METERS.get(_default_unit, 0.001))
+            far = _extreme_along(doc, n)
+            faces = _planar_faces_on(doc, n, distance * to_m)
+            return box2, count2, measured, far, faces
+
+        box2, count2, after, far, faces = await _run(_after)
+        vol_after = after["volume_m3"] * 1e9
+        removed = vol_before - vol_after
+        warnings = list(cut.get("warnings") or [])
+        if removed <= 1e-6 * vol_before:
+            raise RuntimeError("the cut removed no material: the plane does not intersect the solid.")
+        if vol_after <= 0:
+            raise RuntimeError("the cut removed the whole part.")
+        if count2 != 1:
+            warnings.append(f"the cut left {count2} solid bodies (the plane split the part): inspect it before using.")
+        end_on_plane = far is not None and abs(far - distance * to_m) <= max(tolerance * to_m, 1e-7)
+        if far is not None and not end_on_plane:
+            warnings.append(
+                f"the farthest point along the normal is {far / to_m:.4f} {active_unit}, "
+                f"not on the plane ({distance:.4f}): the end is not flat at the requested plane.")
+        face_area_mm2 = sum(f["area_m2"] for f in faces) * 1e6 if faces else None
+        if not faces:
+            warnings.append("no planar face lying on the cut plane was found after the cut.")
+        saved = None
+        if save:
+            saved = await save_document()
+        closed = False
+        if opened and close_after and save:
+            with contextlib.suppress(Exception):
+                await close_document(False)
+                closed = True
+    except Exception:
+        if opened:
+            with contextlib.suppress(Exception):
+                await close_document(False)  # discard: only a document this call opened
+        raise
+    return {
+        "title": title,
+        "path": (saved or {}).get("path") or path,
+        "plane": {"normal": list(n), "offset": distance, "unit": active_unit,
+                  "sketch_plane": plan["plane"], "removes": "n.p > offset"},
+        "volume_before_mm3": vol_before,
+        "volume_after_mm3": vol_after,
+        "removed_mm3": removed,
+        "bounding_box_before_mm": {"min": [v * 1000 for v in box[:3]], "max": [v * 1000 for v in box[3:]],
+                                   "size": extent(box[:3], box[3:])},
+        "bounding_box_after_mm": {"min": [v * 1000 for v in box2[:3]], "max": [v * 1000 for v in box2[3:]],
+                                  "size": extent(box2[:3], box2[3:])},
+        "farthest_along_normal": None if far is None else far / to_m,
+        "end_on_plane": end_on_plane,
+        "cut_face_area_mm2": face_area_mm2,
+        "bodies_after": count2,
+        "cut_depth_check": {"verified": cut.get("verified"), "actual_depth": cut.get("actual_depth")},
+        "saved": bool(save),
+        "closed": closed,
+        "warnings": warnings,
+    }
+
 
 
 # ---------------------------------------------------------------------------
