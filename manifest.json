@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "solidworks-mcp",
   "display_name": "SolidWorks MCP",
-  "version": "5.19.0",
+  "version": "5.20.0",
   "description": "MCP server for SolidWorks automation through the Windows COM API, built with FastMCP.",
   "long_description": "Controls SolidWorks via COM for parts, assemblies, sketches, features, drawings, appearances, validation, and selected mechanical mates. Designed for trusted local desktop automation.",
   "author": {
@@ -457,6 +457,26 @@
     {
       "name": "insert_section_view",
       "description": "Insert a section (cut-through) view into a drawing along a cut line."
+    },
+    {
+      "name": "create_profile_part",
+      "description": "Build one finished prismatic part in a single call (sketch outline + holes/slots, extrude, material, save) and verify its measured volume."
+    },
+    {
+      "name": "create_tube_part",
+      "description": "Create and save a real hollow rectangular, square or round tube part with a wall thickness, verified by measured volume."
+    },
+    {
+      "name": "add_mate_by_name",
+      "description": "Mate entities chosen by name, including the origin planes of components, and measure the resulting movement."
+    },
+    {
+      "name": "interference_report",
+      "description": "Detailed interference detection: which components overlap, overlap volume, and surface contact separated from real overlap."
+    },
+    {
+      "name": "set_view_direction",
+      "description": "Point the camera along an arbitrary direction with a chosen up vector (isometric view for Z-up models) and optionally export a PNG."
     },
     {
       "name": "interference_check",
