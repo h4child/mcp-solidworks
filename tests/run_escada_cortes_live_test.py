@@ -126,24 +126,38 @@ def expected_volumes():
 
 
 async def rebuild():
-    """Re-create stringer + handrail a bit longer (stock to cut) and cut both upper ends on x = 880."""
+    """Lengthen stringer + handrail IN PLACE (edit the extrusion depth of the existing part) and cut both
+    upper ends on x = 880 with cut_part_end. Editing the part in place keeps the assembly references
+    resolved; re-creating the file from scratch made SolidWorks 2025 suppress the components (measured live)."""
     import server
     await server.connect_solidworks()
     exp = expected_volumes()
     report = {}
     print("closed docs:", await close_all(server), flush=True)
     jobs = [
-        ("banzo", dict(section="rectangular", length=STRINGER_NEW_LEN, wall=3, width=80, height=40, axis="x",
-                       tilt=dict(axis="y", angle=-R.ANGLE)), (R.STRINGER_C0[0], 360.0, R.STRINGER_C0[1]), 0.0),
-        ("corrimao", dict(section="round", length=HANDRAIL_NEW_LEN, wall=2.6, outer_diameter=33.7, axis="x",
-                          tilt=dict(axis="y", angle=-R.ANGLE)), (R.HANDRAIL_E0[0], R.YR, R.HANDRAIL_E0[1]), HANDRAIL_DZ),
+        ("banzo", STRINGER_NEW_LEN, (R.STRINGER_C0[0], 360.0, R.STRINGER_C0[1]), 0.0),
+        ("corrimao", HANDRAIL_NEW_LEN, (R.HANDRAIL_E0[0], R.YR, R.HANDRAIL_E0[1]), HANDRAIL_DZ),
     ]
-    for key, kw, origin, dz in jobs:
+    for key, new_len, origin, dz in jobs:
         path = os.path.join(OUT, PARTS[key])
-        os.remove(path)                                   # backup folder holds the original
-        res = await server.create_tube_part(save_path=path, unit="mm", close_after_save=False, **kw)
-        print(f"[{key}] blank: vol={res['volume_mm3']:.1f} ratio={res['volume_check']['ratio']:.5f} "
-              f"bbox={res['bounding_box_mm']['size']}", flush=True)
+        await server.open_document(path)
+
+        def _lengthen():
+            doc = server._active_doc()
+            feat = doc.FirstFeature
+            while feat is not None:
+                if server._com_member(feat, "GetTypeName2") == "Extrusion":
+                    break
+                feat = feat.GetNextFeature
+            param = doc.Parameter(f"D1@{feat.Name}")
+            old = param.SystemValue * 1000.0
+            param.SystemValue = new_len / 1000.0
+            doc.EditRebuild3
+            vol = server._measure_model_doc(doc, 1000.0)["volume_m3"] * 1e9
+            return old, vol
+
+        old_len, vol_blank = await server._run(_lengthen)
+        print(f"[{key}] extrusion {old_len:.4f} -> {new_len:.4f} mm, blank volume {vol_blank:.1f} mm3", flush=True)
         if dz:
             body = await server._run(lambda: server._first_solid_body_name(server._active_doc()))
             mv = await server.move_copy_body(body, 0, 0, dz, unit="mm")
@@ -152,16 +166,62 @@ async def rebuild():
         ratio = cut["volume_after_mm3"] / exp[key]
         print(f"[{key}] cut: removed={cut['removed_mm3']:.1f} after={cut['volume_after_mm3']:.1f} expected={exp[key]:.1f} "
               f"ratio={ratio:.5f} end_on_plane={cut['end_on_plane']} face={cut['cut_face_area_mm2']} bodies={cut['bodies_after']} "
-              f"warn={cut['warnings']}", flush=True)
+              f"warnings={cut['warnings']}", flush=True)
         report[key] = dict(cut, expected_after_mm3=exp[key], ratio=ratio)
         await server.close_document(False)
     Path(OUT, "_cortes_log.json").write_text(json.dumps(report, indent=1, default=str), encoding="utf-8")
+
+
+async def assembly():
+    """Reopen the main assembly, check every reference, run interference_report, save, export the PNG."""
+    import server
+    await server.connect_solidworks()
+    await server.open_document(os.path.join(OUT, "EscadaIndustrial.SLDASM"))
+    await server.rebuild_model(True, False)
+    await server.save_document()
+    print("[saved assembly after rebuild]", flush=True)
+    await server.connect_solidworks()
+    import win32com.client
+
+    def _impl():
+        assy = server._active_assembly()
+        out = []
+        for raw in server._com_member(assy, "GetComponents", False) or ():
+            c = win32com.client.Dispatch(raw)
+            box = server._com_member(c, "GetBox", False, False)
+            out.append(dict(name=str(c.Name2), suppressed=bool(server._com_member(c, "IsSuppressed")),
+                            resolved=server._com_member(c, "GetModelDoc2") is not None,
+                            box=[round(v * 1000, 3) for v in box] if box else None,
+                            path=str(server._com_member(c, "GetPathName"))))
+        return out
+
+    comps = await server._run(_impl)
+    print("components:", len(comps), "unresolved:", sum(not r["resolved"] for r in comps),
+          "suppressed:", sum(r["suppressed"] for r in comps), flush=True)
+    for r in comps:
+        if "Banzo" in r["name"] or "Corrimao" in r["name"]:
+            print("  ", r["name"], r["box"], flush=True)
+    rep = await server.interference_report()
+    Path(OUT, "_interference.json").write_text(json.dumps(rep, indent=1, default=str), encoding="utf-8")
+    print("volumetric:", rep["volumetric_count"], "surface_contact:", rep["surface_contact_count"], flush=True)
+    for p in rep["volumetric"]:
+        print("  VOL", p, flush=True)
+    for p in rep["surface_contact"]:
+        if any(("Banzo" in n or "Corrimao" in n or "Perna" in n or "Trilho" in n) for n in p["components"]):
+            print("  CONTACT", p["components"], flush=True)
+    Path(OUT, "_verify_boxes.json").write_text(json.dumps(comps, indent=1), encoding="utf-8")
+    v = await server.set_view_direction([-1, -1, 0.8], [0, 0, 1], True, os.path.join(OUT, "EscadaIndustrial_isometrica.png"))
+    print("png:", v.get("image"), v.get("image_bytes"), flush=True)
+    await server.save_document()
+    print("[saved]", flush=True)
 
 
 if __name__ == "__main__":
     stage = sys.argv[1]
     if stage == "rebuild":
         asyncio.run(rebuild())
+    if stage == "assembly":
+        asyncio.run(assembly())
     if stage == "contact":
         asyncio.run(contact(sys.argv[2] if len(sys.argv) > 2 else OUT))
 
