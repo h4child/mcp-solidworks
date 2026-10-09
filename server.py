@@ -15533,7 +15533,7 @@ async def set_view_direction(
     built with Z vertical appears lying down: use eye=[-1,-1,0.8], up=[0,0,1] for
     an isometric-like view of a Z-up model. ``output_path`` (.png) also exports
     the resulting viewport. ``view_read_back`` is the orientation SolidWorks
-    actually holds after the change (right/up/back rows)."""
+    actually holds after the change (right/up/back vectors in model coordinates)."""
     if output_path and os.path.splitext(output_path)[1].lower() != ".png":
         raise ValueError("output_path must end in .png.")
     up_vector = list(up) if up else [0.0, 0.0, 1.0]
@@ -15546,19 +15546,27 @@ async def set_view_direction(
         view = doc.ActiveView
         transform = view.Orientation3
         data = list(transform.ArrayData)
-        # IMathTransform: 3x3 rotation row-major in ArrayData[0:9]; the view
-        # matrix maps model coordinates to screen (x right, y up, z to viewer).
-        data[0:9] = [*right, *true_up, *back]
+        # IMathTransform: 3x3 rotation row-major in ArrayData[0:9]. Confirmed live
+        # (2026-10-09): Orientation3 holds the screen axes as COLUMNS (right, up and
+        # back are its columns), i.e. the matrix maps screen -> model. Writing them
+        # as rows produced a camera lying on its side.
+        data[0:9] = [right[0], true_up[0], back[0],
+                     right[1], true_up[1], back[1],
+                     right[2], true_up[2], back[2]]
         data[9:12] = [0.0, 0.0, 0.0]
         transform.ArrayData = win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, tuple(data))
         view.Orientation3 = transform
         if zoom_to_fit_after:
             doc.ViewZoomtofit2()
+        with contextlib.suppress(Exception):
+            doc.GraphicsRedraw2()  # repaint now: SaveAs3 exports what the window last drew
         result = {"eye": list(eye), "up": up_vector,
                   "basis": {"right": list(right), "up": list(true_up), "back": list(back)}}
         try:
             read = list(doc.ActiveView.Orientation3.ArrayData)[0:9]
-            result["view_read_back"] = {"right": read[0:3], "up": read[3:6], "back": read[6:9]}
+            result["view_read_back"] = {"right": [read[0], read[3], read[6]],
+                                        "up": [read[1], read[4], read[7]],
+                                        "back": [read[2], read[5], read[8]]}
         except Exception as exc:
             result["view_read_back"] = f"unavailable ({exc})"
         if output_path:

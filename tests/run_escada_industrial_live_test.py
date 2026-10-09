@@ -222,6 +222,74 @@ async def stage_main():
         await server.save_document()
     print("[saved+mated main]", flush=True)
 
+def expected_leaf_boxes():
+    """leaf component base name -> list of expected global boxes (mm) from part bbox + insertion point."""
+    P = parts_table()
+    log = {}
+    for line in Path(OUT, "_parts_log.jsonl").read_text(encoding="utf-8").splitlines():
+        d = json.loads(line)
+        log[d["key"]] = d["bounding_box_mm"]
+    log.setdefault("Degrau", {"min_m": [0.0, -0.34, 0.0], "max_m": [0.22, 0.34, 0.004]})  # measured live in the first run (not logged)
+    out = []
+    items = [(k, pts) for _n, spec in layout().items() for k, pts in spec] + [(k, pts) for k, pts in MAIN_DIRECT]
+    for key, pts in items:
+        bb = log[key]
+        lo = [v * 1000 for v in bb["min_m"]]
+        hi = [v * 1000 for v in bb["max_m"]]
+        for (x, y, z) in pts:
+            out.append((key, [lo[0] + x, lo[1] + y, lo[2] + z, hi[0] + x, hi[1] + y, hi[2] + z]))
+    return out
+
+
+async def stage_verify():
+    import server
+    await server.connect_solidworks()
+
+    def _impl():
+        assy = server._active_assembly()
+        rows = []
+        comps = server._com_member(assy, "GetComponents", False)
+        for raw in comps or ():
+            import win32com.client
+            c = win32com.client.Dispatch(raw)
+            name = str(c.Name2)
+            box = server._com_member(c, "GetBox", False, False)
+            doc = server._com_member(c, "GetModelDoc2")
+            rows.append(dict(name=name, suppressed=bool(server._com_member(c, "IsSuppressed")), resolved=doc is not None,
+                             box=[round(v * 1000, 3) for v in box] if box else None,
+                             path=str(server._com_member(c, "GetPathName"))))
+        return rows
+
+    rows = await server._run(_impl)
+    leaves = [r for r in rows if not r["name"].startswith("Sub") or "/" in r["name"]]
+    leaves = [r for r in leaves if "/" in r["name"] or not r["name"].startswith("Sub")]
+    print("components:", len(rows), "leaf:", len(leaves), "suppressed:", sum(r["suppressed"] for r in rows),
+          "unresolved:", sum(not r["resolved"] for r in rows))
+    exp = expected_leaf_boxes()
+    # match each expected box with the closest unused leaf box of the same part file
+    used = set()
+    worst = 0.0
+    bad = []
+    for key, eb in exp:
+        part = parts_table()[key]["file"]
+        best = None
+        for i, r in enumerate(leaves):
+            if i in used or not r["path"].lower().endswith(part.lower()) or r["box"] is None:
+                continue
+            d = max(abs(a - b) for a, b in zip(r["box"], eb))
+            if best is None or d < best[0]:
+                best = (d, i)
+        if best is None:
+            bad.append((key, "no component")); continue
+        used.add(best[1]); worst = max(worst, best[0])
+        if best[0] > 0.6:
+            bad.append((key, leaves[best[1]]["name"], round(best[0], 3), leaves[best[1]]["box"], [round(v, 2) for v in eb]))
+    print("matched:", len(used), "of", len(exp), "worst box deviation mm:", round(worst, 3))
+    for b in bad: print("  MISMATCH", b)
+    Path(OUT, "_verify_boxes.json").write_text(json.dumps(rows, indent=1), encoding="utf-8")
+    return rows
+
+
 if __name__ == "__main__":
     stage = sys.argv[1]
     if stage == "parts":
@@ -230,3 +298,6 @@ if __name__ == "__main__":
         asyncio.run(stage_sub(sys.argv[2], len(sys.argv) < 4 or sys.argv[3] != "nomates"))
     elif stage == "main":
         asyncio.run(stage_main())
+    elif stage == "verify":
+        asyncio.run(stage_verify())
+
