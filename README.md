@@ -12,6 +12,16 @@ Requisitos: Windows, SolidWorks 2022+ instalado e licenciado, e Claude Desktop.
 
 ## Para quem vai desenvolver
 
+### Política de ferramentas
+
+O catálogo MCP mantém somente operações CAD reutilizáveis e geradores
+paramétricos de categorias de componentes. Receitas de produtos completos —
+por exemplo, um pistão automotivo completo, um ventilador ou um redutor
+específico — não são ferramentas públicas: elas devem viver em scripts de
+exemplo/workflows que combinem as operações do catálogo. Assim, novos projetos
+reutilizam as mesmas ferramentas mudando parâmetros, sem transformar cada
+modelo em uma nova entrada permanente do MCP.
+
 ```bash
 pip install -r requirements.txt
 python -m pytest

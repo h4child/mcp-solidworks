@@ -179,18 +179,6 @@
       "description": "Pattern a component in the assembly (linear or circular)."
     },
     {
-      "name": "create_automotive_piston",
-      "description": "Create a parametric automotive piston with ring grooves, hollow underside, and wrist-pin bore."
-    },
-    {
-      "name": "create_automotive_piston_assembly",
-      "description": "Create a complete piston, wrist-pin, connecting-rod, bearing, and rod-cap SolidWorks assembly."
-    },
-    {
-      "name": "create_automotive_piston_with_connecting_rod",
-      "description": "Create a clear single-body conceptual piston with ring grooves and an integrated visible connecting rod."
-    },
-    {
       "name": "create_base_flange",
       "description": "Create a sheet metal base flange from the last sketch (first step for sheet metal parts)."
     },
@@ -233,10 +221,6 @@
     {
       "name": "create_new_part",
       "description": "Create a new part document."
-    },
-    {
-      "name": "create_pedestal_fan_propeller",
-      "description": "Create an aerodynamic three-blade pedestal-fan propeller with a shared pitch angle."
     },
     {
       "name": "create_reference_axis",

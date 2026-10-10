@@ -695,19 +695,18 @@ def test_move_copy_body_measures_the_displacement_it_caused():
     )
 
 
-def test_the_piston_joint_centers_no_longer_claim_to_be_a_contract():
-    """They are arithmetic on the input dimensions, computed before any geometry
-    existed. Published as a 'contract', a reader downstream mates to them as if
-    they had been measured."""
-    # ast.unparse renders string literals single-quoted, whatever the source
-    # used -- asserting on '"contract"' would pass even with the key still there.
-    source = _executable_body(TOOLS["create_automotive_piston_with_connecting_rod"].fn)
-    assert "'contract'" not in source, (
-        "joint_centers still presents computed numbers as a guarantee"
-    )
-    assert "'measured': False" in source, (
-        "joint_centers should say outright that it was not measured"
-    )
+def test_finished_product_recipes_are_not_public_tools():
+    """The public catalog must stay reusable across projects."""
+    forbidden = {
+        "create_automotive_piston",
+        "create_automotive_piston_assembly",
+        "create_automotive_piston_with_connecting_rod",
+        "create_pedestal_fan_propeller",
+    }
+    assert forbidden.isdisjoint(TOOLS)
+    with open(os.path.join(ROOT, "manifest.json"), encoding="utf-8") as handle:
+        declared = {entry["name"] for entry in json.load(handle)["tools"]}
+    assert forbidden.isdisjoint(declared)
 
 
 # ---------------------------------------------------------------------------
@@ -1088,26 +1087,6 @@ def test_the_spline_interior_check_says_so_when_it_cannot_read_them():
     source = inspect.getsource(server._spline_interior_check)
     assert "UNVERIFIED" in source
     assert 'result["verified"] = None' in source
-
-
-def test_the_piston_reads_back_its_ring_groove_circles():
-    """The groove is the gap between two circles 3 mm apart in radius, both
-    drawn through the inference engine. draw_circle measures its own radius;
-    nothing was reading it, so a collapsed groove removed no material and the
-    piston still looked right."""
-    source = inspect.getsource(TOOLS["create_automotive_piston"].fn)
-    assert 'circle.get("verified") is False' in source
-    assert "measured_radial_width" in source
-
-
-def test_the_piston_assembly_verifies_where_every_component_landed():
-    """The five offsets are the only thing holding this assembly together --
-    it has no mates by design -- so an unread placement is the whole assembly
-    unverified."""
-    source = inspect.getsource(TOOLS["create_automotive_piston_assembly"].fn)
-    assert "component_positions" in source
-    assert 'placed.get("verified") is not True' in source
-    assert "raise RuntimeError" in source
 
 
 def test_create_gear_delegates_to_the_verified_path():

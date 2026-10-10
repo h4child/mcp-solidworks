@@ -11909,10 +11909,16 @@ async def apply_p2m_appearance(
 
 
 # ===========================================================================
-# Parametric example tools
+# Internal project recipes
+#
+# These implementations remain available to local example/workflow code, but
+# deliberately are not decorated with @mcp.tool. The public catalog is for
+# reusable CAD operations and parametrized component categories only.
 # ===========================================================================
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+# Project recipe kept as an internal reference implementation.  It is not an
+# MCP tool: public tools must describe reusable CAD operations or parametrized
+# component categories, not finished products.
 async def create_automotive_piston(
     bore_diameter: float = 86,
     height: float = 75,
@@ -12076,7 +12082,7 @@ async def create_automotive_piston(
         ) from exc
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+# Internal project recipe; intentionally excluded from the public MCP catalog.
 async def create_automotive_piston_assembly(
     bore_diameter: float = 86,
     piston_height: float = 75,
@@ -12337,7 +12343,7 @@ async def create_automotive_piston_assembly(
         ) from exc
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+# Internal project recipe; intentionally excluded from the public MCP catalog.
 async def create_automotive_piston_with_connecting_rod(
     bore_diameter: float = 86,
     piston_height: float = 75,
@@ -12543,7 +12549,7 @@ async def create_automotive_piston_with_connecting_rod(
         ) from exc
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+# Internal project recipe; intentionally excluded from the public MCP catalog.
 async def create_pedestal_fan_propeller(
     blade_radius: float = 190,
     hub_radius: float = 32,

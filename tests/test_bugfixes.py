@@ -778,40 +778,6 @@ def test_every_tool_name_used_in_the_assembly_or_batch_sets_actually_exists():
 # ---------------------------------------------------------------------------
 
 
-def test_the_piston_assembly_does_not_claim_to_be_mated():
-    """It creates no mates, and said so nowhere.
-
-    Counted over the whole function body: add_mate 0, add_advanced_mate 0,
-    AddMate 0, fix_component 0, set_component_transform 0,
-    interference_check 0, insert_component 5. It positions five components by
-    computed offsets and stops -- while the docstring called it "the moving
-    assembly", which is the one thing it certainly is not. A caller who
-    believes the docstring gets a piston and rod that never seat together,
-    with nothing reporting a gap.
-    """
-    code = code_of("create_automotive_piston_assembly")
-    for mate_call in ("add_mate(", "add_advanced_mate(", "AddMate"):
-        assert mate_call not in code, (
-            f"create_automotive_piston_assembly now calls {mate_call} -- "
-            f"update its docstring, which states that it creates no mates"
-        )
-    description = TOOLS["create_automotive_piston_assembly"].description
-    assert "NO MATES" in description, (
-        "the docstring must state that no mates are created"
-    )
-    assert "moving assembly represented" not in description, (
-        "the docstring still calls this a moving assembly; it has no joints"
-    )
-
-
-def test_the_piston_assembly_points_at_the_mates_a_real_joint_needs():
-    """Saying what is missing is only half useful without saying what to do."""
-    description = TOOLS["create_automotive_piston_assembly"].description
-    for expected in ("concentric", "width", "get_component_transform",
-                     "interference_check"):
-        assert expected in description, f"the docstring does not mention {expected}"
-
-
 def test_add_mate_documents_that_it_cannot_reach_a_hidden_face():
     """SelectByID2 picks from the CAMERA.
 
