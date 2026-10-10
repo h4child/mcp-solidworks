@@ -936,7 +936,7 @@ wheels = [
 
 [[package]]
 name = "solidworks-mcp"
-version = "5.12.0"
+version = "5.21.0"
 source = { virtual = "." }
 dependencies = [
     { name = "mcp" },

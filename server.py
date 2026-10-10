@@ -5463,7 +5463,7 @@ async def cut_extrude(depth: float = 10, through_all: bool = False,
         active_unit, factor = _unit_factor(unit)
         sketch_name = _select_last_sketch(doc)
         if through_all:
-            end_cond = 2 if both_directions else 1  # ThroughAllBoth / ThroughAll
+            end_cond = 9 if both_directions else 1  # swEndCondThroughAllBoth (9) / swEndCondThroughAll (1); 2 is UpToNext
             cut_depth = 0.0
         else:
             end_cond = 6 if both_directions else 0  # MidPlane / Blind
@@ -11236,6 +11236,30 @@ async def lookup_material_properties(material: str = "",
     return await _run(_impl)
 
 
+def _material_call_orders(config: str, database_path: str, material: str) -> list:
+    """Argument tuples for IPartDoc.SetMaterialPropertyName2(config, DATABASE, NAME), in the order
+    to try them. The first is the documented form with the active configuration; the others only
+    change the configuration/database spelling (never swap database and name: that order is the
+    silent no-op measured live)."""
+    forms = [(config, database_path, material), ("", database_path, material)]
+    short = os.path.basename(database_path)
+    if short and short != database_path:
+        forms.append((config, short, material))
+    seen, out = set(), []
+    for form in forms:
+        if form not in seen:
+            seen.add(form)
+            out.append(form)
+    return out
+
+
+def _density_matches(actual, expected) -> bool:
+    """True when the document density equals the library density within 1 % (or 1 kg/m3)."""
+    if not actual or not expected:
+        return False
+    return abs(actual - expected) <= max(1.0, expected * 0.01)
+
+
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def set_material(
     material: str = "AISI 1020",
@@ -11276,66 +11300,44 @@ async def set_material(
                 f"explicitly as 'database' instead."
             )
 
-        # Re-confirmed live, 2026-10-05, on a fresh box part: even with a
-        # correctly resolved .sldmat path, mass stayed at exactly water
-        # density for BOTH "6061 Alloy" and "Cast Alloy Steel" -- the path
-        # fix above was not the whole story. Root cause: the material name
-        # and database path were swapped. The real signature is
-        # SetMaterialPropertyName2(ConfigurationName, SName /* material */,
-        # SDatabase /* path */) -- symmetric with the already-working reader
-        # _native_material_name's GetMaterialPropertyName2(ConfigurationName,
-        # ByRef SDatabase) -> material name as the return value, database as
-        # the out-param. The old code passed (resolved_database, material),
-        # i.e. asked SolidWorks for a material literally named the .sldmat
-        # file path inside a "database" named e.g. "6061 Alloy" -- neither
-        # resolves, so the call is a silent no-op with no exception raised.
-        # The documented contract for ConfigurationName="" is "apply to every
-        # configuration that uses the document material" -- in principle that
-        # should cover the active configuration too. Confirmed live,
-        # 2026-10-05: it does not. After fixing the argument-order bug above,
-        # SetMaterialPropertyName2("", material, resolved_database) still
-        # left mass_kg exactly at water density (1000 kg/m3, verified by
-        # mass/volume, independent of any read-back call) on a freshly built
-        # part. Passing the ACTIVE configuration's real name instead of ""
-        # is the next-most-specific thing the API accepts; used by both the
-        # write and (where _native_material_name is called with no config
-        # override) the read, so they stay symmetric.
-        #
-        # STILL UNRESOLVED, re-confirmed live 2026-10-05 immediately after
-        # this change: using the real active configuration name instead of
-        # "" made no difference -- mass_kg stayed at exactly water density
-        # for both "Alloy Steel" and "6061 Alloy", on a freshly built part,
-        # argument order already correct. The call raises no COM error in
-        # either case; whatever is actually wrong is silent on both ends.
-        # Do NOT re-try more argument-order or config-name permutations
-        # blind -- two independent hypotheses have now been tested and
-        # falsified by density math, not just by the read-back check. Next
-        # debugging step needs either execute_python (gated off by default)
-        # to inspect doc.GetMaterialPropertyName2's actual return value and
-        # type directly, or a live SolidWorks UI comparison (apply a material
-        # by hand via Edit Material, then read it back through this same
-        # reader) to tell whether the WRITE or the READ side is at fault.
+        # ROOT CAUSE (measured live 2026-10-09, SolidWorks 2025 SP4.1, 'Perna' scratch part):
+        # the real signature is IPartDoc.SetMaterialPropertyName2(ConfigurationName,
+        # DATABASE, NAME) -- database FIRST, then the material name. The reader is the
+        # opposite way round (GetMaterialPropertyName2(config, ByRef database) returns the
+        # NAME), and an earlier "fix" here swapped the two to (config, name, database) on a
+        # wrong theory; that order is a silent no-op (density stays 1000 kg/m3, no COM error).
+        # Measured on a fresh part: (cfg, db_path, 'AISI 1020') -> 7900 kg/m3; the same with
+        # config "" or the short name 'SOLIDWORKS Materials' also works; (cfg, name, db) does not.
+        # The old 'verified' failure text blamed the build; the real defect was the order.
+        # Every attempt is verified by DENSITY (mass / volume), the only witness that cannot
+        # be faked, so a future silent no-op still fails loudly instead of reporting success.
         active_config = doc.ConfigurationManager.ActiveConfiguration
         config_name = active_config.Name if active_config is not None else ""
+        expected_density = _library_density(material, resolved_database)
 
-        try:
-            part = doc  # IPartDoc
-            part.SetMaterialPropertyName2(config_name, material, resolved_database)
-        except Exception:
+        attempts = []
+        for call_args in _material_call_orders(config_name, resolved_database, material):
             try:
-                part.SetMaterialPropertyName(material, resolved_database)
+                doc.SetMaterialPropertyName2(*call_args)
+                outcome = "no error"
+            except Exception as exc:
+                outcome = f"{type(exc).__name__}: {exc}"
+            try:
+                doc.ForceRebuild3(False)
             except Exception:
-                raise RuntimeError(
-                    f"Failed to set material '{material}'. Check that the name matches "
-                    "the SolidWorks material library exactly (case-sensitive)."
-                )
+                pass
+            density_now = _document_density(doc)
+            attempts.append({"config": call_args[0], "database": call_args[1],
+                             "name": call_args[2], "outcome": outcome,
+                             "density_kg_m3": round(density_now, 3) if density_now else None})
+            if _density_matches(density_now, expected_density):
+                break
 
         # Verify by DENSITY, which is the number the BOM uses and the only
         # witness that cannot be faked. The previous check compared the
         # material NAME read back from GetMaterialPropertyName2; that is
         # weaker, and on this build the name reads back as "" even when the
         # call reported no error, so the message blamed the wrong thing.
-        expected_density = _library_density(material, resolved_database)
         actual_density = _document_density(doc)
         applied_name = _native_material_name(doc, config_name)
 
@@ -11346,10 +11348,11 @@ async def set_material(
             "document_density_kg_m3": (round(actual_density, 3)
                                        if actual_density else None),
             "material_name_read_back": applied_name,
+            "attempts": attempts,
         }
 
         if expected_density and actual_density:
-            if abs(actual_density - expected_density) <= max(1.0, expected_density * 0.01):
+            if _density_matches(actual_density, expected_density):
                 result["verified"] = "density matches the material library"
                 return result
             # Exactly water means SolidWorks never picked up a density at all,
@@ -11363,16 +11366,11 @@ async def set_material(
                 + (" (water, i.e. no material density at all)" if looks_like_water else "")
                 + f", while '{material}' is {expected_density:.1f} kg/m3 in "
                 f"{os.path.basename(resolved_database)}.\n\n"
-                f"IPartDoc.SetMaterialPropertyName2 has been confirmed silently "
-                f"ineffective on this SolidWorks build: five documented argument "
-                f"orders were tried live and none changed the density. Until that "
-                f"is resolved:\n"
-                f"  - apply the material by hand in SolidWorks (right-click "
-                f"Material in the feature tree, Edit Material), or\n"
-                f"  - compute weight as volume x density, taking the density "
-                f"from lookup_material_properties('{material}').\n"
-                f"Do NOT trust measure_body's mass_kg on a part whose material "
-                f"was set through this tool."
+                f"SetMaterialPropertyName2(config, database, name) was tried with "
+                f"{len(attempts)} argument form(s) and none changed the density "
+                f"(attempts: {attempts}). Do NOT trust mass_kg from this part: "
+                f"apply the material by hand (Edit Material) or report the limitation; "
+                f"never present volume x density as the SolidWorks mass."
             )
 
         # Without a library density there is nothing to verify against, so say
