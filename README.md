@@ -1,7 +1,7 @@
 # SolidWorks MCP Server
 
 Servidor MCP em Python que controla o SolidWorks via COM (`win32com`), escrito
-com o SDK oficial (`mcp`, usando `FastMCP`). **157 ferramentas** (v5.19.0).
+com o SDK oficial (`mcp`, usando `FastMCP`). **163 ferramentas** (v5.21.0).
 
 ## Para quem so quer usar
 
@@ -116,6 +116,18 @@ deslocada aparece em `displaced_points` em vez de virar peca errada.
 `loft_sketches`, `fillet_edges`, `chamfer_edges`, `shell_body`,
 `linear_pattern`, `circular_pattern`, `hole_wizard`, `list_features`,
 `delete_feature`
+
+`cut_part_end` (v5.21.0, medido ao vivo): corte de extremidade / mitra. Fatia uma
+peca de tubo/perfil com um plano (`normal` + `offset` ou `point`, em coordenadas
+da peca; `origin` permite dar o plano em coordenadas da montagem) e remove o lado
+para onde a normal aponta, deixando a ponta como UMA face plana inclinada que
+assenta face a face contra outro membro (banzo x perna, corrimao x guarda-corpo).
+Corta com um retangulo gigante no plano global que contem a normal, extrudado
+simetrico por toda a peca. A resposta traz volume antes/depois, caixa antes/depois,
+`removed_mm3`, `end_on_plane` (ponto mais distante ao longo da normal lido do
+solido) e `cut_face_area_mm2`. Limitacao: a normal tem de ser perpendicular a um
+eixo global (sem angulo composto); para mitrar uma ponta rente a uma parede o
+tubo bruto precisa de sobra de comprimento antes do corte.
 
 Adicionada em 17/08/2026: ate esta versao nao havia forma de apagar uma
 feature de peca por nome (so existia `delete_component` para assembly).

@@ -256,6 +256,8 @@ TIMEOUT_BUDGET_OVERRIDES = {
     # Same reason: draw_profile is one COM call that draws, and then reads back,
     # as many segments as the caller computed.
     "draw_profile": 300,
+    # Orchestrates open + sketch + cut + rebuild + measure + save on a real part.
+    "cut_part_end": 180,
 }
 
 # Reading the whole assembly tree, cross-component interference or a
@@ -5461,7 +5463,7 @@ async def cut_extrude(depth: float = 10, through_all: bool = False,
         active_unit, factor = _unit_factor(unit)
         sketch_name = _select_last_sketch(doc)
         if through_all:
-            end_cond = 2 if both_directions else 1  # ThroughAllBoth / ThroughAll
+            end_cond = 9 if both_directions else 1  # swEndCondThroughAllBoth (9) / swEndCondThroughAll (1); 2 is UpToNext
             cut_depth = 0.0
         else:
             end_cond = 6 if both_directions else 0  # MidPlane / Blind
@@ -11234,6 +11236,30 @@ async def lookup_material_properties(material: str = "",
     return await _run(_impl)
 
 
+def _material_call_orders(config: str, database_path: str, material: str) -> list:
+    """Argument tuples for IPartDoc.SetMaterialPropertyName2(config, DATABASE, NAME), in the order
+    to try them. The first is the documented form with the active configuration; the others only
+    change the configuration/database spelling (never swap database and name: that order is the
+    silent no-op measured live)."""
+    forms = [(config, database_path, material), ("", database_path, material)]
+    short = os.path.basename(database_path)
+    if short and short != database_path:
+        forms.append((config, short, material))
+    seen, out = set(), []
+    for form in forms:
+        if form not in seen:
+            seen.add(form)
+            out.append(form)
+    return out
+
+
+def _density_matches(actual, expected) -> bool:
+    """True when the document density equals the library density within 1 % (or 1 kg/m3)."""
+    if not actual or not expected:
+        return False
+    return abs(actual - expected) <= max(1.0, expected * 0.01)
+
+
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def set_material(
     material: str = "AISI 1020",
@@ -11274,66 +11300,44 @@ async def set_material(
                 f"explicitly as 'database' instead."
             )
 
-        # Re-confirmed live, 2026-10-05, on a fresh box part: even with a
-        # correctly resolved .sldmat path, mass stayed at exactly water
-        # density for BOTH "6061 Alloy" and "Cast Alloy Steel" -- the path
-        # fix above was not the whole story. Root cause: the material name
-        # and database path were swapped. The real signature is
-        # SetMaterialPropertyName2(ConfigurationName, SName /* material */,
-        # SDatabase /* path */) -- symmetric with the already-working reader
-        # _native_material_name's GetMaterialPropertyName2(ConfigurationName,
-        # ByRef SDatabase) -> material name as the return value, database as
-        # the out-param. The old code passed (resolved_database, material),
-        # i.e. asked SolidWorks for a material literally named the .sldmat
-        # file path inside a "database" named e.g. "6061 Alloy" -- neither
-        # resolves, so the call is a silent no-op with no exception raised.
-        # The documented contract for ConfigurationName="" is "apply to every
-        # configuration that uses the document material" -- in principle that
-        # should cover the active configuration too. Confirmed live,
-        # 2026-10-05: it does not. After fixing the argument-order bug above,
-        # SetMaterialPropertyName2("", material, resolved_database) still
-        # left mass_kg exactly at water density (1000 kg/m3, verified by
-        # mass/volume, independent of any read-back call) on a freshly built
-        # part. Passing the ACTIVE configuration's real name instead of ""
-        # is the next-most-specific thing the API accepts; used by both the
-        # write and (where _native_material_name is called with no config
-        # override) the read, so they stay symmetric.
-        #
-        # STILL UNRESOLVED, re-confirmed live 2026-10-05 immediately after
-        # this change: using the real active configuration name instead of
-        # "" made no difference -- mass_kg stayed at exactly water density
-        # for both "Alloy Steel" and "6061 Alloy", on a freshly built part,
-        # argument order already correct. The call raises no COM error in
-        # either case; whatever is actually wrong is silent on both ends.
-        # Do NOT re-try more argument-order or config-name permutations
-        # blind -- two independent hypotheses have now been tested and
-        # falsified by density math, not just by the read-back check. Next
-        # debugging step needs either execute_python (gated off by default)
-        # to inspect doc.GetMaterialPropertyName2's actual return value and
-        # type directly, or a live SolidWorks UI comparison (apply a material
-        # by hand via Edit Material, then read it back through this same
-        # reader) to tell whether the WRITE or the READ side is at fault.
+        # ROOT CAUSE (measured live 2026-10-09, SolidWorks 2025 SP4.1, 'Perna' scratch part):
+        # the real signature is IPartDoc.SetMaterialPropertyName2(ConfigurationName,
+        # DATABASE, NAME) -- database FIRST, then the material name. The reader is the
+        # opposite way round (GetMaterialPropertyName2(config, ByRef database) returns the
+        # NAME), and an earlier "fix" here swapped the two to (config, name, database) on a
+        # wrong theory; that order is a silent no-op (density stays 1000 kg/m3, no COM error).
+        # Measured on a fresh part: (cfg, db_path, 'AISI 1020') -> 7900 kg/m3; the same with
+        # config "" or the short name 'SOLIDWORKS Materials' also works; (cfg, name, db) does not.
+        # The old 'verified' failure text blamed the build; the real defect was the order.
+        # Every attempt is verified by DENSITY (mass / volume), the only witness that cannot
+        # be faked, so a future silent no-op still fails loudly instead of reporting success.
         active_config = doc.ConfigurationManager.ActiveConfiguration
         config_name = active_config.Name if active_config is not None else ""
+        expected_density = _library_density(material, resolved_database)
 
-        try:
-            part = doc  # IPartDoc
-            part.SetMaterialPropertyName2(config_name, material, resolved_database)
-        except Exception:
+        attempts = []
+        for call_args in _material_call_orders(config_name, resolved_database, material):
             try:
-                part.SetMaterialPropertyName(material, resolved_database)
+                doc.SetMaterialPropertyName2(*call_args)
+                outcome = "no error"
+            except Exception as exc:
+                outcome = f"{type(exc).__name__}: {exc}"
+            try:
+                doc.ForceRebuild3(False)
             except Exception:
-                raise RuntimeError(
-                    f"Failed to set material '{material}'. Check that the name matches "
-                    "the SolidWorks material library exactly (case-sensitive)."
-                )
+                pass
+            density_now = _document_density(doc)
+            attempts.append({"config": call_args[0], "database": call_args[1],
+                             "name": call_args[2], "outcome": outcome,
+                             "density_kg_m3": round(density_now, 3) if density_now else None})
+            if _density_matches(density_now, expected_density):
+                break
 
         # Verify by DENSITY, which is the number the BOM uses and the only
         # witness that cannot be faked. The previous check compared the
         # material NAME read back from GetMaterialPropertyName2; that is
         # weaker, and on this build the name reads back as "" even when the
         # call reported no error, so the message blamed the wrong thing.
-        expected_density = _library_density(material, resolved_database)
         actual_density = _document_density(doc)
         applied_name = _native_material_name(doc, config_name)
 
@@ -11344,10 +11348,11 @@ async def set_material(
             "document_density_kg_m3": (round(actual_density, 3)
                                        if actual_density else None),
             "material_name_read_back": applied_name,
+            "attempts": attempts,
         }
 
         if expected_density and actual_density:
-            if abs(actual_density - expected_density) <= max(1.0, expected_density * 0.01):
+            if _density_matches(actual_density, expected_density):
                 result["verified"] = "density matches the material library"
                 return result
             # Exactly water means SolidWorks never picked up a density at all,
@@ -11361,16 +11366,11 @@ async def set_material(
                 + (" (water, i.e. no material density at all)" if looks_like_water else "")
                 + f", while '{material}' is {expected_density:.1f} kg/m3 in "
                 f"{os.path.basename(resolved_database)}.\n\n"
-                f"IPartDoc.SetMaterialPropertyName2 has been confirmed silently "
-                f"ineffective on this SolidWorks build: five documented argument "
-                f"orders were tried live and none changed the density. Until that "
-                f"is resolved:\n"
-                f"  - apply the material by hand in SolidWorks (right-click "
-                f"Material in the feature tree, Edit Material), or\n"
-                f"  - compute weight as volume x density, taking the density "
-                f"from lookup_material_properties('{material}').\n"
-                f"Do NOT trust measure_body's mass_kg on a part whose material "
-                f"was set through this tool."
+                f"SetMaterialPropertyName2(config, database, name) was tried with "
+                f"{len(attempts)} argument form(s) and none changed the density "
+                f"(attempts: {attempts}). Do NOT trust mass_kg from this part: "
+                f"apply the material by hand (Edit Material) or report the limitation; "
+                f"never present volume x density as the SolidWorks mass."
             )
 
         # Without a library density there is nothing to verify against, so say
@@ -14925,6 +14925,969 @@ def _read_readme_or_fallback() -> str:
             return f.read()
     except OSError:
         return "README.md nao encontrado ao lado de server.py."
+
+
+# ===========================================================================
+# Estruturas, perfis e pecas prismaticas (v5.20.0)
+# ===========================================================================
+# Lacunas reveladas ao montar uma escada industrial multi-peca (ver
+# tests/run_escada_industrial_live_test.py e RELATORIO_ESCADA_INDUSTRIAL.md):
+#
+#   * nao havia ferramenta que criasse UMA peca pronta (esboco + extrusao +
+#     material + salvar com nome) -- cada tubo/chapa custava ~12 chamadas e
+#     deixava o documento aberto sem nome;
+#   * nao havia como pedir um TUBO oco (retangular/quadrado/redondo) com
+#     espessura de parede, nem um oblongo (slot) num esboco;
+#   * add_mate/add_advanced_mate escolhem faces por ponto da CAMERA: planos de
+#     origem de componentes (Plano frontal@Peca-1@Montagem) nao sao alcancaveis,
+#     entao nao havia como travar um componente por distancia a origem;
+#   * interference_check so devolvia uma contagem: sem pares, sem volume, sem
+#     separar interferencia volumetrica de contato de superficie;
+#   * set_view so oferece isometrica com Y para cima; um modelo com Z vertical
+#     aparece deitado.
+
+_PROFILE_SHAPES = ("rectangle", "circle", "polygon", "slot")
+_PLANE_ALIASES = {"front": "front", "xy": "front", "top": "top", "xz": "top",
+                  "right": "right", "yz": "right"}
+
+
+def _validate_shape(spec, role: str) -> dict:
+    """Checks one 2D shape spec (outline or hole) without touching COM.
+
+    Returns the spec normalised (shape lower-cased). Raises ValueError with the
+    exact key that is wrong, so a bad call fails before any document is made.
+    """
+    if not isinstance(spec, dict):
+        raise ValueError(f"{role} must be an object like {{'shape': 'rectangle', ...}}, got {spec!r}.")
+    kind = str(spec.get("shape", "")).lower().strip()
+    if kind not in _PROFILE_SHAPES:
+        raise ValueError(f"{role}: unknown shape '{kind}'. Use one of: {', '.join(_PROFILE_SHAPES)}.")
+    need = {
+        "rectangle": ("x1", "y1", "x2", "y2"),
+        "circle": ("cx", "cy"),
+        "polygon": ("points",),
+        "slot": ("cx", "cy", "length", "width"),
+    }[kind]
+    missing = [key for key in need if key not in spec]
+    if missing:
+        raise ValueError(f"{role}: shape '{kind}' is missing {', '.join(missing)}.")
+    if kind == "circle":
+        if spec.get("diameter") is None and spec.get("radius") is None:
+            raise ValueError(f"{role}: a circle needs 'diameter' or 'radius'.")
+        diameter = spec["diameter"] if spec.get("diameter") is not None else 2 * spec["radius"]
+        if diameter <= 0:
+            raise ValueError(f"{role}: the circle diameter must be positive, got {diameter}.")
+    if kind == "rectangle" and (spec["x1"] == spec["x2"] or spec["y1"] == spec["y2"]):
+        raise ValueError(f"{role}: a rectangle needs two different corners (zero-area rectangle).")
+    if kind == "polygon" and (not isinstance(spec["points"], (list, tuple)) or len(spec["points"]) < 3):
+        raise ValueError(f"{role}: a polygon needs at least 3 [x, y] points.")
+    if kind == "slot":
+        if spec["width"] <= 0 or spec["length"] <= spec["width"]:
+            raise ValueError(
+                f"{role}: a slot needs 0 < width < length (length is the OVERALL length, "
+                f"end to end), got width={spec['width']}, length={spec['length']}.")
+    return dict(spec, shape=kind)
+
+
+def _shape_area_mm2(spec: dict) -> float:
+    """Exact area of a validated shape, in the unit of the spec squared."""
+    kind = spec["shape"]
+    if kind == "rectangle":
+        return abs(spec["x2"] - spec["x1"]) * abs(spec["y2"] - spec["y1"])
+    if kind == "circle":
+        d = spec["diameter"] if spec.get("diameter") is not None else 2 * spec["radius"]
+        return math.pi * d * d / 4.0
+    if kind == "slot":
+        w, length = spec["width"], spec["length"]
+        return w * (length - w) + math.pi * w * w / 4.0
+    pts = spec["points"]
+    return abs(sum(pts[i][0] * pts[(i + 1) % len(pts)][1] - pts[(i + 1) % len(pts)][0] * pts[i][1]
+                   for i in range(len(pts)))) / 2.0
+
+
+def _tube_specs(section: str, width: float, height: float, wall: float,
+                outer_diameter: Optional[float]) -> tuple:
+    """Outline + bore specs for a hollow tube centred on the sketch origin.
+
+    Pure geometry (no COM), so the cross-section rules are testable anywhere.
+    'rectangular' uses width x height (width along the sketch X axis), 'square'
+    uses width for both sides, 'round' uses outer_diameter. The bore is the
+    outline offset inwards by ``wall`` on every side.
+    """
+    kind = section.lower().strip()
+    if wall <= 0:
+        raise ValueError(f"wall must be positive, got {wall}.")
+    if kind in ("rectangular", "square"):
+        w = width
+        h = width if kind == "square" else height
+        if not w or not h or w <= 0 or h <= 0:
+            raise ValueError("a rectangular/square tube needs positive width (and height for 'rectangular').")
+        if wall * 2 >= min(w, h):
+            raise ValueError(f"wall={wall} leaves no bore in a {w} x {h} section.")
+        outline = {"shape": "rectangle", "x1": -w / 2, "y1": -h / 2, "x2": w / 2, "y2": h / 2}
+        bore = {"shape": "rectangle", "x1": -w / 2 + wall, "y1": -h / 2 + wall,
+                "x2": w / 2 - wall, "y2": h / 2 - wall}
+        return outline, bore
+    if kind == "round":
+        if not outer_diameter or outer_diameter <= 0:
+            raise ValueError("a round tube needs outer_diameter.")
+        if wall * 2 >= outer_diameter:
+            raise ValueError(f"wall={wall} leaves no bore in a {outer_diameter} mm round tube.")
+        return ({"shape": "circle", "cx": 0, "cy": 0, "diameter": outer_diameter},
+                {"shape": "circle", "cx": 0, "cy": 0, "diameter": outer_diameter - 2 * wall})
+    raise ValueError(f"Unknown section '{section}'. Use 'rectangular', 'square' or 'round'.")
+
+
+def _view_basis(eye, up) -> tuple:
+    """Rows (right, up, toward-viewer) of a camera looking at the model origin.
+
+    ``eye`` is the direction FROM the model TO the camera; ``up`` is the model
+    direction that must point up on screen. Raises on a zero vector or when
+    the two are parallel (no defined 'right').
+    """
+    def norm(v):
+        n = math.sqrt(sum(c * c for c in v))
+        if n < 1e-12:
+            raise ValueError("view vectors must be non-zero.")
+        return tuple(c / n for c in v)
+
+    def cross(a, b):
+        return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+
+    back = norm(eye)
+    right = cross(norm(up), back)
+    if math.sqrt(sum(c * c for c in right)) < 1e-9:
+        raise ValueError("eye and up are parallel: the camera has no defined 'right' direction.")
+    right = norm(right)
+    true_up = cross(back, right)
+    return right, true_up, back
+
+
+def _first_solid_body_name(doc) -> Optional[str]:
+    bodies = _com_member(doc, "GetBodies2", 0, False)
+    for raw in bodies or ():
+        try:
+            return str(win32com.client.Dispatch(raw).Name)
+        except Exception:
+            continue
+    return None
+
+
+async def _draw_slot_shape(spec: dict, unit: Optional[str]) -> dict:
+    """Obround slot with REAL arcs (CreateSketchSlot), not a chord polygon."""
+
+    def _impl():
+        doc = _active_doc()
+        cx, cy = to_meters(spec["cx"], unit), to_meters(spec["cy"], unit)
+        width = to_meters(spec["width"], unit)
+        c2c = to_meters(spec["length"], unit) - width
+        angle = math.radians(float(spec.get("angle", 0)))
+        dx, dy = math.cos(angle) * c2c / 2.0, math.sin(angle) * c2c / 2.0
+        slot = doc.SketchManager.CreateSketchSlot(
+            0, 0, width, cx - dx, cy - dy, 0.0, cx + dx, cy + dy, 0.0, 0.0, 0.0, 0.0, 1, False)
+        if slot is None:
+            raise RuntimeError(f"CreateSketchSlot refused the slot at ({spec['cx']}, {spec['cy']}).")
+        return {"shape": "slot", "created": True}
+
+    return await _run(_impl)
+
+
+async def _draw_shape(spec: dict, unit: Optional[str], tolerance: float) -> dict:
+    kind = spec["shape"]
+    if kind == "rectangle":
+        return await draw_rectangle(spec["x1"], spec["y1"], spec["x2"], spec["y2"], unit, tolerance)
+    if kind == "circle":
+        diameter = spec["diameter"] if spec.get("diameter") is not None else 2 * spec["radius"]
+        return await draw_circle(spec["cx"], spec["cy"], diameter / 2.0, unit, tolerance)
+    if kind == "polygon":
+        return await draw_profile([list(p) for p in spec["points"]], True, unit, tolerance)
+    return await _draw_slot_shape(spec, unit)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def create_profile_part(
+    save_path: str,
+    outline: dict,
+    depth: float,
+    holes: Optional[list[dict]] = None,
+    plane: str = "front",
+    both_directions: bool = False,
+    rotate: Optional[dict] = None,
+    material: Optional[str] = "AISI 1020",
+    close_after_save: bool = True,
+    unit: Optional[str] = None,
+    tolerance: float = 0.01,
+) -> dict:
+    """Build ONE finished prismatic part in a single call: new part, sketch,
+    outline (+ holes/bores/slots), extrusion, material, save under ``save_path``.
+
+    Replaces a 12-call sequence (create_new_part, create_sketch, draw_*, close_sketch,
+    extrude_sketch, set_material, save_document) that left an unnamed document open
+    and gave nothing to verify. THE RESULT IS MEASURED: the saved solid's real
+    volume and bounding box are read back and compared with the volume computed
+    from the requested outline minus holes times depth (``volume_check``).
+
+    outline / holes entries are 2D shapes in the sketch plane, in ``unit``:
+      {"shape": "rectangle", "x1", "y1", "x2", "y2"}
+      {"shape": "circle", "cx", "cy", "diameter"}      (or "radius")
+      {"shape": "polygon", "points": [[x, y], ...]}    (closed, straight edges)
+      {"shape": "slot", "cx", "cy", "length", "width", "angle"}
+          oblong hole with REAL arcs; ``length`` is OVERALL end-to-end, ``angle`` degrees.
+    Holes inside the outline become through-holes of the extrusion (hollow tubes
+    are an outline plus one bore; nested loops must not touch).
+
+    plane: 'front' (XY, extrudes along +Z), 'top' (XZ, extrudes along +Y, sketch
+    y is -Z) or 'right' (YZ, extrudes along +X). both_directions=True is a
+    mid-plane extrusion of total ``depth``.
+
+    rotate: optional {"axis": "x"|"y"|"z", "angle": degrees} applied to the solid
+    about the PART ORIGIN after extruding (Move/Copy Body), so an inclined member
+    is stored already inclined and its origin planes stay parallel to the
+    assembly's -- which keeps plane mates usable.
+
+    The part is closed after saving unless close_after_save=False (only this
+    tool's own new document is ever closed)."""
+
+    def _prepare():
+        out = _validate_shape(outline, "outline")
+        hole_specs = [_validate_shape(h, f"holes[{i}]") for i, h in enumerate(holes or [])]
+        if depth <= 0:
+            raise ValueError(f"depth must be positive, got {depth}.")
+        key = _PLANE_ALIASES.get(plane.lower().strip())
+        if key is None:
+            raise ValueError(f"Unknown plane '{plane}'. Use front, top or right.")
+        if rotate is not None:
+            if str(rotate.get("axis", "")).lower() not in ("x", "y", "z") or "angle" not in rotate:
+                raise ValueError("rotate needs {'axis': 'x'|'y'|'z', 'angle': degrees}.")
+        if os.path.splitext(save_path)[1].lower() != ".sldprt":
+            raise ValueError("save_path must end in .sldprt.")
+        return out, hole_specs, key
+
+    out, hole_specs, plane_key = _prepare()
+    active_unit, _factor = _unit_factor(unit)
+    expected_area = _shape_area_mm2(out) - sum(_shape_area_mm2(h) for h in hole_specs)
+    to_mm = UNIT_TO_METERS[active_unit] * 1000.0
+    expected_volume_mm3 = expected_area * to_mm * to_mm * depth * to_mm
+
+    created = await create_new_part()
+    steps = []
+    try:
+        await create_sketch(plane_key)
+        steps.append(await _draw_shape(out, unit, tolerance))
+        for spec in hole_specs:
+            steps.append(await _draw_shape(spec, unit, tolerance))
+        await close_sketch()
+        extrusion = await extrude_sketch(depth, both_directions, True, unit, tolerance)
+        if rotate:
+            body = await _run(lambda: _first_solid_body_name(_active_doc()))
+            if not body:
+                raise RuntimeError("could not find the solid body to rotate.")
+            axis = str(rotate["axis"]).lower()
+            await move_copy_body(body, 0, 0, 0,
+                                 rx=float(rotate["angle"]) if axis == "x" else 0,
+                                 ry=float(rotate["angle"]) if axis == "y" else 0,
+                                 rz=float(rotate["angle"]) if axis == "z" else 0,
+                                 unit=unit)
+        material_note = None
+        if material:
+            try:
+                await set_material(material)
+            except Exception as exc:
+                # set_material is known to be ineffective on some builds (it
+                # reads the density back and raises). The part is still valid:
+                # record the intended material as a custom property (feeds the
+                # BOM) and report the failure instead of discarding the part.
+                material_note = (f"set_material('{material}') did not take effect "
+                                 f"({str(exc).splitlines()[0]}); the material was recorded as "
+                                 f"the custom property 'Material' only, and mass_kg is NOT real")
+                with contextlib.suppress(Exception):
+                    await set_custom_property("Material", material)
+        measured = await measure_body()
+        saved = await save_document(save_path)
+    except Exception:
+        # Only the document this call created is discarded.
+        with contextlib.suppress(Exception):
+            await close_document(False)
+        raise
+
+    if measured.get("volume_m3") is None:
+        raise RuntimeError("the part was saved but its volume could not be measured; inspect it by hand.")
+    volume_mm3 = measured["volume_m3"] * 1e9
+    ratio = volume_mm3 / expected_volume_mm3 if expected_volume_mm3 else None
+    result = {
+        "path": saved["path"],
+        "title": created.get("title"),
+        "plane": plane_key,
+        "depth": depth,
+        "unit": active_unit,
+        "bounding_box_mm": measured.get("bounding_box"),
+        "volume_mm3": volume_mm3,
+        "mass_kg": measured.get("mass_kg"),
+        "volume_check": {
+            "expected_mm3": expected_volume_mm3,
+            "measured_mm3": volume_mm3,
+            "ratio": ratio,
+            "ok": ratio is not None and abs(ratio - 1.0) < 0.005,
+        },
+        "extrusion_verified": extrusion.get("verified"),
+        "rotated": rotate,
+        "warnings": [material_note] if material_note else [],
+        "material_assigned": bool(material) and not material_note,
+    }
+    if measured.get("density_warning") and not material_note:
+        result["warnings"].append(measured["density_warning"])
+    if rotate:
+        result["volume_check"]["note"] = "rotation preserves volume, so the check still applies"
+    if not result["volume_check"]["ok"]:
+        result["warnings"].append(
+            "the measured volume differs from the one the requested outline implies "
+            "(snapped sketch, refused hole or an overlapping loop): inspect the part before using it")
+    if close_after_save:
+        with contextlib.suppress(Exception):
+            await close_document(False)
+        result["closed"] = True
+    return result
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def create_tube_part(
+    save_path: str,
+    section: str,
+    length: float,
+    wall: float,
+    width: Optional[float] = None,
+    height: Optional[float] = None,
+    outer_diameter: Optional[float] = None,
+    axis: str = "z",
+    both_directions: bool = False,
+    tilt: Optional[dict] = None,
+    material: Optional[str] = "AISI 1020",
+    close_after_save: bool = True,
+    unit: Optional[str] = None,
+) -> dict:
+    """Create a real HOLLOW tube part (rectangular, square or round) and save it.
+
+    section: 'rectangular' (width x height), 'square' (width x width) or 'round'
+    (outer_diameter). ``wall`` is the wall thickness. The solid is the outer
+    section minus the bore, extruded ``length`` along ``axis`` ('x', 'y' or 'z')
+    starting at the part origin (both_directions=True centres it on the origin).
+    The section is centred on the axis; for a rectangular tube ``width`` runs
+    along the first sketch axis of the plane used and ``height`` along the second:
+    axis z (Front plane): width along X, height along Y; axis x (Right plane):
+    width along Z, height along Y; axis y (Top plane): width along X, height
+    along Z. (The Right plane's sketch X is global -Z and the Top plane's sketch Y
+    is global -Z, which does not matter for a section centred on the axis.)
+    Always check ``bounding_box_mm`` in the result.
+
+    tilt: optional {"axis": "y", "angle": degrees} to store the tube already
+    inclined (rotated about the part origin) -- a stair stringer or handrail.
+
+    This is the 'structural member' primitive the server lacked: the weldment
+    profile tool (create_weldment_profile) puts every member as a body of ONE
+    part, which cannot produce one file per distinct component. Real wall: the
+    result carries a volume check against area_outer - area_bore times length."""
+    key = axis.lower().strip()
+    if key not in ("x", "y", "z"):
+        raise ValueError(f"axis must be x, y or z, got '{axis}'.")
+    outline, bore = _tube_specs(section, width or 0, height or 0, wall, outer_diameter)
+    plane = {"z": "front", "x": "right", "y": "top"}[key]
+    result = await create_profile_part(
+        save_path=save_path, outline=outline, holes=[bore], depth=length, plane=plane,
+        both_directions=both_directions, rotate=tilt, material=material,
+        close_after_save=close_after_save, unit=unit)
+    result["section"] = section.lower()
+    result["wall"] = wall
+    result["axis"] = key
+    return result
+
+
+_NAMED_MATE_TYPES = {
+    "coincident": 0, "concentric": 1, "perpendicular": 2, "parallel": 3,
+    "tangent": 4, "distance": 5, "angle": 6, "lock": 16,
+}
+
+
+def _component_plane_selector(plane_name: str, component: str, assembly_title: str) -> str:
+    """SelectByID2 name of a component's feature: 'Plane@Part-1@Sub-1@Assy'.
+
+    ``component`` is the path from the top assembly, outermost first, separated
+    by '/' ('Sub-1/Part-1'); SolidWorks wants it innermost first, joined by '@'.
+    Pure string logic (no COM).
+    """
+    parts = [p.strip() for p in component.replace("\\", "/").split("/") if p.strip()]
+    if not parts:
+        raise ValueError("component must not be empty.")
+    return "@".join([plane_name, *reversed(parts), assembly_title])
+
+
+def _entity_selector(assy, spec: dict) -> tuple:
+    """Turn an entity spec into (kind, selection_name, point) for SelectByID2.
+
+    {"component": "Perna-1", "plane": "front"}  -> 'Plano frontal@Perna-1@Montagem'
+    {"plane": "top"}                            -> the assembly's own origin plane
+    {"face": {x, y, z, unit}} / {"edge": {...}} -> pick by point (camera-dependent)
+    """
+    if not isinstance(spec, dict):
+        raise ValueError(f"entity must be an object, got {spec!r}.")
+    for key, sel_type in (("face", "FACE"), ("edge", "EDGE")):
+        if key in spec:
+            point = spec[key]
+            unit = point.get("unit")
+            return (sel_type, "", (to_meters(point["x"], unit), to_meters(point["y"], unit),
+                                   to_meters(point["z"], unit)))
+    if "plane" not in spec:
+        raise ValueError("entity needs 'plane', 'face' or 'edge'.")
+    which = str(spec["plane"])
+    base = _standard_plane_name(assy, which) if which.lower() in {"front", "top", "right"} else which
+    component = spec.get("component")
+    if component:
+        title = os.path.splitext(_doc_title(assy))[0]
+        base = _component_plane_selector(base, str(component), title)
+    return "PLANE", base, (0.0, 0.0, 0.0)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def add_mate_by_name(
+    mate_type: str,
+    entity1: dict,
+    entity2: dict,
+    value: float = 0,
+    align: str = "closest",
+    flip: bool = False,
+    tolerance: float = 0.05,
+    unit: Optional[str] = None,
+    allow_move: bool = False,
+) -> dict:
+    """Mate two entities chosen BY NAME, including the origin planes of components.
+
+    add_mate / add_advanced_mate pick faces with a ray from the camera, so the
+    origin planes of a component (the only entities that exist on every part,
+    never hidden) cannot be reached, and a hidden face cannot either. This tool
+    selects by feature name, independent of the camera.
+
+    mate_type: coincident, parallel, perpendicular, tangent, concentric,
+    distance (``value`` = gap in ``unit``), angle (``value`` in degrees), lock.
+
+    entity: {"component": "Perna-1", "plane": "front"|"top"|"right"|<plane name>}
+    (a component's origin plane), {"plane": "top"} (the ASSEMBLY's own origin
+    plane), or {"face": {x,y,z,unit}} / {"edge": {...}} to pick by point.
+
+    THE EFFECT IS MEASURED. Component poses are read before and after; the
+    result has ``moved`` per component. For distance/angle mates the side the
+    solver picks depends on plane normals, so when the component MOVES by more
+    than ``tolerance`` the mate is undone and retried once with the opposite
+    ``flip``; ``attempts`` lists what happened. A mate that cannot keep the
+    component where it was (and so contradicts the intended position) raises
+    instead of staying in the model. Pass allow_move=True when the mate is MEANT
+    to position the component (it is then accepted on the first solve and
+    ``moved`` reports how far it travelled; choose the side with ``flip``)."""
+
+    def _impl():
+        assy = _active_assembly()
+        key = mate_type.lower().strip()
+        code = _NAMED_MATE_TYPES.get(key)
+        if code is None:
+            raise ValueError(f"Unknown mate_type '{mate_type}'. Use one of: {', '.join(_NAMED_MATE_TYPES)}")
+        align_code = MATE_ALIGN.get(align.lower().strip())
+        if align_code is None:
+            raise ValueError(f"Unknown align '{align}'. Use one of: {', '.join(MATE_ALIGN)}")
+        active_unit, factor = _unit_factor(unit)
+        mate_value = math.radians(value) if key == "angle" else to_meters(value, unit)
+        sel = [_entity_selector(assy, entity1), _entity_selector(assy, entity2)]
+        empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+
+        def _attempt(flip_flag: bool):
+            assy.ClearSelection2(True)
+            for index, (sel_type, name, point) in enumerate(sel):
+                if not assy.Extension.SelectByID2(name, sel_type, point[0], point[1], point[2],
+                                                  index > 0, 1, empty, 0):
+                    raise RuntimeError(f"could not select entity {index + 1}: {sel_type} '{name}' {point}")
+            picked, before = _capture_picked_components(assy, factor)
+            mate_err = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+            mate = assy.AddMate5(code, align_code, bool(flip_flag),
+                                 mate_value, mate_value, mate_value, 0.0, 0.0,
+                                 mate_value if key == "angle" else 0.0,
+                                 mate_value if key == "angle" else 0.0,
+                                 mate_value if key == "angle" else 0.0,
+                                 False, False, 0, mate_err)
+            if mate is None or mate_err.value != 1:
+                raise RuntimeError(f"mate creation failed (error code {mate_err.value}).")
+            components, warnings = _report_component_movement(
+                picked, before, factor, active_unit, f"the {key} mate")
+            return components, warnings
+
+        attempts = []
+        for flip_flag in (flip, not flip):
+            try:
+                components, warnings = _attempt(flip_flag)
+            except RuntimeError as exc:
+                attempts.append({"flip": flip_flag, "error": str(exc)})
+                if "could not select" in str(exc):
+                    raise
+                continue
+            moved = max((c["moved"]["distance"] for c in components if c.get("moved")), default=0.0)
+            attempts.append({"flip": flip_flag, "moved": moved})
+            if allow_move or moved <= tolerance or key not in ("distance", "angle"):
+                rebuild = assy.EditRebuild3
+                if callable(rebuild):
+                    rebuild()
+                return {"mate_type": key, "value": value if key in ("distance", "angle") else None,
+                        "align": align.lower().strip(), "flip": flip_flag, "unit": active_unit,
+                        "components": components, "attempts": attempts, "warnings": warnings}
+            assy.EditUndo2(1)  # the solver dragged the part: wrong side, undo and retry
+        raise RuntimeError(
+            f"the {key} mate would move the component by more than {tolerance} {active_unit} on "
+            f"both sides ({attempts}); the requested value does not match the current position, "
+            f"so no mate was kept.")
+
+    return await _run(_impl)
+
+
+def _interference_pass(assy, coincidence: bool, subassemblies_as_components: bool,
+                       multibody: bool) -> list:
+    manager = win32com.client.Dispatch(
+        assy.InterferenceDetectionManager,
+        "IInterferenceDetectionMgr", "{EAE282BD-588A-4C1B-AD99-5FE6081C4585}")
+    pairs = []
+    try:
+        manager.TreatCoincidenceAsInterference = bool(coincidence)
+        manager.TreatSubAssembliesAsComponents = bool(subassemblies_as_components)
+        manager.IncludeMultibodyPartInterferences = bool(multibody)
+        manager.MakeInterferingPartsTransparent = False
+        manager.ShowIgnoredInterferences = False
+        raw = manager.GetInterferences
+        if callable(raw):
+            raw = raw()
+        for item in raw or ():
+            interference = win32com.client.Dispatch(item)
+            names = []
+            comps = _com_member(interference, "Components")
+            for comp in comps or ():
+                names.append(str(win32com.client.Dispatch(comp).Name2))
+            volume = _com_member(interference, "Volume")
+            pairs.append({"components": names, "volume_mm3": float(volume or 0.0) * 1e9})
+    finally:
+        with contextlib.suppress(Exception):
+            manager.Done()
+    return pairs
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def interference_report(
+    subassemblies_as_components: bool = False,
+    include_multibody: bool = True,
+    max_pairs: int = 200,
+    min_volume_mm3: float = 0.0,
+) -> dict:
+    """Detailed interference detection: WHICH components, how much volume, and
+    contact separated from real overlap. Read-only (it does not alter the model).
+
+    interference_check only returns a count. This runs SolidWorks'
+    interference detection twice:
+      pass 1 (coincidence NOT counted)  -> ``volumetric``: pairs whose solids really
+          overlap, with the overlap volume in mm3;
+      pass 2 (coincidence counted)      -> pairs that merely touch (shared faces)
+          show up only here: ``surface_contact`` = pass 2 minus pass 1.
+    ``pairs`` entries are {components: [Name2, ...], volume_mm3}. Intentional joints
+    (a tube resting on a plate) belong to ``surface_contact``; anything in
+    ``volumetric`` with a volume above ``min_volume_mm3`` is a real collision to
+    review. subassemblies_as_components=False (default) checks part against part
+    across sub-assembly boundaries."""
+
+    def _impl():
+        assy = _active_assembly()
+        assy.ClearSelection2(True)
+        volumetric = _interference_pass(assy, False, subassemblies_as_components, include_multibody)
+        with_contact = _interference_pass(assy, True, subassemblies_as_components, include_multibody)
+
+        def key(pair):
+            return tuple(sorted(pair["components"]))
+
+        vol_keys = {key(p) for p in volumetric}
+        contact_only = [p for p in with_contact if key(p) not in vol_keys]
+        real = [p for p in volumetric if p["volume_mm3"] > min_volume_mm3]
+        return {
+            "volumetric_count": len(real),
+            "surface_contact_count": len(contact_only),
+            "clear_of_volumetric_interference": len(real) == 0,
+            "volumetric": sorted(real, key=lambda p: -p["volume_mm3"])[:max_pairs],
+            "surface_contact": contact_only[:max_pairs],
+            "truncated": len(real) > max_pairs or len(contact_only) > max_pairs,
+            "subassemblies_as_components": subassemblies_as_components,
+            "note": ("volumetric = solids overlap; surface_contact = faces touch without "
+                     "sharing volume (typical of a welded/bearing joint)"),
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+async def set_view_direction(
+    eye: list[float],
+    up: Optional[list[float]] = None,
+    zoom_to_fit_after: bool = True,
+    output_path: Optional[str] = None,
+) -> dict:
+    """Point the camera from direction ``eye`` (model -> camera) with ``up`` upwards
+    on screen. The named isometric view always has the model Y axis up, so a model
+    built with Z vertical appears lying down: use eye=[-1,-1,0.8], up=[0,0,1] for
+    an isometric-like view of a Z-up model. ``output_path`` (.png) also exports
+    the resulting viewport. ``view_read_back`` is the orientation SolidWorks
+    actually holds after the change (right/up/back vectors in model coordinates)."""
+    if output_path and os.path.splitext(output_path)[1].lower() != ".png":
+        raise ValueError("output_path must end in .png.")
+    up_vector = list(up) if up else [0.0, 0.0, 1.0]
+    if len(eye) != 3 or len(up_vector) != 3:
+        raise ValueError("eye and up must each have exactly 3 components [x, y, z].")
+    right, true_up, back = _view_basis(eye, up_vector)
+
+    def _impl():
+        doc = _active_doc()
+        view = doc.ActiveView
+        transform = view.Orientation3
+        data = list(transform.ArrayData)
+        # IMathTransform: 3x3 rotation row-major in ArrayData[0:9]. Confirmed live
+        # (2026-10-09): Orientation3 holds the screen axes as COLUMNS (right, up and
+        # back are its columns), i.e. the matrix maps screen -> model. Writing them
+        # as rows produced a camera lying on its side.
+        data[0:9] = [right[0], true_up[0], back[0],
+                     right[1], true_up[1], back[1],
+                     right[2], true_up[2], back[2]]
+        data[9:12] = [0.0, 0.0, 0.0]
+        transform.ArrayData = win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, tuple(data))
+        view.Orientation3 = transform
+        if zoom_to_fit_after:
+            doc.ViewZoomtofit2()
+        with contextlib.suppress(Exception):
+            doc.GraphicsRedraw2()  # repaint now: SaveAs3 exports what the window last drew
+        result = {"eye": list(eye), "up": up_vector,
+                  "basis": {"right": list(right), "up": list(true_up), "back": list(back)}}
+        try:
+            read = list(doc.ActiveView.Orientation3.ArrayData)[0:9]
+            result["view_read_back"] = {"right": [read[0], read[3], read[6]],
+                                        "up": [read[1], read[4], read[7]],
+                                        "back": [read[2], read[5], read[8]]}
+        except Exception as exc:
+            result["view_read_back"] = f"unavailable ({exc})"
+        if output_path:
+            path = _resolve_write_path(output_path)
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            doc.SaveAs3(path, 0, 0)
+            if not os.path.exists(path) or os.path.getsize(path) == 0:
+                raise RuntimeError(f"SolidWorks did not write the image '{path}'.")
+            result["image"] = path
+            result["image_bytes"] = os.path.getsize(path)
+        return result
+
+    return await _run(_impl)
+
+
+# ---------------------------------------------------------------------------
+# End cuts (v5.21.0)
+# ---------------------------------------------------------------------------
+# Revealed by the industrial stair: a stringer and a handrail were stored as
+# square-ended prisms, so where they met a leg / a rail they only touched along
+# a line or at a point. A real fabricator cuts the tube end at the angle of the
+# joint (miter / flat seat) so the two members share a FACE.
+
+# Sketch plane -> (sketch x axis, sketch y axis, extrusion axis), as unit
+# vectors in PART coordinates. Front: sketch (x, y) = global (X, Y). Top: sketch
+# y is global -Z. Right: sketch x is global -Z. (Same convention as
+# create_profile_part's docstring; confirmed live while building this tool.)
+_CUT_PLANE_FRAMES = {
+    "top": ((1.0, 0.0, 0.0), (0.0, 0.0, -1.0), (0.0, 1.0, 0.0)),
+    "front": ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+    "right": ((0.0, 0.0, -1.0), (0.0, 1.0, 0.0), (1.0, 0.0, 0.0)),
+}
+
+
+def _unit_vector(vec, label: str = "normal") -> tuple:
+    if not isinstance(vec, (list, tuple)) or len(vec) != 3:
+        raise ValueError(f"{label} must be a list of 3 numbers [x, y, z], got {vec!r}.")
+    length = math.sqrt(sum(float(c) * float(c) for c in vec))
+    if length < 1e-12:
+        raise ValueError(f"{label} must be a non-zero vector.")
+    return tuple(float(c) / length for c in vec)
+
+
+def _end_cut_distance(normal, offset, point, origin) -> tuple:
+    """(unit normal, signed plane distance from the PART origin), no COM.
+
+    The plane is n.p = distance; material with n.p > distance is removed.
+    Give the plane either as ``offset`` (distance along the unit normal from
+    the frame origin) or as a ``point`` on it. ``origin`` is where the part
+    origin sits in the frame the offset/point are written in (e.g. the
+    assembly), so a joint plane can be given in assembly coordinates.
+    """
+    n = _unit_vector(normal, "normal")
+    if (offset is None) == (point is None):
+        raise ValueError("give exactly one of 'offset' (distance along the normal) or 'point' (a point on the plane).")
+    if point is not None:
+        if not isinstance(point, (list, tuple)) or len(point) != 3:
+            raise ValueError(f"point must be [x, y, z], got {point!r}.")
+        distance = sum(n[i] * float(point[i]) for i in range(3))
+    else:
+        distance = float(offset)
+    if origin is not None:
+        if not isinstance(origin, (list, tuple)) or len(origin) != 3:
+            raise ValueError(f"origin must be [x, y, z], got {origin!r}.")
+        distance -= sum(n[i] * float(origin[i]) for i in range(3))
+    return n, distance
+
+
+def _end_cut_plan(normal, distance: float, reach: float) -> dict:
+    """Sketch + extrusion plan that removes the half-space n.p > distance.
+
+    The cutter is a big rectangle on the standard plane that CONTAINS the
+    normal (the sketch plane's extrusion axis must be perpendicular to the
+    normal), extruded mid-plane through the whole part. Raises when the normal
+    is not perpendicular to any global axis (a compound angle), because there
+    is then no standard plane to sketch the cutter on.
+    """
+    n = _unit_vector(normal, "normal")
+    if reach <= 0:
+        raise ValueError(f"reach must be positive, got {reach}.")
+    for key in ("top", "front", "right"):
+        u, v, w = _CUT_PLANE_FRAMES[key]
+        if abs(sum(n[i] * w[i] for i in range(3))) < 1e-6:
+            n2 = (sum(n[i] * u[i] for i in range(3)), sum(n[i] * v[i] for i in range(3)))
+            norm = math.hypot(*n2)
+            n2 = (n2[0] / norm, n2[1] / norm)
+            t = (-n2[1], n2[0])
+            c = (distance * n2[0], distance * n2[1])
+            m = reach
+            corners = [
+                (c[0] - t[0] * m, c[1] - t[1] * m),
+                (c[0] + t[0] * m, c[1] + t[1] * m),
+                (c[0] + t[0] * m + n2[0] * m, c[1] + t[1] * m + n2[1] * m),
+                (c[0] - t[0] * m + n2[0] * m, c[1] - t[1] * m + n2[1] * m),
+            ]
+            return {"plane": key, "normal": n, "distance": distance,
+                    "sketch_normal": n2, "polygon": [list(p) for p in corners],
+                    "depth": 2.0 * m}
+    raise ValueError(
+        f"normal {tuple(round(c, 4) for c in n)} is not perpendicular to any global axis "
+        "(compound angle): the end cut needs a normal lying in the XY, XZ or YZ plane of the part. "
+        "Orient the part (e.g. create_tube_part tilt) so the cut normal lies in one of them.")
+
+
+def _extreme_along(doc, n) -> Optional[float]:
+    """max over every solid body of n.p, via IBody2.GetExtremePoint (metres), or None."""
+    best = None
+    for raw in doc.GetBodies2(0, True) or ():
+        body = win32com.client.Dispatch(raw)
+        try:
+            pt = _com_member(body, "GetExtremePoint", n[0], n[1], n[2])
+        except Exception:
+            return None
+        if pt and len(pt) == 4 and isinstance(pt[0], bool):
+            # Live (SolidWorks 2025): (success, x, y, z) -- the flag comes first.
+            if not pt[0]:
+                return None
+            pt = pt[1:]
+        if not pt or len(pt) < 3:
+            return None
+        value = sum(n[i] * float(pt[i]) for i in range(3))
+        best = value if best is None else max(best, value)
+    return best
+
+
+def _planar_faces_on(doc, n, distance_m: float, tol_m: float = 1e-6) -> list:
+    """Planar faces whose plane is n.p = distance (either orientation): [{area_m2}]."""
+    found = []
+    for raw_body in doc.GetBodies2(0, True) or ():
+        body = win32com.client.Dispatch(raw_body)
+        for raw_face in body.GetFaces() or ():
+            face = win32com.client.Dispatch(raw_face)
+            try:
+                if _classify_surface(win32com.client.Dispatch(face.GetSurface)) != "plane":
+                    continue
+                fn = tuple(_com_member(face, "Normal"))
+                if abs(abs(sum(fn[i] * n[i] for i in range(3))) - 1.0) > 1e-6:
+                    continue
+                box = tuple(_com_member(face, "GetBox"))
+                centre = ((box[0] + box[3]) / 2, (box[1] + box[4]) / 2, (box[2] + box[5]) / 2)
+                on = tuple(face.GetClosestPointOn(*centre))
+                if abs(sum(on[i] * n[i] for i in range(3)) - distance_m) <= tol_m:
+                    found.append({"area_m2": float(_com_member(face, "GetArea"))})
+            except Exception:
+                continue
+    return found
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False))
+async def cut_part_end(
+    normal: list[float],
+    offset: Optional[float] = None,
+    point: Optional[list[float]] = None,
+    origin: Optional[list[float]] = None,
+    part_path: Optional[str] = None,
+    save: bool = True,
+    close_after: bool = False,
+    unit: Optional[str] = None,
+    tolerance: float = 0.01,
+) -> dict:
+    """End cut / miter: slice a tube or profile part with a PLANE so its end becomes
+    one flat face at the angle of the joint, ready to sit face-to-face on another member.
+
+    The plane is given as a ``normal`` plus either ``offset`` or ``point``, in PART
+    coordinates (``unit``): n.p = offset (n is normalised first). Material on the
+    side the normal points to (n.p > offset) is REMOVED -- point the normal out of
+    the end you are trimming. Examples: normal=[1,0,0], offset=120 trims everything
+    beyond x=120; normal=[0.74,0,0.67] gives a mitre whose face is tilted 42 deg.
+    ``origin`` = where the part origin sits in the frame your offset/point are
+    written in (e.g. the part's insertion point in the assembly), so a joint plane
+    can be given directly in assembly coordinates (offset is then n.p in that frame).
+
+    How it cuts: a big rectangle is sketched on the global plane (XY, XZ or YZ)
+    that contains the normal and cut-extruded mid-plane through the whole part, so
+    the new end is a true planar face. Limitation: the normal must be perpendicular
+    to one global axis (no compound angles) -- build the tilted member with
+    create_tube_part ``tilt`` so its joint plane obeys that. The plane must cross
+    the solid: a plane that removes nothing, or everything, is an error. To MITRE a
+    tube end flush to a wall, the blank must be long enough that the whole
+    cross-section is beyond the plane before cutting (leave stock).
+
+    part_path: .sldprt to open, cut, save (and optionally close); omit to cut the
+    ACTIVE part. save=True saves in place (backup the file first: this edits it).
+    close_after=True closes a part this call opened. On any error a part this call
+    opened is closed WITHOUT saving.
+
+    THE RESULT IS MEASURED: volume and bounding box before/after, ``removed_mm3``,
+    the farthest point of the solid along the normal (must equal the plane within
+    ``tolerance``: ``end_on_plane``), the number of bodies (a cut that splits the
+    part is reported) and ``cut_face_area_mm2`` -- the area of the new flat end face
+    read back from the solid."""
+    n, distance = _end_cut_distance(normal, offset, point, origin)
+    active_unit, factor = _unit_factor(unit)
+    to_m = UNIT_TO_METERS[active_unit]
+    if part_path is not None and os.path.splitext(part_path)[1].lower() != ".sldprt":
+        raise ValueError("part_path must end in .sldprt.")
+    if part_path is not None and not os.path.exists(part_path):
+        raise FileNotFoundError(f"File not found: {part_path}")
+    # Fails now (not mid-cut) when the normal is a compound angle.
+    _end_cut_plan(n, distance, 1.0)
+
+    def _open_or_use():
+        app = _connect()
+        if part_path is None:
+            doc = _active_doc()
+            opened = False
+        else:
+            doc = None
+            with contextlib.suppress(Exception):
+                doc = _com_member(app, "GetOpenDocumentByName", part_path)
+            opened = doc is None
+            if doc is None:
+                doc, errors, _w = _open_doc6(app, part_path, 1)
+                if doc is None:
+                    raise RuntimeError(f"Failed to open '{part_path}' (error code {errors}).")
+            _activate_doc3(app, _doc_title(doc), True)
+            doc = app.ActiveDoc
+        if int(_doc_type(doc)) != 1:
+            raise RuntimeError("cut_part_end works on a part document (.sldprt).")
+        return doc, opened
+
+    def _before():
+        doc, opened = _open_or_use()
+        try:
+            box, count = _bodies_bounding_box(doc)
+            if box is None or count != 1:
+                raise RuntimeError(
+                    f"expected exactly 1 solid body, found {count}: cut_part_end trims a single "
+                    "tube/profile body (use split_body or a multibody-aware cut for weldments).")
+            measured = _measure_model_doc(doc, 1.0 / UNIT_TO_METERS.get(_default_unit, 0.001))
+            return opened, box, measured, _doc_title(doc), _doc_path(doc)
+        except Exception:
+            if opened:
+                with contextlib.suppress(Exception):
+                    _connect().CloseDoc(_doc_title(doc))
+            raise
+
+    opened, box, before, title, path = await _run(_before)
+    vol_before = before["volume_m3"] * 1e9
+    reach_m = 2.0 * (math.sqrt(3.0) * max(abs(v) for v in box) + abs(distance) * to_m) + 0.02
+    plan = _end_cut_plan(n, distance, reach_m / to_m)
+    extent = lambda lo, hi: [(h - l) * 1000.0 for l, h in zip(lo, hi)]
+    try:
+        # The extreme point along n must lie beyond the plane or nothing is removed.
+        probe = await _run(lambda: _extreme_along(_active_doc(), n))
+        if probe is not None and probe <= distance * to_m + 1e-7:
+            raise ValueError(
+                f"the plane does not cut the part: its farthest point along the normal is at "
+                f"{probe / to_m:.4f} {active_unit}, not beyond the plane at {distance:.4f} {active_unit}. "
+                "Check the normal's sign (it must point toward the end to remove) and the offset.")
+        if probe is not None:
+            low_probe = await _run(lambda: _extreme_along(_active_doc(), tuple(-c for c in n)))
+            if low_probe is not None and -low_probe >= distance * to_m - 1e-7:
+                raise ValueError("the plane is beyond the whole part (nothing would remain on the keep side).")
+        await create_sketch(plan["plane"])
+        sketch = await draw_profile(plan["polygon"], True, unit, tolerance)
+        await close_sketch()
+        cut = await cut_extrude(plan["depth"], False, True, unit, tolerance)
+
+        def _after():
+            doc = _active_doc()
+            doc.ForceRebuild3(False)
+            box2, count2 = _bodies_bounding_box(doc)
+            measured = _measure_model_doc(doc, 1.0 / UNIT_TO_METERS.get(_default_unit, 0.001))
+            far = _extreme_along(doc, n)
+            faces = _planar_faces_on(doc, n, distance * to_m)
+            return box2, count2, measured, far, faces
+
+        box2, count2, after, far, faces = await _run(_after)
+        vol_after = after["volume_m3"] * 1e9
+        removed = vol_before - vol_after
+        warnings = list(cut.get("warnings") or [])
+        if removed <= 1e-6 * vol_before:
+            raise RuntimeError("the cut removed no material: the plane does not intersect the solid.")
+        if vol_after <= 0:
+            raise RuntimeError("the cut removed the whole part.")
+        if count2 != 1:
+            warnings.append(f"the cut left {count2} solid bodies (the plane split the part): inspect it before using.")
+        end_on_plane = far is not None and abs(far - distance * to_m) <= max(tolerance * to_m, 1e-7)
+        if far is not None and not end_on_plane:
+            warnings.append(
+                f"the farthest point along the normal is {far / to_m:.4f} {active_unit}, "
+                f"not on the plane ({distance:.4f}): the end is not flat at the requested plane.")
+        face_area_mm2 = sum(f["area_m2"] for f in faces) * 1e6 if faces else None
+        if not faces:
+            warnings.append("no planar face lying on the cut plane was found after the cut.")
+        saved = None
+        if save:
+            saved = await save_document()
+        closed = False
+        if opened and close_after and save:
+            with contextlib.suppress(Exception):
+                await close_document(False)
+                closed = True
+    except Exception:
+        if opened:
+            with contextlib.suppress(Exception):
+                await close_document(False)  # discard: only a document this call opened
+        raise
+    return {
+        "title": title,
+        "path": (saved or {}).get("path") or path,
+        "plane": {"normal": list(n), "offset": distance, "unit": active_unit,
+                  "sketch_plane": plan["plane"], "removes": "n.p > offset"},
+        "volume_before_mm3": vol_before,
+        "volume_after_mm3": vol_after,
+        "removed_mm3": removed,
+        "bounding_box_before_mm": {"min": [v * 1000 for v in box[:3]], "max": [v * 1000 for v in box[3:]],
+                                   "size": extent(box[:3], box[3:])},
+        "bounding_box_after_mm": {"min": [v * 1000 for v in box2[:3]], "max": [v * 1000 for v in box2[3:]],
+                                  "size": extent(box2[:3], box2[3:])},
+        "farthest_along_normal": None if far is None else far / to_m,
+        "end_on_plane": end_on_plane,
+        "cut_face_area_mm2": face_area_mm2,
+        "bodies_after": count2,
+        "cut_depth_check": {"verified": cut.get("verified"), "actual_depth": cut.get("actual_depth")},
+        "saved": bool(save),
+        "closed": closed,
+        "warnings": warnings,
+    }
+
 
 
 # ---------------------------------------------------------------------------
