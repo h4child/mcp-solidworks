@@ -44,6 +44,13 @@ Desktop.ini
 .mcpb-cache/
 mcpb-build/
 mcpb-dist/
+build-mcpb/
+
+# Distribution zip artifacts
+solidworks-mcp-chatgpt-plugin-*.zip
+
+# Backup screenshots and reference images
+backup_extensao/
 
 # Locally generated integration-test artifacts
 tests/output/
