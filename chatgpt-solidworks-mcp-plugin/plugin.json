@@ -1,0 +1,22 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "solidworks-mcp",
+  "version": "5.21.0",
+  "description": "Local SolidWorks automation MCP, using the Windows COM API.",
+  "author": {
+    "name": "SolidWorks MCP Contributors"
+  },
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "SolidWorks MCP",
+        "shortDescription": "Automação local SolidWorks",
+        "longDescription": "Automação local do SolidWorks via Windows COM.",
+        "developerName": "SolidWorks MCP Contributors",
+        "category": "Productivity",
+        "capabilities": ["Tools"],
+        "defaultPrompt": "Conecte-se ao SolidWorks e me ajude a automatizar meu projeto CAD."
+      }
+    }
+  }
+}
