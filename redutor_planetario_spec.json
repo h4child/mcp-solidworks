@@ -1,0 +1,15 @@
+{
+  "status": "specification_only_no_solidworks_document_active",
+  "units": "mm",
+  "module": 2.0,
+  "pressure_angle_deg": 20.0,
+  "face_width": 20.0,
+  "planet_count": 3,
+  "planet_angles_deg": [0, 120, 240],
+  "stages": [
+    {"name": "E1", "sun_teeth": 21, "planet_teeth": 21, "ring_teeth": 63, "sun_planet_center_mm": 42.0, "ratio_ring_fixed": 4.0, "phase_condition": 28},
+    {"name": "E2", "sun_teeth": 18, "planet_teeth": 18, "ring_teeth": 54, "sun_planet_center_mm": 36.0, "ratio_ring_fixed": 4.0, "phase_condition": 24}
+  ],
+  "total_ratio_ring_fixed": 16.0,
+  "solidworks_validation": {"assembly": false, "motion": false, "interference": false, "materials": false, "bom": false, "save_reopen": false}
+}
