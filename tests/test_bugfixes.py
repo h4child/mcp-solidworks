@@ -551,6 +551,65 @@ def test_cut_extrude_warns_about_the_synthesized_depth_it_used():
 
 
 # ---------------------------------------------------------------------------
+# B14 -- insert_component's origin correction only worked for parts
+# ---------------------------------------------------------------------------
+
+
+def test_assembly_components_bounding_box_exists_and_recurses():
+    """GetBodies2 is a part-document concept: an assembly reports no bodies
+    of its own, so _bodies_bounding_box(subassembly_doc) always returned
+    None and insert_component silently skipped the origin correction for any
+    sub-assembly (RELATORIO_ESCADA_INDUSTRIAL.md, 'limitacoes conhecidas').
+    The fix unions the sub-assembly's own top-level components instead, and
+    has to recurse for a sub-assembly nested inside another one."""
+    assert hasattr(server, "_assembly_components_bounding_box")
+    source = inspect.getsource(server._component_bounding_box)
+    assert "_assembly_components_bounding_box(model)" in source, (
+        "a component whose own model is itself an assembly must recurse, "
+        "or a sub-sub-assembly silently contributes nothing to the union"
+    )
+
+
+def test_component_bounding_box_transforms_all_eight_corners():
+    """A rotated box's extreme points are not the transformed extreme points
+    of the original -- transforming only the min/max corner pair silently
+    shrinks the box for any component that isn't axis-aligned with its
+    parent."""
+    source = strip_prose(inspect.getsource(server._component_bounding_box))
+    assert "_transform_point(values, corner)" in source
+    assert "corners = (" in source
+
+
+def test_component_bounding_box_reads_the_model_through_the_dispatch_helper():
+    """component.GetModelDoc2() raised 'Membro nao encontrado' live -- same
+    dual-shape issue as B12, this time on IComponent2 instead of
+    ISketchSegment. Caught and silently treated as 'no model', every
+    component bounding box came back None and the whole union collapsed."""
+    source = inspect.getsource(server._component_bounding_box)
+    assert '_com_member(component, "GetModelDoc2")' in source
+    assert '_com_member(model, "GetType")' in source
+    assert "component.GetModelDoc2()" not in strip_prose(source)
+
+
+def test_assembly_components_bounding_box_resolves_lightweight_components():
+    """Components load lightweight by default; a lightweight component's
+    GetModelDoc2() legitimately returns None (not a dispatch-shape issue --
+    there is no model loaded yet), so every component in a freshly opened
+    sub-assembly read as unmeasurable until this resolves them first."""
+    source = inspect.getsource(server._assembly_components_bounding_box)
+    assert "ResolveAllLightWeightComponents(True)" in source
+
+
+def test_preload_and_insert_uses_the_component_union_for_assemblies():
+    """The None-box path used to always mean 'uncorrected'; for doc_type==2
+    (swDocASSEMBLY) it must now try the component-union fallback before
+    giving up."""
+    source = inspect.getsource(server._preload_and_insert_component)
+    assert "_assembly_components_bounding_box(loaded_doc)" in source
+    assert "doc_type == 2" in source
+
+
+# ---------------------------------------------------------------------------
 # Cross-cutting: arguments are validated before COM is touched
 # ---------------------------------------------------------------------------
 

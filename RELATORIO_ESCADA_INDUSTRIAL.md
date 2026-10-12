@@ -18,7 +18,7 @@ Pasta de saida: C:\Users\pcrod\Documents\EscadaIndustrial  (EscadaIndustrial.SLD
 
 ## Limitacoes conhecidas (nao corrigidas)
 - set_material('AISI 1020') nao tem efeito nesta instalacao (densidade continua 1000 kg/m3): massa do SolidWorks NAO e real; o material ficou so como propriedade 'Material'. Massa de aco calculada = volume x 7850.
-- insert_component desloca sub-montagens (origem corrigida pelo centro da caixa, correto so para pecas): inseridas flutuantes na origem e fixadas por mates coincidentes aos planos de origem.
+- (resolvido na v5.21.3, ver .claude/knowledge/verificacao_e_qa.md) insert_component nao corrigia a origem de sub-montagens.
 - (resolvido na v5.21.0, ver abaixo) Nao havia corte de extremidade.
 - SolidWorks encerrou sozinho uma vez ao inserir SubTrilhos (RPC indisponivel); relancado e repetido com sucesso.
 

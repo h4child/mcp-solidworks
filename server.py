@@ -1159,6 +1159,116 @@ def _deviation(requested, measured: dict, tolerance: float) -> dict:
     }
 
 
+def _transform_point(values, point) -> tuple:
+    """Map a local point into its parent frame through a flat row-major
+    transform (see _component_pose for why row-major: confirmed live against
+    a known face, documented in montagens_mecanicas_reais.md)."""
+    r00, r01, r02, r10, r11, r12, r20, r21, r22 = values[0:9]
+    tx, ty, tz = values[9:12]
+    x, y, z = point
+    return (
+        r00 * x + r01 * y + r02 * z + tx,
+        r10 * x + r11 * y + r12 * z + ty,
+        r20 * x + r21 * y + r22 * z + tz,
+    )
+
+
+def _component_bounding_box(component):
+    """One assembly component's bounding box, in its PARENT's coordinate
+    frame: the component's own local box (recursing into a sub-assembly, or
+    reading a part's bodies directly) with all 8 corners carried through its
+    Transform2. All 8 corners, not just the two the local box is stored as,
+    because a rotated box's extreme points are not simply the transformed
+    extreme points of the original."""
+    try:
+        # GetModelDoc2 raised "Member not found" when called as
+        # component.GetModelDoc2() -- confirmed live: this dispatch exposes
+        # it as a plain value, not a bound method, same dual-shape issue
+        # _com_member exists for (see its docstring and B12 above).
+        model = _com_member(component, "GetModelDoc2")
+    except Exception:
+        model = None
+    if model is None:
+        return None
+    try:
+        doc_type = int(_com_member(model, "GetType"))
+    except Exception:
+        doc_type = None
+    if doc_type == 2:  # swDocASSEMBLY
+        box = _assembly_components_bounding_box(model)
+    else:
+        box, _count = _bodies_bounding_box(model)
+    if box is None:
+        return None
+    try:
+        transform = component.Transform2
+        data = transform.ArrayData
+        if callable(data):
+            data = data()
+        values = list(data or ())
+    except Exception:
+        return None
+    if len(values) < 12:
+        return None
+    corners = (
+        (box[0], box[1], box[2]), (box[3], box[1], box[2]),
+        (box[0], box[4], box[2]), (box[3], box[4], box[2]),
+        (box[0], box[1], box[5]), (box[3], box[1], box[5]),
+        (box[0], box[4], box[5]), (box[3], box[4], box[5]),
+    )
+    transformed = [_transform_point(values, corner) for corner in corners]
+    xs, ys, zs = zip(*transformed)
+    return [min(xs), min(ys), min(zs), max(xs), max(ys), max(zs)]
+
+
+def _assembly_components_bounding_box(assy_doc):
+    """Union of every TOP-LEVEL component's bounding box, in assy_doc's own
+    coordinate frame.
+
+    GetBodies2 is a part-document concept: an assembly document reports no
+    bodies of its own, so _bodies_bounding_box(subassembly_doc) always comes
+    back None, and insert_component could never correct a sub-assembly's
+    placement the way it corrects a part's -- confirmed live (escada
+    industrial build, 2026-10-xx): sub-assemblies landed at (requested -
+    nothing), i.e. exactly at the requested point with no origin correction,
+    which is wrong by however far the sub-assembly's own origin sits from its
+    component cloud. This walks the sub-assembly's own components instead
+    (recursing for nested sub-assemblies through _component_bounding_box) and
+    unions their boxes, giving insert_component the same kind of box for a
+    sub-assembly that GetBodies2 gives it for free on a part.
+    """
+    try:
+        # Components load LIGHTWEIGHT by default (a performance setting, not
+        # something this call controls): a lightweight component's
+        # GetModelDoc2() returns None, so its geometry is invisible to
+        # _component_bounding_box until it is resolved. Confirmed live: with
+        # no resolve step, every component came back unreadable and the
+        # union silently stayed None. ReadOnly=True so this never dirties the
+        # document just for a bounding-box read.
+        assy_doc.ResolveAllLightWeightComponents(True)
+    except Exception:
+        pass
+    low = [None, None, None]
+    high = [None, None, None]
+    measured = 0
+    for raw_component in assy_doc.GetComponents(True) or ():
+        try:
+            component = win32com.client.Dispatch(raw_component)
+            box = _component_bounding_box(component)
+        except Exception:
+            continue
+        if box is None:
+            continue
+        measured += 1
+        for axis in range(3):
+            lo, hi = box[axis], box[axis + 3]
+            low[axis] = lo if low[axis] is None else min(low[axis], lo)
+            high[axis] = hi if high[axis] is None else max(high[axis], hi)
+    if not measured:
+        return None
+    return [low[0], low[1], low[2], high[0], high[1], high[2]]
+
+
 # ---------------------------------------------------------------------------
 # Sketch geometry: measure what SolidWorks built, never echo what was asked
 # ---------------------------------------------------------------------------
@@ -1885,14 +1995,27 @@ def _preload_and_insert_component(assy, filepath: str, x: float, y: float, z: fl
         "this placement"
     )
     try:
-        box, body_count = _bodies_bounding_box(loaded_doc)
+        if doc_type == 2:
+            # GetBodies2 is a part-document concept: on an assembly document
+            # it does not return an empty result, it RAISES (confirmed live,
+            # "<unknown>.GetBodies2") -- so this must never be called for a
+            # sub-assembly. Union its own top-level components' boxes
+            # instead, so a sub-assembly gets the same origin correction a
+            # part gets for free (see _assembly_components_bounding_box).
+            box = _assembly_components_bounding_box(loaded_doc)
+            body_count = 0
+            correction["measured_from"] = "component_union" if box is not None else None
+        else:
+            box, body_count = _bodies_bounding_box(loaded_doc)
+            correction["measured_from"] = "bodies" if box is not None else None
         correction["body_count"] = body_count
         correction["bodies_measured"] = box is not None
         if box is None:
             correction["warnings"].append(
-                f"no solid body in '{os.path.basename(filepath)}' reported a readable "
-                f"bounding box (subassembly, surface-only or lightweight), so the origin "
-                f"correction could not be computed -- {uncorrected}")
+                f"neither a solid body nor a readable component box was found in "
+                f"'{os.path.basename(filepath)}' (surface-only or lightweight "
+                f"document), so the origin correction could not be computed -- "
+                f"{uncorrected}")
         else:
             offset = [(box[0] + box[3]) / 2.0,
                       (box[1] + box[4]) / 2.0,
