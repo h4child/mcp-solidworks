@@ -159,6 +159,86 @@ Este MCP **não tem FEA**. Para uma resposta honesta:
    produção se a aplicação for crítica (segurança, carga de pessoas,
    certificação regulatória).
 
+## 8. `cut_extrude(through_all=True, both_directions=True)` corta só UM lado (confirmado ao vivo)
+
+Testado ao vivo (2026-10-11) modelando um mancal de bucha: um furo Ø20mm
+centrado no meio de um boss cilíndrico de 70mm de comprimento, cortado com
+`cut_extrude(through_all=True, both_directions=True)`. Resultado: `validate_model`
+0 erros, nenhum aviso — mas `list_faces(surface_type="cylinder")` na face do
+furo deu área que, dividida pela circunferência, mede **35mm** de comprimento
+(metade do boss), não 70mm. O furo não atravessa o lado positivo do eixo —
+indistinguível de sucesso sem medir a face resultante.
+
+Causa provável (leitura de `server.py`): `FeatureCut4` recebe `T1=end_cond`
+com `swEndCondThroughAllBoth=9` quando `through_all and both_directions`, mas
+na prática o SolidWorks resolve isso como `ThroughAll` de um lado só — ao
+contrário do boss/extrude com profundidade explícita e `both_directions=True`,
+que corretamente divide a profundidade pedida entre os dois lados (ver item 9
+abaixo).
+
+**Contorno confirmado:** não use `through_all=True` com `both_directions=True`
+num `cut_extrude` que precisa passar dos dois lados. Em vez disso, calcule uma
+profundidade cega grande o bastante (maior que a extensão do sólido no eixo de
+corte) e use `cut_extrude(depth=X, both_directions=True)` sem `through_all` —
+o corte para sozinho na superfície do sólido, então um valor "grande demais"
+é seguro e não há necessidade de acertar o valor exato. Confirmado: boss de
+70mm cortado limpo com `depth=80, both_directions=True`.
+
+## 9. `both_directions=True`: o `depth` pedido é o TOTAL somado, não por lado
+
+Confirmado ao vivo duas vezes (`extrude_sketch` e `cut_extrude`): com
+`both_directions=True`, o valor de `depth` é **dividido** entre os dois
+sentidos, não aplicado inteiro em cada um. `extrude_sketch(depth=70,
+both_directions=True)` produziu um boss de 70mm de comprimento TOTAL (35mm
+para cada lado a partir do plano do esboço), não 140mm. Planeje a partir
+disso: para um comprimento total desejado `L`, passe `depth=L`, não `depth=L/2`
+nem `depth=L*2`.
+
+## 10. `hole_wizard`: coordenada da face falha de forma inconsistente após chanfro/filete global
+
+Confirmado ao vivo: depois de `chamfer_edges`/`fillet_edges` (que afetam TODAS
+as arestas da peça — não há seleção de aresta nessas duas ferramentas, ver
+`CLAUDE.md`), a face plana que antes aceitava `hole_wizard` em `(hole_x=0,
+hole_y=0)` passou a falhar tanto na seleção da face quanto no posicionamento
+do ponto, de forma não determinística entre tentativas com o mesmo ponto
+exato devolvido por `list_faces`. Resultado prático: depois de um chanfro/filete
+global, prefira furos de fixação simples como sketch manual (`create_sketch`
+num plano de referência nomeado + `draw_circle` + `cut_extrude`) em vez de
+`hole_wizard`, que depende de clicar a face via câmera/coordenada e é sensível
+à geometria de borda que o chanfro altera.
+
+## 11. `set_units` usa o parâmetro `unit`, não `unit_system`; `set_view` usa `view_name`, não `view`
+
+Erro de uso comum (não é bug do servidor): passar `unit_system=` para
+`set_units` ou `view=` para `set_view` não gera erro de validação — o
+parâmetro desconhecido é ignorado e a ferramenta usa o default (`set_view`
+sem `view_name` válido mantém a vista atual sem avisar que o parâmetro foi
+ignorado). Sempre conferir o nome exato do parâmetro no schema antes de
+assumir.
+
+## 12. `set_material` pode não aplicar densidade — confirmado nesta instalação
+
+`set_material("Gray Cast Iron")` e `set_material("AISI 1045 Steel, cold
+drawn")` retornaram erro explícito e detalhado (não um falso sucesso):
+`SetMaterialPropertyName2` foi tentado com 3 variações de argumento e nenhuma
+mudou a densidade computada (ficou em 1000 kg/m³, água). A própria ferramenta
+já documenta isso no docstring de `lookup_material_properties` ("while
+set_material cannot apply a density on this SolidWorks build"). Contorno:
+`lookup_material_properties` pra pegar a densidade real da biblioteca,
+`set_custom_property("Material", ...)` pra registrar a decisão no documento
+(aparece em BOM/exports), e calcular a massa à mão (`volume_m3 × density`)
+deixando explícito que não é a propriedade de massa nativa do SolidWorks.
+
+## 13. Toda chamada a `draw_circle`/`draw_rectangle` no mesmo esboço perto de geometria existente pode snapar — confira `verified`
+
+Confirmado ao vivo: dois furos de fixação desenhados no mesmo esboço, o
+primeiro com `draw_circle(x=40, radius=4.5)` saiu exato, o segundo
+`draw_circle(x=-40, radius=4.5)` **sem** `zoom_to_area` antes saiu com raio
+5.0mm em vez de 4.5mm (`verified: false`, aviso explícito do snap). A correção
+não é olhar a imagem — é sempre checar o campo `verified`/`deviation` de cada
+chamada de desenho antes de prosseguir, e usar `zoom_to_area` na região do
+próximo ponto antes de desenhar perto de geometria já existente no esboço.
+
 ## 7. Antes de `save_document`/entregar
 
 - `get_custom_properties` preenchido com o que o usuário/processo downstream
