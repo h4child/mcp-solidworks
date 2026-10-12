@@ -5454,7 +5454,19 @@ async def cut_extrude(depth: float = 10, through_all: bool = False,
     With ``through_all`` there is no depth to verify -- the end condition is what
     decides where the cut stops -- so ``verified`` comes back None and
     ``verification_skipped`` says so rather than claiming a check that did not
-    happen."""
+    happen.
+
+    ``through_all=True, both_directions=True`` ACTUALLY CUTS BOTH SIDES: the
+    native SolidWorks end condition for this combination
+    (``swEndCondThroughAllBoth``) was confirmed live to cut only one side of
+    the sketch plane -- a hole through the middle of a boss came out as a
+    blind pocket reaching half way, not a through hole, with no error and no
+    warning from SolidWorks. Instead of that end condition, this synthesizes
+    a blind cut in both directions deep enough to clear the whole part (twice
+    the model's bounding-box diagonal), which SolidWorks stops at the solid's
+    own surface regardless of how deep it is asked to go -- so "too deep" is
+    always safe here. ``through_all=True`` with ``both_directions=False``
+    still uses the native ``swEndCondThroughAll`` (confirmed correct)."""
 
     def _impl():
         if not through_all and depth <= 0:
@@ -5462,8 +5474,20 @@ async def cut_extrude(depth: float = 10, through_all: bool = False,
         doc = _active_doc()
         active_unit, factor = _unit_factor(unit)
         sketch_name = _select_last_sketch(doc)
-        if through_all:
-            end_cond = 9 if both_directions else 1  # swEndCondThroughAllBoth (9) / swEndCondThroughAll (1); 2 is UpToNext
+        through_all_both_workaround = through_all and both_directions
+        if through_all_both_workaround:
+            box, _ = _bodies_bounding_box(doc)
+            if box is None:
+                raise RuntimeError(
+                    "through_all + both_directions needs a solid body to size "
+                    "the cut against, and none was found (GetBodies2 returned "
+                    "nothing measurable)."
+                )
+            diagonal = math.dist(box[:3], box[3:])
+            end_cond = 6  # MidPlane / blind-both-directions
+            cut_depth = max(diagonal, 1e-6) * 2.0
+        elif through_all:
+            end_cond = 1  # swEndCondThroughAll; 2 is UpToNext
             cut_depth = 0.0
         else:
             end_cond = 6 if both_directions else 0  # MidPlane / Blind
@@ -5484,6 +5508,20 @@ async def cut_extrude(depth: float = 10, through_all: bool = False,
             )
         result = {"sketch": sketch_name, "through_all": through_all,
                   "depth": None if through_all else depth, "unit": active_unit}
+        if through_all_both_workaround:
+            result["actual_depth"] = None
+            result["verified"] = None
+            result["verification_skipped"] = (
+                "through_all cuts have no depth dimension to check: the end "
+                "condition decides where the cut stops")
+            result["warnings"] = [
+                "both_directions with through_all does not use SolidWorks' own "
+                "ThroughAllBoth end condition (confirmed to cut only one side); "
+                f"a blind cut of {cut_depth * factor:.4g} {active_unit} in both "
+                "directions was used instead, sized from the model's bounding "
+                "box so it clears the part on every side."
+            ]
+            return result
         if through_all:
             result["actual_depth"] = None
             result["verified"] = None

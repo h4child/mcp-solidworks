@@ -507,6 +507,50 @@ def test_sketch_segment_endpoints_reads_points_through_the_dispatch_helper():
 
 
 # ---------------------------------------------------------------------------
+# B13 -- cut_extrude(through_all=True, both_directions=True) only cut one side
+# ---------------------------------------------------------------------------
+
+
+def test_cut_extrude_does_not_use_the_native_through_all_both_end_condition():
+    """swEndCondThroughAllBoth (end_cond 9) was confirmed live (2026-10-11,
+    verificacao_e_qa.md section 8) to cut only one side of a boss: a Ø20mm
+    hole through the middle of a 70mm cylinder measured 35mm deep, not 70,
+    with validate_model reporting zero errors -- indistinguishable from
+    success without measuring the resulting face. cut_extrude must instead
+    synthesize a blind both-directions cut deep enough to clear the whole
+    part, which SolidWorks stops at the solid's own surface."""
+    source = code_of("cut_extrude")
+    assert "end_cond = 9" not in source
+    assert "_bodies_bounding_box(doc)" in source
+    assert "through_all_both_workaround" in source
+
+
+def test_cut_extrude_sizes_the_workaround_depth_from_the_bounding_diagonal():
+    """Too shallow silently reproduces the bug (a cut that does not reach the
+    far side); the fix has to be provably deep enough rather than a guess,
+    so it is derived from the part's own measured extent, doubled for
+    margin."""
+    source = code_of("cut_extrude")
+    assert "math.dist(box[:3], box[3:])" in source
+    assert "diagonal" in source and "* 2.0" in source
+
+
+def test_cut_extrude_through_all_single_direction_keeps_the_native_end_condition():
+    """Only the both_directions combination was confirmed broken; a plain
+    through_all cut must keep using swEndCondThroughAll unchanged."""
+    source = source_of("cut_extrude")
+    assert "end_cond = 1  # swEndCondThroughAll" in source
+
+
+def test_cut_extrude_warns_about_the_synthesized_depth_it_used():
+    """A silent substitution would be just as dangerous as the bug it
+    replaces if a caller ever needs to know the real end condition used."""
+    source = source_of("cut_extrude")
+    assert "ThroughAllBoth" in source
+    assert '"warnings"' in source
+
+
+# ---------------------------------------------------------------------------
 # Cross-cutting: arguments are validated before COM is touched
 # ---------------------------------------------------------------------------
 

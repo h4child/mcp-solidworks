@@ -159,31 +159,6 @@ Este MCP **não tem FEA**. Para uma resposta honesta:
    produção se a aplicação for crítica (segurança, carga de pessoas,
    certificação regulatória).
 
-## 8. `cut_extrude(through_all=True, both_directions=True)` corta só UM lado (confirmado ao vivo)
-
-Testado ao vivo (2026-10-11) modelando um mancal de bucha: um furo Ø20mm
-centrado no meio de um boss cilíndrico de 70mm de comprimento, cortado com
-`cut_extrude(through_all=True, both_directions=True)`. Resultado: `validate_model`
-0 erros, nenhum aviso — mas `list_faces(surface_type="cylinder")` na face do
-furo deu área que, dividida pela circunferência, mede **35mm** de comprimento
-(metade do boss), não 70mm. O furo não atravessa o lado positivo do eixo —
-indistinguível de sucesso sem medir a face resultante.
-
-Causa provável (leitura de `server.py`): `FeatureCut4` recebe `T1=end_cond`
-com `swEndCondThroughAllBoth=9` quando `through_all and both_directions`, mas
-na prática o SolidWorks resolve isso como `ThroughAll` de um lado só — ao
-contrário do boss/extrude com profundidade explícita e `both_directions=True`,
-que corretamente divide a profundidade pedida entre os dois lados (ver item 9
-abaixo).
-
-**Contorno confirmado:** não use `through_all=True` com `both_directions=True`
-num `cut_extrude` que precisa passar dos dois lados. Em vez disso, calcule uma
-profundidade cega grande o bastante (maior que a extensão do sólido no eixo de
-corte) e use `cut_extrude(depth=X, both_directions=True)` sem `through_all` —
-o corte para sozinho na superfície do sólido, então um valor "grande demais"
-é seguro e não há necessidade de acertar o valor exato. Confirmado: boss de
-70mm cortado limpo com `depth=80, both_directions=True`.
-
 ## 9. `both_directions=True`: o `depth` pedido é o TOTAL somado, não por lado
 
 Confirmado ao vivo duas vezes (`extrude_sketch` e `cut_extrude`): com
