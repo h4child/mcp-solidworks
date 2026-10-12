@@ -1,7 +1,7 @@
 # SolidWorks MCP Server
 
 Servidor MCP em Python que controla o SolidWorks via COM (`win32com`), escrito
-com o SDK oficial (`mcp`, usando `FastMCP`). **163 ferramentas** (v5.21.0).
+com o SDK oficial (`mcp`, usando `FastMCP`). **163 ferramentas** (v5.21.5).
 
 ## Para quem so quer usar
 
@@ -469,6 +469,36 @@ Limites declarados na docstring: so engrenagem cilindrica de dentes retos,
 externa, sem correcao de perfil. Helicoidal, interna, conica, coroa/rosca sem
 fim e chanfro de topo ficam de fora -- e, como sempre, nao ha FEA aqui pra
 conferir resistencia do dente.
+
+### Novas em v5.17.0 (contexto para a IA: resource novo + descricoes corrigidas)
+
+As tres versoes anteriores criaram uma camada de medicao inteira — `verified`,
+`snapped`, `moved`, `deviation`, `measurement_method`, `components_moved` — e
+**nada explicava ao cliente como ler esses campos**. Um `verified: null` lido
+como sucesso reintroduz exatamente o problema que a medicao resolve.
+
+**`solidworks://knowledge/campos-de-verificacao` (resource novo, 13 no total).**
+Registrado **primeiro** na lista, porque e o unico que vale para qualquer pedido:
+fala do RETORNO DAS FERRAMENTAS, nao de engenharia. Cobre o contrato
+(`requested_*` vs `actual_*`), por que `verified: false` e `verified: null` sao
+coisas diferentes, o que fazer com cada campo especifico, as **cinco armadilhas
+confirmadas** (snap de esboco em espaco de tela, alinhamento de mate forcado,
+primeiro componente ancorado, dimensao de feature reduzida sem erro, pose de
+mecanismo que nenhuma mate segura) e — deliberadamente — a lista do que **ainda
+nao foi validado ao vivo**, para que nada disso seja citado como garantia.
+
+**Duas descricoes de resource estavam desatualizadas**, e isso e pior do que
+parece: a descricao e o que o modelo usa para **decidir** se abre o resource,
+entao uma descricao que nao menciona uma secao garante que aquela secao nunca
+seja lida. `montagens-mecanicas-reais` nao falava de mecanismo, motion study nem
+`add_advanced_mate`; `verificacao-e-qa` nao falava do snap de esboco. Corrigidas.
+
+**Testes de resource, que nao existiam.** 19 novos, entre eles: todo arquivo em
+`.claude/knowledge/` tem de estar registrado (um arquivo nao registrado alcanca o
+Claude Code neste repo e mais nada — do Claude Desktop, `.claude/` e invisivel e
+os resources sao tudo), todo resource registrado aponta para um arquivo que
+existe, toda descricao tem corpo, o resource novo cobre cada campo que as
+ferramentas devolvem, e ele admite o que nao foi provado.
 
 ### Novas em v5.16.0 (movimento: a mate de mecanismo conferida)
 
