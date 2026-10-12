@@ -1237,7 +1237,7 @@ def _sketch_segment_geometry(raw_segment, factor: float) -> dict:
         ("GetCenterPoint2", "center"),
     ):
         try:
-            raw_point = getattr(segment, member)()
+            raw_point = _com_member(segment, member)
         except Exception:
             continue
         if raw_point is None:
@@ -1393,7 +1393,7 @@ def _sketch_segment_endpoints(raw_segment) -> list:
     ends = []
     for member in ("GetStartPoint2", "GetEndPoint2"):
         try:
-            raw_point = getattr(segment, member)()
+            raw_point = _com_member(segment, member)
         except Exception:
             continue
         if raw_point is None:

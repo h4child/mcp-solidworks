@@ -477,6 +477,36 @@ def test_asking_for_folded_does_not_create_a_flat_pattern():
 
 
 # ---------------------------------------------------------------------------
+# B12 -- sketch segment start/end/center points read through the raw getattr
+# shape instead of the dispatch-agnostic helper
+# ---------------------------------------------------------------------------
+
+
+def test_sketch_segment_geometry_reads_points_through_the_dispatch_helper():
+    """GetStartPoint2/GetEndPoint2/GetCenterPoint2 used to be called as
+    `getattr(segment, member)()`. Under the generated-type-library dispatch
+    shape (see _com_member's docstring) these members can arrive as plain
+    values rather than bound methods, so calling them raised and was caught
+    by the bare `except Exception: continue` -- silently dropping start/end/
+    center from every arc, circle and spline instead of crashing loudly.
+    Confirmed live (2026-10-11): draw_circle/draw_arc/list_sketch_entities
+    all read 'center' back correctly only once this goes through
+    _com_member, same as every other dual-shape COM read in this file."""
+    source = inspect.getsource(server._sketch_segment_geometry)
+    assert '_com_member(segment, member)' in source
+    assert 'getattr(segment, member)()' not in strip_prose(source)
+
+
+def test_sketch_segment_endpoints_reads_points_through_the_dispatch_helper():
+    """The lean endpoint reader used by polygon/profile verification had the
+    exact same bug as _sketch_segment_geometry above, for the same two
+    members."""
+    source = inspect.getsource(server._sketch_segment_endpoints)
+    assert '_com_member(segment, member)' in source
+    assert 'getattr(segment, member)()' not in strip_prose(source)
+
+
+# ---------------------------------------------------------------------------
 # Cross-cutting: arguments are validated before COM is touched
 # ---------------------------------------------------------------------------
 
