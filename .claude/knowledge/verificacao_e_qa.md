@@ -169,19 +169,6 @@ para cada lado a partir do plano do esboço), não 140mm. Planeje a partir
 disso: para um comprimento total desejado `L`, passe `depth=L`, não `depth=L/2`
 nem `depth=L*2`.
 
-## 10. `hole_wizard`: coordenada da face falha de forma inconsistente após chanfro/filete global
-
-Confirmado ao vivo: depois de `chamfer_edges`/`fillet_edges` (que afetam TODAS
-as arestas da peça — não há seleção de aresta nessas duas ferramentas, ver
-`CLAUDE.md`), a face plana que antes aceitava `hole_wizard` em `(hole_x=0,
-hole_y=0)` passou a falhar tanto na seleção da face quanto no posicionamento
-do ponto, de forma não determinística entre tentativas com o mesmo ponto
-exato devolvido por `list_faces`. Resultado prático: depois de um chanfro/filete
-global, prefira furos de fixação simples como sketch manual (`create_sketch`
-num plano de referência nomeado + `draw_circle` + `cut_extrude`) em vez de
-`hole_wizard`, que depende de clicar a face via câmera/coordenada e é sensível
-à geometria de borda que o chanfro altera.
-
 ## 11. `set_units` usa o parâmetro `unit`, não `unit_system`; `set_view` usa `view_name`, não `view`
 
 Erro de uso comum (não é bug do servidor): passar `unit_system=` para

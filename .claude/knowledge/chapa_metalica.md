@@ -115,6 +115,13 @@ falha:
    corretas e confirmadas por `list_faces`. Causa raiz não identificada no
    lado do servidor (a seleção da face funciona; é o próprio `HoleWizard4`
    do SolidWorks que recusa essa face). Reproduzido de forma determinística.
+   **Reavaliar:** confirmado ao vivo em 2026-10-12 que `hole_type="simple"`
+   usava a constante `hw_type` errada (2 em vez de 5) e falhava com essa
+   MESMA mensagem em QUALQUER face plana, chanfrada ou não (corrigido em
+   `server.py`, `hole_wizard`). Esse teste pode ter sido vítima do mesmo bug
+   em vez de um problema específico de `EdgeFlange`; não reexecutado aqui
+   ainda — vale repetir com a versão corrigida antes de confiar neste
+   "dead end".
 
 2. **`create_sketch_on_face` + `draw_circle` + `cut_extrude` na face dobrada**
    — a face externa da aba é literalmente o mesmo plano do sketch que

@@ -610,6 +610,37 @@ def test_preload_and_insert_uses_the_component_union_for_assemblies():
 
 
 # ---------------------------------------------------------------------------
+# B15 -- hole_wizard's face selection was camera-dependent (SelectByID2)
+# ---------------------------------------------------------------------------
+
+
+def test_hole_wizard_simple_uses_the_correct_wizard_type_constant():
+    """hw_type 2 (the old 'simple': 2) returned None from HoleWizard4 for
+    EVERY size and standard (ISO and ANSI both), while counterbore/
+    countersink/tapped worked unchanged with the same face/point selection --
+    confirmed live this was never a size-table or selection problem, hw_type
+    5 is what actually creates a HoleWzd feature for a plain drilled hole on
+    this API binding."""
+    source = source_of("hole_wizard")
+    assert '"simple": 5,' in source
+    assert '"simple": 2,' not in source
+
+
+def test_hole_wizard_selects_its_face_through_geometry_not_the_camera():
+    """Confirmed live (verificacao_e_qa.md section 10): after a global
+    chamfer/fillet, SelectByID2(..., 'FACE', x, y, z) started failing
+    non-deterministically between attempts with the EXACT SAME point --
+    SelectByID2 resolves from the current camera view, and the new
+    chamfer/fillet edges change what sits in front of that point on screen,
+    not the face's own boundary. _planar_face_at_point already solves this
+    for weldment faces via GetClosestPointOn (pure geometry, no camera), and
+    hole_wizard already requires a flat face, so it applies here unchanged."""
+    source = code_of("hole_wizard")
+    assert "_planar_face_at_point(doc, fx, fy, fz)" in source
+    assert '_select_by_id(doc, "", "FACE"' not in source
+
+
+# ---------------------------------------------------------------------------
 # Cross-cutting: arguments are validated before COM is touched
 # ---------------------------------------------------------------------------
 

@@ -6164,8 +6164,13 @@ async def hole_wizard(face_x: float, face_y: float, face_z: float,
         fy = to_meters(face_y, unit)
         fz = to_meters(face_z, unit)
         types = {
-            # swWzdGeneralHoleTypes_e
-            "simple": 2,       # swWzdHole
+            # swWzdGeneralHoleTypes_e. "simple" confirmed live to be 5, not 2:
+            # hw_type=2 returns None from HoleWizard4 for EVERY size/standard
+            # combination (ISO and ANSI both), while counterbore/countersink/
+            # tapped all succeed unchanged -- so this was never a size-table
+            # or face-selection problem, it was the wrong type constant for a
+            # plain drilled hole on this API binding.
+            "simple": 5,       # swWzdHole
             "counterbore": 0,  # swWzdCounterBore
             "countersink": 1,  # swWzdCounterSink
             "tapped": 4,       # swWzdTap
@@ -6256,8 +6261,19 @@ async def hole_wizard(face_x: float, face_y: float, face_z: float,
         # A Hole Wizard feature is positioned by preselected sketch points.
         # Create the point on the requested face before calling HoleWizard4;
         # creating it afterwards cannot change the hole position.
+        #
+        # Face selection goes through _planar_face_at_point (geometry lookup
+        # via GetClosestPointOn), not SelectByID2 by coordinate -- confirmed
+        # live (verificacao_e_qa.md section 10) that after a global
+        # chamfer/fillet, SelectByID2 started failing non-deterministically
+        # between attempts with the exact same point: SelectByID2 picks from
+        # the CAMERA, and the new chamfer/fillet edges change what is in
+        # front of that point from the current view, not just the face's own
+        # boundary. hole_wizard already requires a flat face, so the planar
+        # lookup used for weldment faces applies here unchanged.
         doc.ClearSelection2(True)
-        if not _select_by_id(doc, "", "FACE", fx, fy, fz):
+        face = _planar_face_at_point(doc, fx, fy, fz)
+        if not face.Select4(False, pythoncom.Nothing):
             raise RuntimeError(f"No face found at ({face_x}, {face_y}, {face_z}).")
         doc.InsertSketch2(True)
         point = None
