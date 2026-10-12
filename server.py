@@ -2263,7 +2263,12 @@ async def insert_drawing_view(source_filepath: str, view_type: str = "front",
             view.ScaleRatio = (scale, 1.0)
             # The API help for IView.ScaleRatio says to rebuild after changing
             # it; without this the outline read below can still be the old one.
-            doc.EditRebuild3()
+            # Dynamic IDispatch executes a zero-arg member on attribute access
+            # (see _com_member), so EditRebuild3() here was calling the bool
+            # that access already returned, not the method itself.
+            rebuild = doc.EditRebuild3
+            if callable(rebuild):
+                rebuild()
         except Exception as exc:
             scale_applied, scale_error = False, str(exc)
             log.warning("Could not set the scale of view %r to %s: %s",
@@ -9909,7 +9914,9 @@ async def insert_broken_view(
             ) from exc
 
         try:
-            doc.EditRebuild3()
+            rebuild = doc.EditRebuild3
+            if callable(rebuild):
+                rebuild()
         except Exception:
             pass
 

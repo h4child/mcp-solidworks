@@ -93,6 +93,19 @@ def tool_arguments(tool_name: str, function: Any, project: Path) -> dict[str, An
     return arguments
 
 
+def _json_default(obj: Any) -> Any:
+    """Summarize a tool return value that json.dumps cannot serialize.
+
+    Several capture_*/zoom_* tools return an mcp.server.fastmcp.Image
+    (raw PNG bytes), which has no JSON representation of its own. Record
+    its shape instead of letting one such result abort the whole report.
+    """
+    data = getattr(obj, "data", None)
+    if data is not None:
+        return {"__type__": type(obj).__name__, "bytes": len(data)}
+    return {"__type__": type(obj).__name__, "repr": repr(obj)}
+
+
 def write_report(project: Path, results: list[dict[str, Any]], mode: str) -> Path:
     project.mkdir(parents=True, exist_ok=True)
     report = project / f"live-test-{datetime.now():%Y%m%d-%H%M%S}.json"
@@ -105,7 +118,10 @@ def write_report(project: Path, results: list[dict[str, Any]], mode: str) -> Pat
         "not_run": sum(item["status"] == "not_run" for item in results),
         "results": results,
     }
-    report.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    report.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False, default=_json_default),
+        encoding="utf-8",
+    )
     return report
 
 
