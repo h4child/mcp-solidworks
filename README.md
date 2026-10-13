@@ -149,15 +149,17 @@ dialogo de confirmacao do SolidWorks, que travaria a chamada COM.
 ### Operacoes de corpo / referencia
 `mirror_feature` (OK), `mirror_body` (OK), `move_copy_body` (OK),
 `create_reference_plane` (OK), `set_appearance` (OK),
-`set_material` (EXP -- a densidade continua em 1000 kg/m3 (agua): confirmado
-ao vivo em 05/10/2026, mesmo com o `.sldmat` resolvido, cinco ordens de
-argumentos testadas e nome da configuracao ativa; o nome tambem le de volta
-vazio. Desde a v5.12.0 a ferramenta verifica pela DENSIDADE e falha com erro
-explicito em vez de reportar sucesso; `measure_body` devolve `density_kg_m3` e
-avisa quando a massa esta em densidade de agua; `lookup_material_properties`
-le densidade/modulo/escoamento direto do `.sldmat` (peso = volume x
-densidade) como caminho correto enquanto a causa raiz -- no SolidWorks ou na
-instalacao, nao no codigo -- nao e encontrada),
+`set_material` (OK -- retestado ao vivo em 13/10/2026 com `tests/run_measure_body_live_test.py`:
+`set_material("AISI 1020")` aplicou densidade 7900 kg/m3, e um bloco de
+100x50x20 mm mediu massa/volume/densidade com 0,0000% de erro contra o
+calculo analitico e contra `lookup_material_properties`. O travamento em
+1000 kg/m3 (agua) relatado em 05/10/2026 nao se repetiu nesta reinstalacao
+e a causa raiz daquela falha continua sem explicacao -- pode ter sido
+estado da instalacao/licenca, nao o codigo. `measure_body` continua
+devolvendo `density_kg_m3` e avisando se a massa aparecer em densidade de
+agua, que agora e um sinal de regressao a observar, nao o estado esperado;
+`lookup_material_properties` segue como a fonte independente pra conferir
+density contra),
 `create_reference_axis` (EXP -- InsertAxis2 depende de selecao valida),
 `combine_bodies` (EXP -- corpos precisam se tocar/interseccionar),
 `split_body` (EXP -- fluxo Pre/PostSplitBody), `add_rib` (EXP)
