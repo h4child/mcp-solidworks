@@ -14079,12 +14079,17 @@ async def rebuild_model(force: bool = True, top_only: bool = False) -> dict:
     return await _run(_impl)
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def validate_model() -> dict:
     """Rebuild and inspect the feature tree for SolidWorks errors and warnings.
 
     This is a production gate: it returns ``valid: false`` when a feature has a
     non-zero ``IFeature.GetErrorCode2`` result after rebuilding.
+
+    Not read-only: like ``rebuild_model``, this calls ``ForceRebuild3`` before
+    inspecting the tree (was incorrectly annotated ``readOnlyHint=True`` --
+    fixed because a client may otherwise call it speculatively/repeatedly on
+    the strength of that annotation).
     """
 
     def _impl():
