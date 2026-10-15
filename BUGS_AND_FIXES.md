@@ -142,6 +142,64 @@ Cada entrada segue o template da seção 7.5 do pacote de auditoria
 
 ---
 
+## BUG-03 — `apply_texture` enviava ângulo e blend nos slots errados de `CreateTexture` (fechando a lacuna "mapeamento UV")
+
+- **Severidade:** Média (o resultado visual da textura provavelmente saía
+  errado sempre que `angle` era diferente de 0, mas sem erro COM — silencioso).
+- **Status:** CONFIRMADO por documentação da API (não por SolidWorks real —
+  ver limitação abaixo) e CORRIGIDO.
+- **Contexto:** levantado pelo usuário a partir dos achados do documento 03
+  do pacote de auditoria ("Aplicar textura com mapeamento UV", "Materiais
+  PBR avançados", "Configurar reflexão, rugosidade e relevo" — classificados
+  lá como "lacuna de evidência").
+- **Arquivo e função:** `server.py`, `apply_texture`.
+- **Trecho mínimo (antes):**
+  ```python
+  texture = extension.CreateTexture(abs_path, float(scale), float(angle), bool(blend_with_color))
+  ```
+- **Causa:** `IModelDocExtension::CreateTexture` é documentado como
+  `(FileName, Width, Height, Angle)`. O código enviava `scale` em `Width`
+  (ok, mas igual nos dois eixos), o `angle` do chamador no slot de
+  `Height` (errado), e um booleano 0.0/1.0 no slot de `Angle` (errado) — a
+  rotação pedida pelo chamador nunca chegava a ser enviada para o SolidWorks.
+- **Correção:**
+  1. `CreateTexture` agora recebe `(abs_path, resolved_u, resolved_v, angle)`
+     na ordem documentada.
+  2. Novos parâmetros `u_scale`/`v_scale` expõem mapeamento U/V
+     independente por eixo (a lacuna "textura com mapeamento UV"); `scale`
+     continua existindo e aplica o mesmo valor aos dois eixos — sem quebra
+     para quem já chamava a ferramenta só com `scale`.
+  3. `blend_with_color` e o novo `bump_texture_path` (textura de relevo —
+     fecha parcialmente "configurar relevo de renderização") não têm nome
+     de propriedade COM confirmado nesta API, então são aplicados via
+     `_try_set_com_property`: tenta uma lista curta de nomes plausíveis e
+     relata no retorno exatamente qual funcionou (`applied_via_property`)
+     ou `None` — nunca afirma sucesso sem confirmação.
+  4. `list_p2m_appearances` ganhou um bloco `pbr_extended` (roughness,
+     reflectivity, bump_map_path) com o mesmo princípio honesto — `None`
+     quando o objeto de material de renderização desta instalação não
+     expõe aquele canal (fecha parcialmente "materiais PBR avançados": o
+     tool agora *tenta e relata*, em vez de simplesmente não existir).
+- **Testes:** `tests/test_texture_and_pbr_appearance.py` (19 testes) —
+  cobre a ordem correta dos argumentos de `CreateTexture`, o comportamento
+  back-compat de `scale`, validação de intervalo antes de tocar no COM, e
+  o relato honesto de sucesso/falha de `blend_with_color`/`bump_texture_path`/
+  `pbr_extended` com objetos COM simulados que ora têm, ora não têm, a
+  propriedade candidata.
+- **Riscos restantes / limitação importante:** a assinatura
+  `(FileName, Width, Height, Angle)` de `CreateTexture` **não foi
+  confirmada contra um SolidWorks real** nesta auditoria — é uma correção
+  baseada em documentação da API, não em teste ao vivo. Se a suposição
+  estiver errada, a ferramenta continua incorreta, só que de um jeito
+  diferente. **Validação ao vivo necessária:** sim — ver
+  `LIVE_TESTS_REQUIRED.md`, item LT-09. Os nomes de propriedade tentados
+  para blend/bump/PBR (`BlendColor`, `BumpMapFileName`, `Roughness`, etc.)
+  são palpites informados, não documentação oficial — é esperado que
+  `applied_via_property` venha `None` em muitas instalações até alguém
+  confirmar os nomes reais.
+
+---
+
 ## Bugs do pacote de auditoria investigados e NÃO reproduzidos (ver AUDIT_REPORT.md §5, F7)
 
 Nenhum outro item do pacote de auditoria (02 a 07) produziu um bug

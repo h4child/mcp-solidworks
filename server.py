@@ -11869,12 +11869,58 @@ async def set_appearance_properties(
     return await _run(_impl)
 
 
+# IModelDocExtension::CreateTexture's documented signature is
+# (FileName, Width, Height, Angle) -- it returns an IRenderMaterial-like
+# object representing the texture definition, not yet applied (SetTexture
+# does that). The call below used to pass (path, scale, angle,
+# bool(blend_with_color)): that put the caller's ANGLE into the Height slot
+# and a 0.0/1.0 boolean into the ANGLE slot, so the requested rotation was
+# never actually sent and the texture came out stretched/squashed by
+# whatever angle value was passed instead. Fixed here alongside adding real
+# independent U/V scale (u_scale/v_scale) -- this tool was never in the
+# README's OK/EXP matrix (no live verification on file), so the corrected
+# mapping is UNVERIFIED against a real SolidWorks session; see
+# LIVE_TESTS_REQUIRED.md.
+#
+# "blend_with_color" and the optional bump/relief map are not part of
+# CreateTexture's signature at all -- SolidWorks exposes them (if at all)
+# as properties on the render-material object CreateTexture returns, and
+# the exact property name is not documented anywhere in this repo or
+# confirmed live. Rather than invent one and claim it worked, both are
+# applied defensively: try each plausible name, keep going on failure, and
+# report in the result exactly which one (if any) actually took, so a
+# caller never gets a false "applied: true".
+_TEXTURE_BLEND_PROPERTY_CANDIDATES = ("BlendColor", "Blend", "UseColor", "BlendWithBaseColor")
+_TEXTURE_BUMP_PROPERTY_CANDIDATES = ("BumpMapFileName", "BumpFileName", "BumpTextureFileName")
+
+
+def _try_set_com_property(obj, names, value):
+    """Best-effort: set the first of ``names`` that exists on ``obj``.
+
+    Returns the property name that worked, or None if none did. Never
+    raises -- an unsupported property in this SolidWorks version/object is
+    expected, not an error.
+    """
+    for name in names:
+        if not hasattr(obj, name):
+            continue
+        try:
+            setattr(obj, name, value)
+            return name
+        except Exception:
+            continue
+    return None
+
+
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def apply_texture(
     texture_path: str,
+    u_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
     scale: float = 1.0,
     angle: float = 0.0,
     blend_with_color: bool = True,
+    bump_texture_path: Optional[str] = None,
     target: str = "model",
     face_x: float = 0, face_y: float = 0, face_z: float = 0,
     unit: Optional[str] = None,
@@ -11882,28 +11928,64 @@ async def apply_texture(
     """Apply an image texture to the active model or a selected face.
 
     ``texture_path`` must be a local image path supported by SolidWorks.
-    ``scale`` is the texture granularity multiplier (0.001..1000000), and
-    ``angle`` rotates it in degrees (0..360). Set target to ``face`` to apply
-    only to the face at face_x/face_y/face_z.
+    ``u_scale``/``v_scale`` set the texture's width/height tiling
+    independently (UV-style mapping) -- each 0.001..1000000; omit either
+    to fall back to ``scale`` for that axis (back-compat: a caller that
+    only passes ``scale`` gets the same square tiling as before).
+    ``angle`` rotates the texture in degrees (0..360). Set target to
+    ``face`` to apply only to the face at face_x/face_y/face_z.
+
+    ``blend_with_color`` and ``bump_texture_path`` (a second image used as
+    a relief/bump map) are applied best-effort: SolidWorks's COM API does
+    not document a stable property for either on the object this tool can
+    reach, so each is attempted against a short list of plausible property
+    names and the result reports exactly which one worked (or ``None`` if
+    none did) -- never silently claimed as applied. ``bump_texture_path``
+    does not provide true PBR normal-mapped relief; it is a second image
+    layered the same way the color texture is, which is the closest
+    approximation this API exposes.
     """
 
     def _impl():
         abs_path = os.path.abspath(texture_path)
         if not os.path.isfile(abs_path):
             raise FileNotFoundError(f"Texture file not found: {abs_path}")
-        if not 0.001 <= float(scale) <= 1_000_000:
-            raise ValueError("scale must be between 0.001 and 1000000.")
+        resolved_u = scale if u_scale is None else u_scale
+        resolved_v = scale if v_scale is None else v_scale
+        for label, value in (("scale/u_scale", resolved_u), ("scale/v_scale", resolved_v)):
+            if not 0.001 <= float(value) <= 1_000_000:
+                raise ValueError(f"{label} must be between 0.001 and 1000000.")
         if not 0.0 <= float(angle) <= 360.0:
             raise ValueError("angle must be between 0 and 360 degrees.")
         target_key = target.strip().lower()
         if target_key not in {"model", "face"}:
             raise ValueError("target must be 'model' or 'face'.")
+        abs_bump_path = None
+        if bump_texture_path:
+            abs_bump_path = os.path.abspath(bump_texture_path)
+            if not os.path.isfile(abs_bump_path):
+                raise FileNotFoundError(f"Bump texture file not found: {abs_bump_path}")
 
         doc = _active_doc()
         extension = doc.Extension
-        texture = extension.CreateTexture(abs_path, float(scale), float(angle), bool(blend_with_color))
+        texture = extension.CreateTexture(abs_path, float(resolved_u), float(resolved_v), float(angle))
         if texture is None:
             raise RuntimeError("SolidWorks could not create a texture from the supplied file.")
+        blend_applied_via = _try_set_com_property(texture, _TEXTURE_BLEND_PROPERTY_CANDIDATES, bool(blend_with_color))
+
+        bump_result = None
+        if abs_bump_path is not None:
+            bump_texture = extension.CreateTexture(abs_bump_path, float(resolved_u), float(resolved_v), float(angle))
+            bump_applied_via = None
+            if bump_texture is not None:
+                bump_applied_via = _try_set_com_property(texture, _TEXTURE_BUMP_PROPERTY_CANDIDATES, bump_texture)
+            bump_result = {
+                "path": abs_bump_path,
+                "texture_object_created": bump_texture is not None,
+                "applied_via_property": bump_applied_via,
+                "applied": bool(bump_applied_via),
+            }
+
         if target_key == "face":
             doc.ClearSelection2(True)
             fx, fy, fz = to_meters(face_x, unit), to_meters(face_y, unit), to_meters(face_z, unit)
@@ -11920,7 +12002,19 @@ async def apply_texture(
         if not applied:
             raise RuntimeError("SolidWorks rejected the texture assignment.")
         _redraw_document(doc)
-        return {"target": target_key, "texture_path": abs_path, "scale": scale, "angle": angle, "blend_with_color": blend_with_color}
+        return {
+            "target": target_key,
+            "texture_path": abs_path,
+            "u_scale": resolved_u,
+            "v_scale": resolved_v,
+            "angle": angle,
+            "blend_with_color": {
+                "requested": blend_with_color,
+                "applied_via_property": blend_applied_via,
+                "applied": bool(blend_applied_via),
+            },
+            "bump": bump_result,
+        }
 
     return await _run(_impl)
 
@@ -12047,12 +12141,49 @@ async def apply_metal_finish(
 # Native P2M appearance tools
 # ===========================================================================
 
+# Candidate COM property names for PBR-ish render-material channels that
+# are NOT documented anywhere in this repo and have never been confirmed
+# against a live SolidWorks session (list_p2m_appearances was one of the
+# tools missing from the README OK/EXP matrix -- see AUDIT_REPORT.md F1).
+# Rather than assert a single guessed name as "the" property and risk
+# silently reporting 0.0/False for a channel that is simply not exposed,
+# each is tried against every plausible name and the result says exactly
+# which one (if any) matched -- None/None means this SolidWorks
+# installation's IRenderMaterial object does not expose that channel at
+# all, which is itself the honest answer to "materiais PBR avancados" when
+# true. See LIVE_TESTS_REQUIRED.md for what an operator needs to confirm.
+_PBR_PROPERTY_CANDIDATES = {
+    "roughness": ("Roughness", "Smoothness", "Blurriness"),
+    "reflectivity": ("Reflectivity", "ReflectionAmount", "Reflection"),
+    "bump_map_path": ("BumpMapFileName", "BumpFileName", "BumpTextureFileName"),
+}
+
+
+def _read_first_com_property(obj, names):
+    """Return (value, property_name) for the first of ``names`` present on
+    ``obj``, or (None, None) if none of them exist. Never raises."""
+    for name in names:
+        if hasattr(obj, name):
+            try:
+                return getattr(obj, name), name
+            except Exception:
+                continue
+    return None, None
+
+
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def list_p2m_appearances(scope: str = "this") -> dict:
     """List native P2M/render appearances linked to the active display state.
 
     scope: ``this`` for the current display state or ``all`` for every display
     state in the active configuration.
+
+    Each entry's ``pbr_extended`` block reports roughness, reflectivity, and
+    bump-map-path for PBR-style rendering, each as ``{"value": ..., "source_property":
+    ...}`` -- ``source_property`` is ``None`` (and ``value`` is ``None``) when
+    this SolidWorks installation's render-material object does not expose
+    that channel at all, which this tool reports honestly instead of
+    guessing a default.
     """
 
     def _impl():
@@ -12064,11 +12195,19 @@ async def list_p2m_appearances(scope: str = "this") -> dict:
         materials = doc.Extension.GetRenderMaterials2(option, None) or ()
         appearances = []
         for material in materials:
+            pbr_extended = {}
+            for channel, candidates in _PBR_PROPERTY_CANDIDATES.items():
+                value, source = _read_first_com_property(material, candidates)
+                pbr_extended[channel] = {
+                    "value": None if value is None else value,
+                    "source_property": source,
+                }
             appearances.append({
                 "path": str(getattr(material, "FileName", "")),
                 "ambient": float(getattr(material, "Ambient", 0.0)),
                 "diffuse": float(getattr(material, "Diffuse", 0.0)),
                 "specular": float(getattr(material, "Specular", 0.0)),
+                "pbr_extended": pbr_extended,
             })
         return {"scope": scope.strip().lower(), "count": len(appearances), "appearances": appearances}
 
