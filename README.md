@@ -308,6 +308,36 @@ gerenciador de propriedades ou de uma vista de modelo com estado especifico:
 `add_surface_finish`, `add_gdt_symbol`, `add_balloon`, `insert_bom_table`,
 `insert_cut_list_table`.
 
+### Cobertura desta matriz (auditoria de 15/10/2026)
+Este servidor registra 158 ferramentas incondicionais + `execute_python`
+(condicional). A matriz OK/EXP acima -- a mesma lida ao vivo pelo resource
+`solidworks://tool-status` -- cobre 137 delas. As 47 ferramentas abaixo não
+têm status OK/EXP registrado aqui (não é o mesmo que "falhou": a maioria
+(`list_*`, `get_*`, `delete_*`, `set_*` simples) tem alta chance de funcionar
+pelo mesmo padrão COM de ferramentas vizinhas já marcadas OK, mas isso não foi
+testado ao vivo e não deve ser assumido pela IA que lê este resource):
+`extract_assembly_bom`, `get_component_transform`, `set_component_transform`,
+`capture_standard_views`, `list_sketch_entities`, `draw_centerline`,
+`draw_spline`, `create_gear`, `get_drawing_layout`, `get_view_entities`,
+`get_view_dimensions`, `dimension_by_entity_ids`, `verify_drawing`,
+`delete_mate`, `get_appearance_properties`, `set_appearance_properties`,
+`apply_texture`, `remove_texture`, `apply_metal_finish`,
+`list_p2m_appearances`, `apply_p2m_appearance`, `capture_viewport`,
+`get_selection`, `list_faces`, `rebuild_model`, `validate_model`,
+`get_document_dependencies`, `get_persistent_reference`,
+`resolve_persistent_reference`, `list_configurations`,
+`delete_configuration`, `list_equations`, `add_equation`, `set_equation`,
+`delete_equation`, `export_flat_pattern_dxf`, `pack_and_go`,
+`list_display_states`, `create_display_state`, `apply_display_state`,
+`rename_display_state`, `delete_display_state`, `create_profile_part`,
+`create_tube_part`, `add_mate_by_name`, `interference_report`,
+`set_view_direction`.
+
+Ver `TOOL_INVENTORY.csv` (gerado nesta auditoria) para a lista completa das
+158+1 ferramentas com categoria, schema, tipo leitura/escrita/destrutiva e
+referências de teste unitário/live -- derivado mecanicamente do código atual,
+não copiado de uma análise anterior.
+
 ## Notas de implementacao
 
 ### extract_assembly_data nao via o material nativo (corrigido em 02/10/2026)
