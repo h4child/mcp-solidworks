@@ -1,0 +1,431 @@
+ferramenta,categoria,funcao,parametros,tipo,destructiveHint,idempotentHint,openWorldHint,status_readme,testes_unitarios,testes_live
+connect_solidworks,Conexao / Documentos / Utilidades,"Connect to a running SolidWorks instance, launching it if it isn't open yet.",,escrita,False,True,False,OK,test_bugfixes.py,run_gear_live_test.py;run_escada_cortes_live_test.py;run_measure_body_live_test.py;run_live_test_project.py;run_sketch_com_member_live_test.py;run_inspection_live_test.py;run_sheet_metal_weldment_live_test.py;run_hole_wizard_after_fillet_live_test.py;run_read_tools_live_test.py;run_cut_extrude_through_all_both_live_test.py;run_macro_live_test.py;run_drawing_live_test.py;run_insert_subassembly_origin_live_test.py;run_escada_industrial_live_test.py
+get_solidworks_info,Conexao / Documentos / Utilidades,Get the connected SolidWorks application's version and visibility state.,,leitura,False,False,False,OK,,
+create_new_part,Conexao / Documentos / Utilidades,Create a new part document from the default part template.,,escrita,False,False,False,OK,test_escada_tools.py,run_gear_live_test.py;run_measure_body_live_test.py;run_live_test_project.py;run_sketch_com_member_live_test.py;run_inspection_live_test.py;run_sheet_metal_weldment_live_test.py;run_hole_wizard_after_fillet_live_test.py;run_read_tools_live_test.py;run_cut_extrude_through_all_both_live_test.py;run_drawing_live_test.py;run_insert_subassembly_origin_live_test.py
+create_new_assembly,Conexao / Documentos / Utilidades,Create a new assembly document from the default assembly template.,,escrita,False,False,False,OK,,run_live_test_project.py;run_read_tools_live_test.py;run_insert_subassembly_origin_live_test.py;run_escada_industrial_live_test.py
+create_new_drawing,Conexao / Documentos / Utilidades,Create a new drawing document from the default drawing template.,,escrita,False,False,False,OK,,run_live_test_project.py;run_sheet_metal_weldment_live_test.py;run_drawing_live_test.py
+insert_drawing_view,Desenho tecnico detalhado,Insert a standard model view into the active drawing.,"source_filepath: str, view_type: str = ""front"",
+                               x: float = 150, y: float = 150,
+                               scale: float = 1.0",escrita,False,False,False,OK,test_contract.py;test_alfa_drawing.py,run_live_test_project.py;run_sheet_metal_weldment_live_test.py;run_drawing_live_test.py
+open_document,Conexao / Documentos / Utilidades,"Open an existing SolidWorks file (.sldprt, .sldasm, or .slddrw).",filepath: str,escrita,False,True,False,OK,,run_escada_cortes_live_test.py;run_live_test_project.py
+close_document,Conexao / Documentos / Utilidades,"Close the active document, optionally saving it first.",save: bool = False,destrutiva,True,False,False,OK,test_escada_tools.py;test_end_cut.py,run_gear_live_test.py;run_escada_cortes_live_test.py;run_sketch_com_member_live_test.py;run_inspection_live_test.py;run_sheet_metal_weldment_live_test.py;run_hole_wizard_after_fillet_live_test.py;run_read_tools_live_test.py;run_cut_extrude_through_all_both_live_test.py;run_insert_subassembly_origin_live_test.py;run_escada_industrial_live_test.py
+save_document,Conexao / Documentos / Utilidades,Save the active document. Omit filepath to save in place.,filepath: Optional[str] = None,destrutiva,True,True,False,OK,test_escada_tools.py;test_bugfixes.py;test_end_cut.py,run_gear_live_test.py;run_escada_cortes_live_test.py;run_live_test_project.py;run_sheet_metal_weldment_live_test.py;run_read_tools_live_test.py;run_drawing_live_test.py;run_insert_subassembly_origin_live_test.py;run_escada_industrial_live_test.py
+get_document_info,Conexao / Documentos / Utilidades,"Get the active document's title, path, and document type.",,leitura,False,False,False,OK,test_bugfixes.py,run_sheet_metal_weldment_live_test.py
+list_open_documents,Conexao / Documentos / Utilidades,List every SolidWorks document currently open.,,leitura,False,False,False,OK,,run_drawing_live_test.py
+insert_component,Montagem,Insert an existing part or sub-assembly file into the active assembly at a position.,"filepath: str, x: float = 0, y: float = 0, z: float = 0,
+                            unit: Optional[str] = None,
+                            tolerance: float = ",escrita,False,False,False,OK,test_contract.py;test_bugfixes.py,run_live_test_project.py;run_read_tools_live_test.py;run_insert_subassembly_origin_live_test.py;run_escada_industrial_live_test.py
+list_components,Montagem,"List the components of the active assembly, at every level by default.",top_level_only: bool = False,leitura,False,False,False,OK,test_bugfixes.py,run_live_test_project.py;run_read_tools_live_test.py
+extract_assembly_data,Montagem,"Walk every TOP-LEVEL component of the active assembly and return name,","config: str = """"",leitura,False,False,False,OK,test_bugfixes.py,
+extract_assembly_bom,NAO MAPEADO NO README,Build a full multi-level BOM of the active assembly in one call.,"config: str = """",
+                               include_subassemblies: bool = True,
+                               include_suppressed: bool = False,
+          ",leitura,False,False,False,NAO DOCUMENTADO,test_bugfixes.py,
+get_component_transform,NAO MAPEADO NO README,Read an assembly component's exact position and orientation.,"name: str, unit: Optional[str] = None",leitura,False,False,False,NAO DOCUMENTADO,test_contract.py;test_bugfixes.py,
+set_component_transform,NAO MAPEADO NO README,Set a component's absolute assembly position and Euler rotation.,"name: str,
+    x: float = 0,
+    y: float = 0,
+    z: float = 0,
+    rotation_x: float = 0,
+    rotation_y: float = 0,
+    rotation_z: float = 0,
+    unit: Opti",escrita,False,True,False,NAO DOCUMENTADO,test_contract.py,
+capture_standard_views,NAO MAPEADO NO README,"Export front, back, top, bottom, and isometric PNG views of the active model.","output_dir: str = ""tests/output"", prefix: str = ""model""",leitura,False,False,False,NAO DOCUMENTADO,test_bugfixes.py,run_gear_live_test.py
+fix_component,Montagem,Fix a component in place (removes its remaining degrees of freedom).,name: str,escrita,False,True,False,INDEFINIDO (header sem sufixo claro),,run_live_test_project.py
+float_component,Montagem,"Float a previously fixed component, giving it back its degrees of freedom.",name: str,escrita,False,True,False,INDEFINIDO (header sem sufixo claro),test_contract.py,run_live_test_project.py
+delete_component,Features 3D,Remove a component from the active assembly.,name: str,destrutiva,True,False,False,OK,,run_live_test_project.py
+suppress_component,Montagem,Suppress a component in the active assembly (hides it and excludes from calculations).,name: str,escrita,False,True,False,INDEFINIDO (header sem sufixo claro),,run_live_test_project.py
+unsuppress_component,Montagem,Unsuppress a previously suppressed component in the active assembly.,name: str,escrita,False,True,False,INDEFINIDO (header sem sufixo claro),,run_live_test_project.py
+add_mate,Montagem,"Mate two faces/planes, each chosen by a point that","mate_type: str, point1: dict, point2: dict,
+                   align: str = ""closest""",escrita,False,False,False,EXP,test_contract.py;test_bugfixes.py,run_live_test_project.py
+list_mates,Montagem,List every mate (constraint) in the active assembly.,,leitura,False,False,False,INDEFINIDO (header sem sufixo claro),,run_live_test_project.py
+verify_assembly_positions,Montagem,Check where every component of the active assembly ACTUALLY is. Read-only.,"tolerance: float = 0.01,
+                                    unit: Optional[str] = None,
+                                    require_constrained: bool = True,
+ ",leitura,False,False,False,OK,test_contract.py,
+capture_assembly_pose,Montagem,"Record where every component of the active assembly is RIGHT NOW, as a","label: str = """",
+                                filepath: Optional[str] = None,
+                                unit: Optional[str] = None,
+                   ",leitura,False,False,False,OK,test_contract.py,
+restore_assembly_pose,Montagem,Put a mechanism back into a pose recorded by capture_assembly_pose.,"filepath: Optional[str] = None,
+                                pose: Optional[dict] = None,
+                                tolerance: float = 0.01,
+          ",escrita,False,True,False,OK,test_contract.py,
+list_motion_studies,Montagem,List native SolidWorks Motion Studies in the active assembly or part.,,leitura,False,False,False,OK,,
+create_motion_study,Montagem,Create and optionally activate a native SolidWorks Animation study.,"name: Optional[str] = None, activate: bool = True,
+                              unit: Optional[str] = None,
+                              tolerance: float = 0.",escrita,False,False,False,OK,test_contract.py,
+export_document,Propriedades / Medicao / Exportacao / Configuracoes,"Export the active document to STEP, STL, IGES, PDF, DWG, DXF or Parasolid.",filepath: str,destrutiva,True,True,False,OK,test_bugfixes.py,run_live_test_project.py;run_drawing_live_test.py
+create_sketch,Esbocos e desenho 2D,Create a sketch on a standard plane or a named reference plane.,"plane: str = ""front""",escrita,False,False,False,OK,test_escada_tools.py;test_end_cut.py,run_gear_live_test.py;run_measure_body_live_test.py;run_live_test_project.py;run_sketch_com_member_live_test.py;run_inspection_live_test.py;run_sheet_metal_weldment_live_test.py;run_hole_wizard_after_fillet_live_test.py;run_read_tools_live_test.py;run_cut_extrude_through_all_both_live_test.py;run_drawing_live_test.py;run_insert_subassembly_origin_live_test.py
+create_sketch_on_face,Esbocos e desenho 2D,"Create a sketch on an existing body face, chosen by a point known to lie on it.","x: float = 0, y: float = 0, z: float = 0, unit: Optional[str] = None",escrita,False,False,False,OK,,run_inspection_live_test.py
+close_sketch,Esbocos e desenho 2D,Exit the currently active sketch.,,escrita,False,True,False,OK,test_escada_tools.py;test_end_cut.py,run_gear_live_test.py;run_measure_body_live_test.py;run_live_test_project.py;run_sketch_com_member_live_test.py;run_inspection_live_test.py;run_sheet_metal_weldment_live_test.py;run_hole_wizard_after_fillet_live_test.py;run_read_tools_live_test.py;run_cut_extrude_through_all_both_live_test.py;run_drawing_live_test.py;run_insert_subassembly_origin_live_test.py
+get_sketch_status,Esbocos e desenho 2D,"Report whether a sketch is currently active, and its name if so.",,leitura,False,False,False,OK,,
+list_sketch_entities,NAO MAPEADO NO README,Read the real geometry of a sketch out of SolidWorks. Read-only.,"name: Optional[str] = None,
+                               unit: Optional[str] = None",leitura,False,False,False,NAO DOCUMENTADO,test_contract.py;test_bugfixes.py,run_sketch_com_member_live_test.py
+draw_line,Esbocos e desenho 2D,"Draw a line in the active sketch from (x1, y1) to (x2, y2).","x1: float = 0, y1: float = 0, x2: float = 100, y2: float = 0,
+                    unit: Optional[str] = None, tolerance: float = 0.01",escrita,False,False,False,OK,test_contract.py,run_gear_live_test.py
+draw_centerline,NAO MAPEADO NO README,Draw a centerline (construction geometry) in the active PART/ASSEMBLY sketch.,"x1: float = 0, y1: float = 0, x2: float = 0, y2: float = 100,
+                           unit: Optional[str] = None, tolerance: float = 0.01",escrita,False,False,False,NAO DOCUMENTADO,test_contract.py,
+draw_circle,Esbocos e desenho 2D,Draw a circle in the active sketch given its center and radius.,"x: float = 0, y: float = 0, radius: float = 25,
+                      unit: Optional[str] = None, tolerance: float = 0.01",escrita,False,False,False,OK,test_escada_tools.py;test_contract.py;test_bugfixes.py,run_gear_live_test.py;run_measure_body_live_test.py;run_sketch_com_member_live_test.py;run_inspection_live_test.py;run_cut_extrude_through_all_both_live_test.py;run_drawing_live_test.py
+draw_rectangle,Esbocos e desenho 2D,Draw a rectangle in the active sketch given two opposite corners.,"x1: float = -50, y1: float = -25, x2: float = 50, y2: float = 25,
+                         unit: Optional[str] = None, tolerance: float = 0.01",escrita,False,False,False,OK,test_escada_tools.py;test_contract.py,run_measure_body_live_test.py;run_live_test_project.py;run_inspection_live_test.py;run_sheet_metal_weldment_live_test.py;run_hole_wizard_after_fillet_live_test.py;run_read_tools_live_test.py;run_drawing_live_test.py;run_insert_subassembly_origin_live_test.py
+draw_arc,Esbocos e desenho 2D,"Draw an arc in the active sketch given center, radius, and start/end angles (degrees).","cx: float = 0, cy: float = 0, radius: float = 25,
+                    start_angle: float = 0, end_angle: float = 90,
+                    unit: Optional[str] = N",escrita,False,False,False,OK,test_contract.py;test_bugfixes.py,run_sketch_com_member_live_test.py
+draw_spline,NAO MAPEADO NO README,"Draw a 2D B-spline through two or more [x, y] control points.","points: list[list[float]], natural_ends: bool = True,
+                      unit: Optional[str] = None, tolerance: float = 0.01",escrita,False,False,False,NAO DOCUMENTADO,test_contract.py,
+draw_polygon,Esbocos e desenho 2D,"Draw a regular, circumscribed polygon in the active sketch.","cx: float = 0, cy: float = 0, radius: float = 25, sides: int = 6,
+                       unit: Optional[str] = None, tolerance: float = 0.01",escrita,False,False,False,OK,test_contract.py,
+draw_profile,Esbocos e desenho 2D,"Draw a COMPUTED curve as one chain of segments, snap-proof, in one call.","points: list[list[float]], closed: bool = True,
+                       unit: Optional[str] = None, tolerance: float = 0.01,
+                       verify_points",escrita,False,False,False,OK,test_escada_tools.py;test_contract.py;test_end_cut.py,run_gear_live_test.py
+add_sketch_dimension,Esbocos e desenho 2D,Add a driving dimension to sketch entities selected by coordinate.,"x1: float, y1: float,
+                                x2: Optional[float] = None, y2: Optional[float] = None,
+                                dim_x: float = 0, ",escrita,False,False,False,OK,,
+add_sketch_relation,Esbocos e desenho 2D,Add a geometric relation (constraint) between sketch entities selected by coordinate.,"relation: str, x1: float, y1: float,
+                                x2: Optional[float] = None, y2: Optional[float] = None,
+                                uni",escrita,False,False,False,OK,,
+extrude_sketch,Features 3D,Boss-extrude the last sketch drawn; set merge=False to keep a separate body.,"depth: float = 10, both_directions: bool = False,
+                         merge: bool = True, unit: Optional[str] = None,
+                         tolerance: f",escrita,False,False,False,OK,test_escada_tools.py;test_contract.py,run_gear_live_test.py;run_measure_body_live_test.py;run_live_test_project.py;run_inspection_live_test.py;run_sheet_metal_weldment_live_test.py;run_hole_wizard_after_fillet_live_test.py;run_read_tools_live_test.py;run_cut_extrude_through_all_both_live_test.py;run_drawing_live_test.py;run_insert_subassembly_origin_live_test.py
+cut_extrude,Features 3D,"Cut-extrude the last sketch drawn, removing material from the body.","depth: float = 10, through_all: bool = False,
+                       both_directions: bool = False, unit: Optional[str] = None,
+                       tolerance",escrita,False,False,False,OK,test_contract.py;test_bugfixes.py;test_end_cut.py,run_gear_live_test.py;run_inspection_live_test.py;run_cut_extrude_through_all_both_live_test.py
+revolve_sketch,Features 3D,Revolve the last sketch around its centerline axis.,"angle: float = 360, both_directions: bool = False,
+                          cut: bool = False, reverse: bool = False,
+                          unit: Optional[",escrita,False,False,False,OK,test_contract.py,
+sweep_sketch,Features 3D,Sweep a closed profile sketch along a path sketch to create a solid.,"profile_sketch: str, path_sketch: str",escrita,False,False,False,OK,,
+loft_sketches,Features 3D,Loft between two or more closed profile sketches to create a solid.,sketch_names: list,escrita,False,False,False,OK,,
+fillet_edges,Features 3D,Apply a constant-radius fillet to every edge of the solid body/bodies.,"radius: float = 2, unit: Optional[str] = None, force: bool = False,
+                       tolerance: float = 0.01",escrita,False,False,False,OK,test_contract.py,run_hole_wizard_after_fillet_live_test.py;run_read_tools_live_test.py
+chamfer_edges,Features 3D,Apply a distance/angle chamfer to every edge of the solid body/bodies.,"distance: float = 2, angle: float = 45, unit: Optional[str] = None,
+                        force: bool = False, tolerance: float = 0.01",escrita,False,False,False,OK,test_contract.py,run_hole_wizard_after_fillet_live_test.py
+shell_body,Features 3D,Hollow out the solid body leaving thin walls.,"thickness: float = 2, remove_face_at_x: Optional[float] = None,
+                      remove_face_at_y: Optional[float] = None,
+                      remove_fac",escrita,False,False,False,OK,test_contract.py,run_sheet_metal_weldment_live_test.py
+linear_pattern,Features 3D,Repeat a feature in a linear pattern.,"feature_name: str, direction: str = ""x"",
+                          count: int = 2, spacing: float = 20,
+                          count2: int = 1, spacing2: flo",escrita,False,False,False,OK,test_contract.py,
+circular_pattern,Features 3D,Repeat a feature in a circular pattern around an axis.,"feature_name: str, axis: str = ""z"",
+                             count: int = 4, angle: float = 360",escrita,False,False,False,OK,test_contract.py,run_gear_live_test.py
+hole_wizard,Features 3D,Create a hole using the Hole Wizard on a face.,"face_x: float, face_y: float, face_z: float,
+                       hole_x: float, hole_y: float,
+                       hole_type: str = ""simple"",
+            ",escrita,False,False,False,OK,test_bugfixes.py,run_hole_wizard_after_fillet_live_test.py
+create_weldment_profile,Perfis estruturais (weldments),Create a structural member (weldment profile) along sketch segments.,"standard: str,
+    profile_type: str,
+    size: str,
+    sketch_name: str,
+    groups: Optional[list] = None,
+    unit: Optional[str] = None,",escrita,False,False,False,MIXED,,run_sheet_metal_weldment_live_test.py
+trim_extend_structural,Perfis estruturais (weldments),Trim or extend a structural member (weldment body) at an intersection.,"body_to_trim: str,
+    trim_boundary: str,
+    trim_type: str = ""trim"",",escrita,False,False,False,MIXED,,run_sheet_metal_weldment_live_test.py
+add_gusset,Perfis estruturais (weldments),Add a gusset plate (reinforcement triangle) between two planar faces.,"thickness: float = 5,
+    x1: float = 0, y1: float = 0, z1: float = 0,
+    x2: float = 0, y2: float = 0, z2: float = 0,
+    profile: str = ""triangular"",
+    leg",escrita,False,False,False,MIXED,test_bugfixes.py,run_sheet_metal_weldment_live_test.py
+add_end_cap,Perfis estruturais (weldments),Add an end cap to a structural member (weldment body).,"face_x: float = 0, face_y: float = 0, face_z: float = 0,
+    thickness: float = 2,
+    offset: float = 0,
+    unit: Optional[str] = None,",escrita,False,False,False,EXP,,run_sheet_metal_weldment_live_test.py
+create_3d_sketch,Esbocos e desenho 2D,Open a new 3D sketch.,,escrita,False,False,False,OK,,run_sheet_metal_weldment_live_test.py
+draw_line_3d,Esbocos e desenho 2D,"Draw a line in a 3D sketch from (x1,y1,z1) to (x2,y2,z2).","x1: float = 0, y1: float = 0, z1: float = 0,
+    x2: float = 100, y2: float = 0, z2: float = 0,
+    unit: Optional[str] = None,
+    tolerance: float = 0.01,",escrita,False,False,False,OK,test_contract.py,run_sheet_metal_weldment_live_test.py
+create_base_flange,Chapa metalica,Create a sheet metal base flange from the last sketch.,"thickness: float = 2,
+    depth: float = 100,
+    direction: str = ""blind"",
+    both_directions: bool = False,
+    bend_radius: float = 1,
+    unit: Optional[st",escrita,False,False,False,OK,,run_sheet_metal_weldment_live_test.py
+add_sheet_metal_bend,Chapa metalica,"Convert a shelled/thin part into sheet metal, adding bends at sharp edges.","face_x: float = 0, face_y: float = 0, face_z: float = 0,
+    bend_radius: float = 1,
+    unit: Optional[str] = None,",escrita,False,False,False,OK,,run_sheet_metal_weldment_live_test.py
+add_sheet_metal_edge_flange,Chapa metalica,Add an edge flange to a sheet metal part.,"edge_x: float = 0, edge_y: float = 0, edge_z: float = 0,
+    flange_length: float = 20,
+    flange_angle: float = 90,
+    unit: Optional[str] = None,",escrita,False,False,False,OK,,run_sheet_metal_weldment_live_test.py
+flatten_sheet_metal,Chapa metalica,Put a sheet metal part into its flat or folded state.,"state: str = ""flat""",escrita,False,True,False,OK,test_bugfixes.py;conftest.py,run_sheet_metal_weldment_live_test.py
+create_helix,Perfis estruturais (weldments),Create a helix / spiral curve.,"diameter: float = 10,
+    pitch: float = 1.5,
+    revolutions: float = 10,
+    start_angle: float = 0,
+    clockwise: bool = True,
+    unit: Optional[str] = Non",escrita,False,False,False,EXP,,
+add_thread_feature,Roscas / usinagem,Mark where a real 3D thread should go (delegates to a cosmetic thread).,"edge_x: float = 0, edge_y: float = 0, edge_z: float = 0,
+    thread_type: str = ""metric"",
+    size: str = ""M6x1.0"",
+    length: float = 20,
+    internal: bool =",escrita,False,False,False,MIXED,,
+add_cosmetic_thread,Roscas / usinagem,"Add a cosmetic thread (visual/annotation only, no real geometry cut).","edge_x: float = 0, edge_y: float = 0, edge_z: float = 0,
+    minor_diameter: float = 5.0,
+    length: Optional[float] = None,
+    standard: str = ""ISO"",
+    uni",escrita,False,False,False,EXP,,
+create_knurl,Roscas / usinagem,Create a knurled pattern on a cylindrical face.,"face_x: float = 0, face_y: float = 0, face_z: float = 0,
+    pattern: str = ""diamond"",
+    pitch: float = 0.5,
+    depth: float = 0.3,
+    angle: float = 30,
+  ",escrita,False,False,False,EXP,test_contract.py,run_gear_live_test.py
+create_gear,NAO MAPEADO NO README,Create a standard external spur gear with true involute teeth.,"module: float = 2.0,
+    teeth: int = 20,
+    face_width: float = 10.0,
+    pressure_angle: float = 20.0,
+    bore_diameter: float = 0.0,
+    plane: str = ""fron",escrita,False,False,False,NAO DOCUMENTADO,test_contract.py,
+add_rib,Operacoes de corpo / referencia,Add a rib (thin reinforcing wall) using the last sketch as its centerline.,"thickness: float = 3,
+    direction: str = ""parallel"",
+    flip: bool = False,
+    unit: Optional[str] = None,",escrita,False,False,False,EXP,,
+mirror_feature,Operacoes de corpo / referencia,"Mirror an existing feature (hole, cut, boss, etc.) across a plane.","feature_name: str,
+    plane: str = ""front"",",escrita,False,False,False,OK,,
+mirror_body,Operacoes de corpo / referencia,Mirror an entire solid body across a plane.,"body_name: str,
+    plane: str = ""front"",
+    merge: bool = False,",escrita,False,False,False,OK,,
+move_copy_body,Operacoes de corpo / referencia,Move or copy a solid body by translation and/or rotation.,"body_name: str,
+    dx: float = 0, dy: float = 0, dz: float = 0,
+    rx: float = 0, ry: float = 0, rz: float = 0,
+    copy: bool = False,
+    num_copies: int = ",escrita,False,False,False,OK,test_escada_tools.py;test_contract.py,run_escada_cortes_live_test.py
+combine_bodies,Operacoes de corpo / referencia,Combine two or more solid bodies with a boolean operation.,"operation: str = ""add"",
+    main_body: Optional[str] = None,
+    tool_bodies: Optional[list] = None,",destrutiva,True,False,False,EXP,,
+create_reference_plane,Operacoes de corpo / referencia,Create a new reference plane offset (or rotated) from an existing plane.,"reference: str = ""front"",
+    offset: float = 50,
+    angle: float = 0,
+    angle_about: Optional[str] = None,
+    flip: bool = False,
+    unit: Optional[str] =",escrita,False,False,False,OK,test_bugfixes.py,run_sheet_metal_weldment_live_test.py
+create_reference_axis,Operacoes de corpo / referencia,Create a reference axis.,"method: str = ""two_planes"",
+    ref1: str = ""front"",
+    ref2: str = ""top"",
+    face_x: float = 0, face_y: float = 0, face_z: float = 0,
+    unit: Optional[str]",escrita,False,False,False,EXP,,
+split_body,Operacoes de corpo / referencia,Split a solid body into multiple pieces using a cutting tool.,"tool_type: str = ""plane"",
+    plane: str = ""front"",
+    face_x: float = 0, face_y: float = 0, face_z: float = 0,
+    consume_original: bool = False,
+    unit: O",destrutiva,True,False,False,EXP,,
+get_drawing_layout,NAO MAPEADO NO README,Describe every sheet of the active drawing as data.,,leitura,False,False,False,NAO DOCUMENTADO,test_contract.py,run_drawing_live_test.py
+get_view_entities,NAO MAPEADO NO README,"List the visible edges of a drawing view, each with a stable ID.","view_name: str, kinds: str = ""line,circle,arc"",
+                            min_length_mm: float = 0.0,
+                            max_results: int = 200",leitura,False,False,False,NAO DOCUMENTADO,test_contract.py;test_alfa_drawing.py;test_bugfixes.py,run_drawing_live_test.py
+get_view_dimensions,NAO MAPEADO NO README,List the dimensions already shown in a drawing view.,view_name: str,leitura,False,False,False,NAO DOCUMENTADO,test_contract.py,run_drawing_live_test.py
+dimension_by_entity_ids,NAO MAPEADO NO README,Dimension one or two entities by the IDs from get_view_entities.,"entity_ids: list[str], side: str = ""auto"",
+                                  expected_mm: Optional[float] = None,
+                                  tolerance_mm",escrita,False,False,False,NAO DOCUMENTADO,test_contract.py;test_bugfixes.py,run_drawing_live_test.py
+verify_drawing,NAO MAPEADO NO README,Check the active drawing and return every problem found. Read-only.,"require_hole_dimensions: bool = True,
+                         require_overall_extents: bool = True,
+                         require_cut_angles: bool = True,
+ ",leitura,False,False,False,NAO DOCUMENTADO,test_contract.py,run_drawing_live_test.py
+insert_section_view,Desenho tecnico detalhado,Insert a section view (cut-through) into the active drawing.,"x1: float, y1: float, x2: float, y2: float,
+    place_x: float = 250, place_y: float = 150,
+    unit: Optional[str] = None,",escrita,False,False,False,MIXED,,run_live_test_project.py
+insert_detail_view,Desenho tecnico detalhado,Insert a detail view (magnified close-up) into the active drawing.,"center_x: float, center_y: float, radius: float,
+    place_x: float = 300, place_y: float = 150,
+    scale: float = 2.0,
+    unit: Optional[str] = None,",escrita,False,False,False,MIXED,,run_live_test_project.py
+insert_broken_view,Desenho tecnico detalhado,Add a broken view (removes the middle of a long part to save paper space).,"break_position1: float, break_position2: float,
+    orientation: str = ""vertical"",
+    gap: float = 10,
+    unit: Optional[str] = None,",escrita,False,False,False,MIXED,,run_live_test_project.py
+insert_auxiliary_view,Desenho tecnico detalhado,Insert an auxiliary view projected perpendicular to a selected edge.,"edge_x: float, edge_y: float,
+    place_x: float = 300, place_y: float = 200,
+    unit: Optional[str] = None,",escrita,False,False,False,MIXED,,run_live_test_project.py
+add_drawing_dimension,Desenho tecnico detalhado,"Add a dimension to the active drawing, picking entities by sheet point.","x1: float, y1: float,
+    x2: Optional[float] = None, y2: Optional[float] = None,
+    place_x: Optional[float] = None, place_y: Optional[float] = None,
+    expe",escrita,False,False,False,MIXED,test_contract.py,run_live_test_project.py;run_drawing_live_test.py
+add_drawing_annotation,Desenho tecnico detalhado,Add a free text note to the active drawing.,"text: str,
+    x: float = 100, y: float = 100,
+    height: float = 3.5,
+    unit: Optional[str] = None,",escrita,False,False,False,OK,,run_live_test_project.py
+add_centerline,Desenho tecnico detalhado,Add a centerline (dashed axis line) to the active drawing.,"x1: float, y1: float, x2: float, y2: float,
+    unit: Optional[str] = None,",escrita,False,False,False,MIXED,,run_live_test_project.py
+add_weld_symbol,Desenho tecnico detalhado,Add a welding symbol to the active drawing at a point on an edge.,"x: float, y: float,
+    weld_type: str = ""fillet"",
+    size: float = 5,
+    unit: Optional[str] = None,",escrita,False,False,False,OK,,run_live_test_project.py;run_sheet_metal_weldment_live_test.py
+add_surface_finish,Desenho tecnico detalhado,Add a surface finish symbol (roughness callout) to the active drawing.,"x: float, y: float,
+    ra_value: float = 3.2,
+    symbol_type: str = ""machined"",
+    unit: Optional[str] = None,",escrita,False,False,False,MIXED,,run_live_test_project.py
+add_gdt_symbol,Desenho tecnico detalhado,Add a geometric tolerance (GD&T) feature control frame to the drawing.,"x: float, y: float,
+    symbol: str = ""position"",
+    tolerance: float = 0.1,
+    datum: str = ""A"",
+    unit: Optional[str] = None,",escrita,False,False,False,MIXED,,run_live_test_project.py
+add_balloon,Desenho tecnico detalhado,Add a BOM balloon (numbered callout) to a component in the drawing.,"x: float, y: float,
+    unit: Optional[str] = None,",escrita,False,False,False,MIXED,,run_live_test_project.py
+insert_bom_table,Desenho tecnico detalhado,Insert a Bill of Materials (BOM) table into the active drawing.,"x: float = 300, y: float = 200,
+    template: str = """",
+    unit: Optional[str] = None,",escrita,False,False,False,MIXED,,run_live_test_project.py
+insert_cut_list_table,Desenho tecnico detalhado,Insert a weldment cut list table into the active drawing.,"x: float = 300, y: float = 200,
+    template: str = """",
+    unit: Optional[str] = None,",escrita,False,False,False,MIXED,,run_live_test_project.py
+create_exploded_view,Montagem,Create an exploded view of the active assembly.,"explode_distance: float = 100,
+    direction: str = ""y"",
+    unit: Optional[str] = None,",escrita,False,False,False,EXP,,run_live_test_project.py
+delete_mate,NAO MAPEADO NO README,Delete a named assembly mate and verify it no longer exists.,name: str,destrutiva,True,False,False,NAO DOCUMENTADO,,
+add_advanced_mate,Montagem,Add an advanced mate between two entities selected by point.,"mate_type: str,
+    x1: float, y1: float, z1: float,
+    x2: float, y2: float, z2: float,
+    value: float = 0,
+    gear_ratio_numerator: float = 1.0,
+    gear_",escrita,False,False,False,EXP,test_contract.py,run_live_test_project.py
+add_cam_follower_mate,Montagem,Create a stable cam-follower mate using ``CreateMateData``/``CreateMate``.,"cam_ray_origin: list[float],
+    cam_ray_direction: list[float],
+    follower_ray_origin: list[float],
+    follower_ray_direction: list[float],
+    ray_radius: ",escrita,False,False,False,OK,test_contract.py,run_live_test_project.py
+add_screw_mate,Montagem,Create a screw mate from two cylindrical entities selected by rays.,"first_ray_origin: list[float],
+    first_ray_direction: list[float],
+    second_ray_origin: list[float],
+    second_ray_direction: list[float],
+    ray_radius: ",escrita,False,False,False,OK,test_contract.py,run_live_test_project.py
+add_rack_pinion_mate,Montagem,Create a rack-and-pinion mate from a rack edge and a pinion cylinder.,"rack_ray_origin: list[float],
+    rack_ray_direction: list[float],
+    pinion_ray_origin: list[float],
+    pinion_ray_direction: list[float],
+    ray_radius: fl",escrita,False,False,False,OK,test_contract.py,run_live_test_project.py
+interference_check,Montagem,Check the active assembly for interferences (parts overlapping in space).,,leitura,False,False,False,OK,,run_live_test_project.py
+create_assembly_pattern,Montagem,Pattern a component within the active assembly.,"component_name: str,
+    pattern_type: str = ""linear"",
+    direction: str = ""x"",
+    count: int = 3,
+    spacing: float = 100,
+    axis_face_x: float = 0, axis_",escrita,False,False,False,EXP,,run_live_test_project.py
+lookup_material_properties,Operacoes de corpo / referencia,Read a material's real physical properties from the SolidWorks library.,"material: str = """",
+                                     database: str = ""SOLIDWORKS Materials"",
+                                     search: str = """"",leitura,False,False,False,INDEFINIDO (header sem sufixo claro),test_bugfixes.py,run_measure_body_live_test.py
+set_material,Operacoes de corpo / referencia,Assign a material to the active part.,"material: str = ""AISI 1020"",
+    database: str = ""SOLIDWORKS Materials"",",escrita,False,True,False,OK,test_escada_tools.py;test_bugfixes.py,run_measure_body_live_test.py
+set_appearance,Operacoes de corpo / referencia,Set the color/appearance of the active part or a specific face.,"red: int = 255, green: int = 255, blue: int = 0,
+    target: str = ""body"",
+    face_x: float = 0, face_y: float = 0, face_z: float = 0,
+    unit: Optional[str] ",escrita,False,True,False,OK,,
+get_appearance_properties,NAO MAPEADO NO README,"Read the active document's RGB, reflection, transparency, and emission.",,leitura,False,False,False,NAO DOCUMENTADO,,
+set_appearance_properties,NAO MAPEADO NO README,Set color plus all native SolidWorks reflection/opacity channels.,"red: int = 210, green: int = 215, blue: int = 220,
+    ambient: float = 0.35, diffuse: float = 0.85,
+    specular: float = 0.70, shininess: float = 0.70,
+    tr",escrita,False,True,False,NAO DOCUMENTADO,,
+apply_texture,NAO MAPEADO NO README,Apply an image texture to the active model or a selected face.,"texture_path: str,
+    scale: float = 1.0,
+    angle: float = 0.0,
+    blend_with_color: bool = True,
+    target: str = ""model"",
+    face_x: float = 0, face_y: ",escrita,False,True,False,NAO DOCUMENTADO,,
+remove_texture,NAO MAPEADO NO README,Remove the native texture from the active model or a selected face.,"target: str = ""model"",
+    face_x: float = 0, face_y: float = 0, face_z: float = 0,
+    unit: Optional[str] = None,",escrita,False,True,False,NAO DOCUMENTADO,,
+apply_metal_finish,NAO MAPEADO NO README,Apply a native SolidWorks metallic visual finish to a body or face.,"finish: str = ""chrome"",
+    target: str = ""body"",
+    face_x: float = 0, face_y: float = 0, face_z: float = 0,
+    unit: Optional[str] = None,",escrita,False,True,False,NAO DOCUMENTADO,,
+list_p2m_appearances,NAO MAPEADO NO README,List native P2M/render appearances linked to the active display state.,"scope: str = ""this""",leitura,False,False,False,NAO DOCUMENTADO,,
+apply_p2m_appearance,NAO MAPEADO NO README,Apply a native SolidWorks ``.p2m`` appearance to the active model.,"appearance_path: str,
+    scope: str = ""this"",
+    display_state: str = """",",escrita,False,True,False,NAO DOCUMENTADO,,
+create_spur_gear,Esbocos e desenho 2D,Create an involute spur gear WITH REAL TEETH in the ACTIVE part document.,"module: float = 2.0,
+    teeth: int = 20,
+    thickness: float = 10.0,
+    pressure_angle: float = 20.0,
+    bore_diameter: float = 0.0,
+    plane: str = ""front",escrita,False,False,False,EXP,test_contract.py;test_gear_geometry.py;test_gear_phase_keyway.py,run_gear_live_test.py
+create_configuration,Propriedades / Medicao / Exportacao / Configuracoes,Create a new configuration (design variant) in the active document.,"name: str,
+    comment: str = """",
+    parent: str = """",",escrita,False,False,False,OK,,
+switch_configuration,Propriedades / Medicao / Exportacao / Configuracoes,Switch the active document to a named configuration.,name: str,escrita,False,True,False,OK,,
+list_features,Features 3D,List every feature in the active document's feature tree.,,leitura,False,False,False,OK,,run_inspection_live_test.py;run_sheet_metal_weldment_live_test.py;run_read_tools_live_test.py
+delete_feature,Features 3D,Delete a named feature from the active part/assembly's FeatureManager tree.,"name: str, delete_children: bool = True",destrutiva,True,False,False,OK,test_contract.py,
+get_custom_properties,Montagem,Read all custom properties from the active document.,"config: str = """"",leitura,False,False,False,INDEFINIDO (header sem sufixo claro),,
+set_custom_property,Propriedades / Medicao / Exportacao / Configuracoes,Set a custom property on the active document. Creates it if it doesn't exist.,"name: str, value: str, config: str = """"",escrita,False,True,False,OK,test_escada_tools.py,
+measure_body,Operacoes de corpo / referencia,"Measure the active document's solid body: mass, volume, surface area,",,leitura,False,False,False,INDEFINIDO (header sem sufixo claro),test_escada_tools.py;test_contract.py;test_bugfixes.py,run_gear_live_test.py;run_measure_body_live_test.py;run_drawing_live_test.py
+capture_viewport,NAO MAPEADO NO README,Return the SolidWorks viewport exactly as it currently appears on screen.,output_path: Optional[str] = None,leitura,False,False,False,NAO DOCUMENTADO,test_bugfixes.py,run_inspection_live_test.py;run_sheet_metal_weldment_live_test.py
+get_selection,NAO MAPEADO NO README,Read what is currently selected in SolidWorks.,unit: Optional[str] = None,leitura,False,False,False,NAO DOCUMENTADO,,run_inspection_live_test.py
+list_faces,NAO MAPEADO NO README,"Inventory the solid faces of the active part, each with a usable pick point.","surface_type: Optional[str] = None,
+    min_area: float = 0.0,
+    max_faces: int = 200,
+    unit: Optional[str] = None,",leitura,False,False,False,NAO DOCUMENTADO,test_contract.py;test_bugfixes.py,run_inspection_live_test.py;run_sheet_metal_weldment_live_test.py;run_hole_wizard_after_fillet_live_test.py;run_cut_extrude_through_all_both_live_test.py
+rebuild_model,NAO MAPEADO NO README,Rebuild the active document and report whether SolidWorks accepted it.,"force: bool = True, top_only: bool = False",escrita,False,True,False,NAO DOCUMENTADO,,run_escada_cortes_live_test.py;run_inspection_live_test.py;run_sheet_metal_weldment_live_test.py;run_read_tools_live_test.py
+validate_model,NAO MAPEADO NO README,Rebuild and inspect the feature tree for SolidWorks errors and warnings.,,leitura,False,False,False,NAO DOCUMENTADO,test_bugfixes.py,run_gear_live_test.py;run_inspection_live_test.py;run_sheet_metal_weldment_live_test.py;run_hole_wizard_after_fillet_live_test.py;run_cut_extrude_through_all_both_live_test.py
+get_document_dependencies,NAO MAPEADO NO README,List referenced models and identify broken/read-only document links.,"traverse_all: bool = True,
+    search_paths: bool = True,
+    include_read_only: bool = True,
+    include_broken: bool = True,",leitura,False,False,False,NAO DOCUMENTADO,,
+get_persistent_reference,NAO MAPEADO NO README,"Create a portable base64 persistent ID for a model face, edge, or vertex.","entity_type: str,
+    x: float, y: float, z: float,
+    unit: Optional[str] = None,",leitura,False,False,False,NAO DOCUMENTADO,,
+resolve_persistent_reference,NAO MAPEADO NO README,Resolve a base64 persistent ID and optionally select its current entity.,"reference: str, select: bool = True",leitura,False,False,False,NAO DOCUMENTADO,,
+list_configurations,NAO MAPEADO NO README,"List all configurations, their descriptions, and the active configuration.",,leitura,False,False,False,NAO DOCUMENTADO,,
+delete_configuration,NAO MAPEADO NO README,Delete a non-active configuration from the active model.,name: str,destrutiva,True,False,False,NAO DOCUMENTADO,,
+list_equations,NAO MAPEADO NO README,List equations and global variables in the active document.,,leitura,False,False,False,NAO DOCUMENTADO,,
+add_equation,NAO MAPEADO NO README,"Add an equation or global variable, e.g. ``\""Length\"" = 25mm``.","equation: str, solve: bool = True",escrita,False,False,False,NAO DOCUMENTADO,test_bugfixes.py,
+set_equation,NAO MAPEADO NO README,Replace an equation by index and optionally evaluate it immediately.,"index: int, equation: str, solve: bool = True",escrita,False,True,False,NAO DOCUMENTADO,test_bugfixes.py,
+delete_equation,NAO MAPEADO NO README,Delete an equation or global variable by zero-based index.,index: int,destrutiva,True,False,False,NAO DOCUMENTADO,,
+export_flat_pattern_dxf,NAO MAPEADO NO README,Export a sheet-metal flat pattern to DXF/DWG using ``IPartDoc.ExportToDWG2``.,"filepath: str,
+    include_hidden_edges: bool = False,
+    include_bend_lines: bool = True,
+    include_sketches: bool = False,
+    include_bounding_box: bool =",destrutiva,True,True,False,NAO DOCUMENTADO,test_bugfixes.py,
+pack_and_go,NAO MAPEADO NO README,Create a portable Pack and Go copy of the active saved SolidWorks document.,"destination: str,
+    include_drawings: bool = True,
+    include_suppressed: bool = True,
+    include_toolbox_components: bool = False,
+    flatten_to_single_fo",destrutiva,True,True,False,NAO DOCUMENTADO,test_bugfixes.py,
+list_display_states,NAO MAPEADO NO README,List display states for a configuration (or the active configuration).,"configuration: str = """"",leitura,False,False,False,NAO DOCUMENTADO,,
+create_display_state,NAO MAPEADO NO README,"Create a named display state, optionally applying it immediately.","name: str, configuration: str = """", activate: bool = False",escrita,False,False,False,NAO DOCUMENTADO,,
+apply_display_state,NAO MAPEADO NO README,Apply an existing display state in the requested configuration.,"name: str, configuration: str = """"",escrita,False,True,False,NAO DOCUMENTADO,,
+rename_display_state,NAO MAPEADO NO README,Rename one display state without changing its appearance data.,"old_name: str, new_name: str, configuration: str = """"",escrita,False,False,False,NAO DOCUMENTADO,,
+delete_display_state,NAO MAPEADO NO README,Delete a display state after confirming it belongs to the configuration.,"name: str, configuration: str = """"",destrutiva,True,False,False,NAO DOCUMENTADO,,
+set_units,Conexao / Documentos / Utilidades,"Set the default unit (mm, cm, m, in, or ft) used by tools when 'unit' is omitted.",unit: str,escrita,False,True,False,OK,test_contract.py;test_bugfixes.py,
+set_view,Conexao / Documentos / Utilidades,Set the camera view orientation.,"view_name: str = ""isometric""",escrita,False,True,False,OK,,run_gear_live_test.py;run_inspection_live_test.py;run_read_tools_live_test.py
+zoom_to_fit,Conexao / Documentos / Utilidades,Zoom the view to fit the entire model in the viewport.,,escrita,False,True,False,OK,,run_gear_live_test.py
+zoom_to_area,Conexao / Documentos / Utilidades,Zoom into a rectangular area defined by two corner points (screen-mapped to model).,"x1: float, y1: float, x2: float, y2: float, unit: Optional[str] = None",escrita,False,True,False,OK,,
+get_view_state,Conexao / Documentos / Utilidades,Read the camera state the user is actually looking at right now.,,leitura,False,False,False,OK,,run_read_tools_live_test.py
+list_macro_methods,Macros VBA,List the entry points inside a SolidWorks macro WITHOUT executing it.,path: str,leitura,False,False,False,OK,,run_macro_live_test.py
+run_macro,Macros VBA,Run a procedure from an existing SolidWorks macro file (.swp/.swb/.dll).,"path: str,
+    module: str = """",
+    procedure: str = """",
+    unload_after: bool = True,",destrutiva,True,False,True,OK,test_contract.py,run_macro_live_test.py
+create_profile_part,NAO MAPEADO NO README,"Build ONE finished prismatic part in a single call: new part, sketch,","save_path: str,
+    outline: dict,
+    depth: float,
+    holes: Optional[list[dict]] = None,
+    plane: str = ""front"",
+    both_directions: bool = False,
+    ro",escrita,False,False,False,NAO DOCUMENTADO,test_escada_tools.py,run_escada_industrial_live_test.py
+create_tube_part,NAO MAPEADO NO README,"Create a real HOLLOW tube part (rectangular, square or round) and save it.","save_path: str,
+    section: str,
+    length: float,
+    wall: float,
+    width: Optional[float] = None,
+    height: Optional[float] = None,
+    outer_diameter:",escrita,False,False,False,NAO DOCUMENTADO,test_escada_tools.py,run_escada_industrial_live_test.py
+add_mate_by_name,NAO MAPEADO NO README,"Mate two entities chosen BY NAME, including the origin planes of components.","mate_type: str,
+    entity1: dict,
+    entity2: dict,
+    value: float = 0,
+    align: str = ""closest"",
+    flip: bool = False,
+    tolerance: float = 0.05,
+   ",escrita,False,False,False,NAO DOCUMENTADO,test_escada_tools.py,run_escada_industrial_live_test.py
+interference_report,NAO MAPEADO NO README,"Detailed interference detection: WHICH components, how much volume, and","subassemblies_as_components: bool = False,
+    include_multibody: bool = True,
+    max_pairs: int = 200,
+    min_volume_mm3: float = 0.0,",leitura,False,False,False,NAO DOCUMENTADO,test_escada_tools.py,run_escada_cortes_live_test.py
+set_view_direction,NAO MAPEADO NO README,Point the camera from direction ``eye`` (model -> camera) with ``up`` upwards,"eye: list[float],
+    up: Optional[list[float]] = None,
+    zoom_to_fit_after: bool = True,
+    output_path: Optional[str] = None,",escrita,False,True,False,NAO DOCUMENTADO,test_escada_tools.py,run_escada_cortes_live_test.py
+cut_part_end,Features 3D,End cut / miter: slice a tube or profile part with a PLANE so its end becomes,"normal: list[float],
+    offset: Optional[float] = None,
+    point: Optional[list[float]] = None,
+    origin: Optional[list[float]] = None,
+    part_path: Optio",destrutiva,True,False,False,OK,test_end_cut.py,run_escada_cortes_live_test.py
+execute_python,Conexao / Documentos / Utilidades (condicional),Run privileged Python with sw and doc in scope (so registrada se SOLIDWORKS_MCP_ENABLE_EXECUTE_PYTHON=1),code: str,destrutiva,True,False,True,"OK (desligada por padrao, confirmado em server.py:15048)",tests/test_contract.py (verifica ausencia quando desabilitada),
