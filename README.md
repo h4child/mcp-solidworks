@@ -330,10 +330,10 @@ gerenciador de propriedades ou de uma vista de modelo com estado especifico:
 `add_surface_finish`, `add_gdt_symbol`, `add_balloon`, `insert_bom_table`,
 `insert_cut_list_table`.
 
-### Cobertura desta matriz (auditoria de 15/10/2026)
+### Cobertura desta matriz (auditoria de 15/10/2026, atualizada)
 Este servidor registra 158 ferramentas incondicionais + `execute_python`
 (condicional). A matriz OK/EXP acima -- a mesma lida ao vivo pelo resource
-`solidworks://tool-status` -- cobre 137 delas. As 47 ferramentas abaixo não
+`solidworks://tool-status` -- cobre 137 delas. As ferramentas abaixo não
 têm status OK/EXP registrado aqui (não é o mesmo que "falhou": a maioria
 (`list_*`, `get_*`, `delete_*`, `set_*` simples) tem alta chance de funcionar
 pelo mesmo padrão COM de ferramentas vizinhas já marcadas OK, mas isso não foi
@@ -353,7 +353,38 @@ testado ao vivo e não deve ser assumido pela IA que lê este resource):
 `list_display_states`, `create_display_state`, `apply_display_state`,
 `rename_display_state`, `delete_display_state`, `create_profile_part`,
 `create_tube_part`, `add_mate_by_name`, `interference_report`,
-`set_view_direction`.
+`set_view_direction`, `get_default_templates`, `set_default_templates`,
+`create_document_from_template`, `save_as_template`, `run_command_by_id`,
+`set_section_view`, `clear_section_view` (as últimas 7, adicionadas em
+17/10/2026 -- ver seção abaixo).
+
+### Templates, System Options e vista em corte 3D (17/10/2026, não verificado ao vivo)
+Sete ferramentas novas:
+- `get_default_templates`/`set_default_templates` -- leem/gravam os System
+  Options "Default Templates" (part/assembly/drawing) via
+  `GetUserPreferenceStringValue`/`SetUserPreferenceStringValue` nos índices
+  8/9/10 -- os mesmos índices que `_find_template` já usa ao vivo (confirmado)
+  para `create_new_part`/`create_new_assembly`/`create_new_drawing`.
+- `create_document_from_template` -- cria um documento a partir de um arquivo
+  de template específico (não o default configurado), via `NewDocument` com o
+  mesmo formato de chamada já usado por `create_new_part` etc.
+- `save_as_template` -- salva o documento ativo como `.prtdot`/`.asmdot`/
+  `.drwdot`, validando que a extensão bate com o tipo do documento antes de
+  chamar `SaveAs` (reaproveita o mesmo mecanismo de `save_document`).
+- `run_command_by_id` -- escape hatch genérico para `ISldWorks::RunCommand`
+  (executa qualquer comando de UI pelo ID numérico `swCommands_e`). Marcado
+  `openWorldHint=True`: o efeito depende inteiramente do ID passado.
+- `set_section_view`/`clear_section_view` -- mostram/escondem o modelo
+  "cortado" por um plano **só na vista 3D** (não remove material de verdade,
+  ao contrário de `cut_extrude`). **O nome exato do método COM para isto não
+  está documentado neste repositório nem foi confirmado ao vivo** -- a
+  ferramenta tenta uma lista de nomes plausíveis (`SectionViewOn3`/`2`/sem
+  sufixo) e o retorno (`applied_via_method`) diz exatamente qual funcionou,
+  ou `null` se nenhum funcionou (nesse caso, usar `run_command_by_id` com o
+  ID correto do comando "Section View" nesta versão do SolidWorks).
+
+**Nenhuma destas 7 ferramentas foi testada contra um SolidWorks real** -- ver
+`LIVE_TESTS_REQUIRED.md`, item LT-10.
 
 ### `apply_texture`: mapeamento U/V real + relevo/blend best-effort (15/10/2026, não verificado ao vivo)
 `apply_texture` chamava `extension.CreateTexture(path, scale, angle,

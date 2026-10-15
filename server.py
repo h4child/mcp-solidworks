@@ -2217,6 +2217,181 @@ async def create_new_drawing() -> dict:
     return await _run(_impl)
 
 
+# swUserPreferenceStringValue_e indices for the three default-template System
+# Options (same constants _find_template already uses and that are confirmed
+# live -- see the README note next to create_new_part/create_new_assembly/
+# create_new_drawing about indices 8/9/10 vs. the unrelated 4/5/6, which
+# return the templates FOLDER instead and silently make NewDocument create a
+# blank Part).
+_DEFAULT_TEMPLATE_PREF_INDEX = {"part": 8, "assembly": 9, "drawing": 10}
+_TEMPLATE_EXTENSION = {"part": ".prtdot", "assembly": ".asmdot", "drawing": ".drwdot"}
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def get_default_templates() -> dict:
+    """Read SolidWorks' System Options > Default Templates (part/assembly/drawing).
+
+    These are the templates create_new_part/create_new_assembly/
+    create_new_drawing resolve through _find_template when none is
+    configured, falling back to a search of the installed templates folder.
+    """
+
+    def _impl():
+        app = _connect()
+        result = {}
+        for kind, pref_index in _DEFAULT_TEMPLATE_PREF_INDEX.items():
+            try:
+                path = app.GetUserPreferenceStringValue(pref_index)
+            except Exception as exc:
+                path = None
+                result[f"{kind}_error"] = str(exc)
+            result[kind] = path or None
+            if path:
+                result[f"{kind}_exists"] = os.path.isfile(path)
+        return result
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+async def set_default_templates(part: Optional[str] = None,
+                                 assembly: Optional[str] = None,
+                                 drawing: Optional[str] = None) -> dict:
+    """Set SolidWorks' System Options > Default Templates (part/assembly/drawing).
+
+    Pass only the kinds you want to change; omit the rest. Each path must
+    already exist and have the matching extension (.prtdot/.asmdot/.drwdot) --
+    SolidWorks accepts a wrong extension without complaint and then silently
+    creates the wrong document type later (the exact failure _find_template's
+    docstring already warns about for index 4/5/6).
+    """
+
+    requested = {"part": part, "assembly": assembly, "drawing": drawing}
+    for kind, path in requested.items():
+        if path is None:
+            continue
+        abs_path = os.path.abspath(path)
+        if not os.path.isfile(abs_path):
+            raise FileNotFoundError(f"{kind} template not found: {abs_path}")
+        expected_ext = _TEMPLATE_EXTENSION[kind]
+        if os.path.splitext(abs_path)[1].lower() != expected_ext:
+            raise ValueError(
+                f"{kind} template must end in '{expected_ext}', got '{abs_path}'."
+            )
+
+    def _impl():
+        app = _connect()
+        applied = {}
+        for kind, path in requested.items():
+            if path is None:
+                continue
+            abs_path = os.path.abspath(path)
+            pref_index = _DEFAULT_TEMPLATE_PREF_INDEX[kind]
+            ok = bool(app.SetUserPreferenceStringValue(pref_index, abs_path))
+            if not ok:
+                raise RuntimeError(f"SolidWorks rejected the {kind} default template '{abs_path}'.")
+            read_back = app.GetUserPreferenceStringValue(pref_index)
+            applied[kind] = {"path": abs_path, "verified": read_back == abs_path}
+        if not applied:
+            raise ValueError("Pass at least one of part/assembly/drawing.")
+        return applied
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def create_document_from_template(template_path: str,
+                                         paper_size: int = 0,
+                                         width: float = 0.0,
+                                         height: float = 0.0,
+                                         unit: Optional[str] = None) -> dict:
+    """Create a new document from a SPECIFIC template file (not the default one).
+
+    Use this instead of create_new_part/create_new_assembly/create_new_drawing
+    when you need a particular company/project template rather than
+    SolidWorks' configured default. ``template_path`` must exist and end in
+    .prtdot/.asmdot/.drwdot. ``paper_size``/``width``/``height`` only matter
+    for a drawing template using a custom sheet size (``paper_size=0`` with
+    width/height in the active unit; non-zero ``paper_size`` uses a standard
+    size and ignores width/height) -- same ``NewDocument`` call
+    create_new_part/create_new_assembly/create_new_drawing already use.
+    """
+
+    abs_path = os.path.abspath(template_path)
+    if not os.path.isfile(abs_path):
+        raise FileNotFoundError(f"Template not found: {abs_path}")
+    ext = os.path.splitext(abs_path)[1].lower()
+    kind_by_ext = {".prtdot": "part", ".asmdot": "assembly", ".drwdot": "drawing"}
+    if ext not in kind_by_ext:
+        raise ValueError(f"'{ext}' is not a SolidWorks template. Expected one of: {', '.join(kind_by_ext)}")
+    expected_kind = kind_by_ext[ext]
+
+    def _impl():
+        app = _connect()
+        width_m = to_meters(width, unit) if width else 0.0
+        height_m = to_meters(height, unit) if height else 0.0
+        doc = app.NewDocument(abs_path, int(paper_size), width_m, height_m)
+        if doc is None:
+            raise RuntimeError(f"SolidWorks could not create a document from '{abs_path}'.")
+        active = app.ActiveDoc
+        resolved = active if active is not None else doc
+        type_names = {1: "Part", 2: "Assembly", 3: "Drawing"}
+        actual_type = type_names.get(_doc_type(resolved), "Unknown")
+        if actual_type.lower() != expected_kind:
+            raise RuntimeError(
+                f"Expected a {expected_kind} from '{abs_path}' but SolidWorks created a "
+                f"{actual_type}. The template file's own type may not match its extension."
+            )
+        return {"title": _doc_title(resolved), "type": actual_type, "template_path": abs_path}
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False))
+async def save_as_template(filepath: str) -> dict:
+    """Save the active document AS a template (.prtdot/.asmdot/.drwdot).
+
+    The extension must match the active document's type (a part can only be
+    saved as .prtdot, etc.) -- SolidWorks does not enforce this itself, so a
+    mismatch here would silently produce an unusable template.
+    """
+
+    abs_path = os.path.abspath(filepath)
+    ext = os.path.splitext(abs_path)[1].lower()
+    ext_by_doc_type = {1: ".prtdot", 2: ".asmdot", 3: ".drwdot"}
+
+    def _impl():
+        doc = _active_doc()
+        dtype = _doc_type(doc)
+        expected_ext = ext_by_doc_type.get(dtype)
+        if expected_ext is None:
+            raise RuntimeError(f"Unrecognized active document type ({dtype}).")
+        if ext != expected_ext:
+            raise ValueError(
+                f"This document is a {expected_ext[1:]} document; save it with the "
+                f"'{expected_ext}' extension, not '{ext}'."
+            )
+        resolved_path = _resolve_write_path(abs_path)
+        os.makedirs(os.path.dirname(resolved_path) or ".", exist_ok=True)
+        ok = False
+        try:
+            ok = bool(doc.SaveAs(resolved_path))
+        except Exception:
+            ok = False
+        if not ok:
+            errors = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+            warnings = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+            empty_export = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+            ok = bool(doc.Extension.SaveAs(resolved_path, 0, 0, empty_export, errors, warnings))
+        if not ok:
+            raise RuntimeError(f"Failed to save template to '{resolved_path}'.")
+        if not os.path.isfile(resolved_path):
+            raise RuntimeError(f"SolidWorks reported success but '{resolved_path}' does not exist.")
+        return {"path": resolved_path}
+
+    return await _run(_impl)
+
+
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def insert_drawing_view(source_filepath: str, view_type: str = "front",
                                x: float = 150, y: float = 150,
@@ -14978,6 +15153,127 @@ async def zoom_to_area(x1: float, y1: float, x2: float, y2: float, unit: Optiona
             to_meters(x2, unit), to_meters(y2, unit), 0,
         )
         return {"area": [[x1, y1], [x2, y2]], "unit": unit or _default_unit}
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True))
+async def run_command_by_id(command_id: int) -> dict:
+    """Run a SolidWorks UI command by its ``swCommands_e``/menu command ID.
+
+    Advanced escape hatch: ``ISldWorks::RunCommand(ID, UseDefault)`` runs the
+    exact same thing as clicking the corresponding toolbar/menu button,
+    whatever that command is. Use this only when you already know the
+    correct numeric ID for the SolidWorks version in use (they are not
+    guaranteed stable across versions) -- this tool does not validate the ID
+    or know what it does, so a wrong one can trigger an unrelated, unexpected
+    command. Marked open-world because its effect is, by construction,
+    unbounded: it is whatever that command does.
+    """
+
+    def _impl():
+        app = _connect()
+        result = app.RunCommand(int(command_id), "")
+        return {"command_id": command_id, "accepted": bool(result)}
+
+    return await _run(_impl)
+
+
+# Dynamic section view: cuts away part of the model in the 3D viewport only
+# (a display mode, not a geometry edit -- unlike cut_extrude/combine_bodies,
+# nothing is removed from the actual solid). The exact COM surface for this
+# is NOT documented anywhere in this repo and has never been confirmed
+# against a live SolidWorks session -- unlike _find_template's pref indices
+# 8/9/10 or NewDocument's signature above, both reused from already-working
+# code. Each plausible method name is tried in turn and the result says
+# exactly which one (if any) worked, same pattern as apply_texture's
+# blend/bump probing (BUGS_AND_FIXES.md BUG-03) -- never a false "enabled".
+_SECTION_VIEW_ON_CANDIDATES = ("SectionViewOn3", "SectionViewOn2", "SectionViewOn")
+_SECTION_VIEW_OFF_CANDIDATES = ("SectionViewOff3", "SectionViewOff2", "SectionViewOff")
+_SECTION_VIEW_PLANE_NORMAL = {
+    "front": (0.0, 0.0, 1.0), "back": (0.0, 0.0, -1.0),
+    "right": (1.0, 0.0, 0.0), "left": (-1.0, 0.0, 0.0),
+    "top": (0.0, 1.0, 0.0), "bottom": (0.0, -1.0, 0.0),
+}
+
+
+def _try_call_com_method(obj, names, *args):
+    """Best-effort: call the first of ``names`` that exists on ``obj`` with
+    ``args``. Returns (method_name, return_value) for the first call that
+    does not raise, or (None, None) if every candidate failed. Never raises
+    -- an unsupported method in this SolidWorks version is expected, not an
+    error (see module note above _SECTION_VIEW_ON_CANDIDATES)."""
+    for name in names:
+        method = getattr(obj, name, None)
+        if method is None:
+            continue
+        try:
+            return name, method(*args)
+        except Exception:
+            continue
+    return None, None
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+async def set_section_view(plane: str = "front", offset: float = 0.0,
+                            flip: bool = False, unit: Optional[str] = None) -> dict:
+    """Show the model cut by a plane in the 3D viewport only (display, not geometry).
+
+    ``plane``: front/back/right/left/top/bottom (through the origin, offset
+    along its normal by ``offset``); ``flip`` reverses which side is hidden.
+    This never changes the actual solid -- it is the same as the "Section
+    View" toolbar button, a camera/display mode you can turn back off with
+    ``clear_section_view``.
+
+    UNVERIFIED: no live SolidWorks session has confirmed which COM method
+    this SolidWorks installation actually exposes for this (see
+    LIVE_TESTS_REQUIRED.md). The result's ``applied_via_method`` says exactly
+    which candidate worked, or ``null`` if none did -- never claims success
+    without that confirmation. If ``null``, use ``run_command_by_id`` with
+    the correct ``swCommands_e`` ID for this SolidWorks version instead.
+    """
+
+    normal = _SECTION_VIEW_PLANE_NORMAL.get(plane.strip().lower())
+    if normal is None:
+        raise ValueError(f"Unknown plane '{plane}'. Use one of: {', '.join(_SECTION_VIEW_PLANE_NORMAL)}")
+
+    def _impl():
+        doc = _active_doc()
+        offset_m = to_meters(offset, unit)
+        nx, ny, nz = normal
+        method_name, raw_result = _try_call_com_method(
+            doc.Extension, _SECTION_VIEW_ON_CANDIDATES,
+            True, nx, ny, nz, 0.0, 0.0, offset_m, bool(flip), False, 0, 0, 0,
+        )
+        applied = method_name is not None and raw_result is not False
+        if applied:
+            _redraw_document(doc)
+        return {
+            "plane": plane.strip().lower(),
+            "offset": offset,
+            "flip": flip,
+            "applied_via_method": method_name,
+            "applied": applied,
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+async def clear_section_view() -> dict:
+    """Turn off a section view previously shown by ``set_section_view``.
+
+    Same unverified-COM-surface caveat as ``set_section_view``: reports
+    exactly which candidate method (if any) worked.
+    """
+
+    def _impl():
+        doc = _active_doc()
+        method_name, raw_result = _try_call_com_method(doc.Extension, _SECTION_VIEW_OFF_CANDIDATES)
+        applied = method_name is not None and raw_result is not False
+        if applied:
+            _redraw_document(doc)
+        return {"applied_via_method": method_name, "applied": applied}
 
     return await _run(_impl)
 

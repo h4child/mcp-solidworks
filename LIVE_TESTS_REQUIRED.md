@@ -213,6 +213,46 @@ e a função precisa ser corrigida de novo com a ordem real.
 
 ---
 
+## LT-10 — Templates, System Options e vista em corte 3D (17/10/2026)
+
+**Por quê:** `get_default_templates`/`set_default_templates`/
+`create_document_from_template` reaproveitam índices e chamadas já
+confirmados (8/9/10, `NewDocument`), então o risco ali é baixo. `set_section_view`/
+`clear_section_view` usam nomes de método **chutados** -- é bem possível que
+nenhum funcione nesta instalação.
+
+**Passos:**
+1. `get_default_templates()` — confirmar que os três caminhos retornados
+   batem com SolidWorks > Opções > Propriedades do Sistema > Modelos
+   Padrão na UI.
+2. `set_default_templates(part="C:\caminho\MeuTemplate.prtdot")` com um
+   template de teste — confirmar na UI que o campo mudou, e que
+   `create_new_part()` em seguida usa esse template (ex.: confirmar uma
+   propriedade customizada exclusiva desse template no documento criado).
+3. `create_document_from_template(template_path="C:\caminho\Config.drwdot")`
+   — confirmar que o documento criado tem a folha/configuração daquele
+   template específico, não do default.
+4. Numa peça aberta, `save_as_template(filepath="C:\temp\Teste.prtdot")` —
+   abrir o arquivo resultante na UI do SolidWorks e confirmar que ele
+   aparece como template (ícone de template, pode ser usado em "Novo
+   Documento").
+5. `run_command_by_id(command_id=...)` com um ID conhecido e inofensivo
+   (ex. o de "Zoom to Fit") — confirmar que o comando correto executou.
+6. `set_section_view(plane="right", offset=0)` numa peça com geometria
+   assimétrica — observar se a vista 3D realmente corta o modelo. Se
+   `applied` vier `false`, usar o Macro Recorder do SolidWorks (Ferramentas
+   > Macro > Gravar) clicando no botão "Vista em Corte" da UI manualmente,
+   abrir o `.swp` gerado e ler o nome do método COM realmente usado — depois
+   atualizar `_SECTION_VIEW_ON_CANDIDATES`/`_SECTION_VIEW_OFF_CANDIDATES` em
+   `server.py` com o nome real.
+
+**Critério de aprovação:** cada efeito confirmado visualmente/na UI, não só
+"a chamada não lançou exceção". Para `set_section_view`, se nenhum candidato
+funcionar, isso é uma lacuna confirmada (ferramenta marcada `EXP` no README),
+não um "talvez funcione".
+
+---
+
 ## Observação geral
 
 Nenhum destes testes deve ser considerado "aprovado" só porque uma chamada
