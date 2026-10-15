@@ -71,7 +71,7 @@ log = logging.getLogger("solidworks-mcp")
 # never the tool's. This is a second, independent, append-only log: one JSON
 # object per call (tool, a truncated view of its arguments, duration, and
 # whether it raised), written by _log_tool_call via the single place every
-# call already passes through regardless of which of the 150 tools it is --
+# call already passes through regardless of which of the 158 tools it is --
 # ToolManager.call_tool (patched onto `mcp` once below) -- rather than by
 # touching each tool function.
 CALL_LOG_PATH = os.environ.get(
@@ -178,7 +178,7 @@ mcp = FastMCP("solidworks-mcp", instructions=SERVER_INSTRUCTIONS)
 
 def _install_call_instrumentation(server: FastMCP) -> None:
     """Wrap the one place every tool call passes through regardless of which
-    of the 150 tools it is: a structured log entry (see CALL_LOG_PATH above)
+    of the 158 tools it is: a structured log entry (see CALL_LOG_PATH above)
     and the per-tool timeout budget (see _timeout_budget_for below), neither
     of which _run can tell on its own -- every tool's COM work runs through
     a locally-defined `_impl` closure, so by the time a call reaches _run,
@@ -273,7 +273,7 @@ ASSEMBLY_SCALE_TOOLS = frozenset({
 BATCH_EXPORT_TOOLS = frozenset({"export_document", "export_flat_pattern_dxf", "pack_and_go"})
 
 # Set by _install_call_instrumentation's wrapper around ToolManager.call_tool
-# (the one place that knows which of the 150 tools is running) and read by
+# (the one place that knows which of the 158 tools is running) and read by
 # _run, several `await`s deeper in the same task -- a plain module-level
 # variable would race under concurrent calls, but a contextvar is scoped to
 # the call that set it regardless of how many other calls are in flight.

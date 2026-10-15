@@ -1,7 +1,29 @@
 # SolidWorks MCP Server
 
 Servidor MCP em Python que controla o SolidWorks via COM (`win32com`), escrito
-com o SDK oficial (`mcp`, usando `FastMCP`). **163 ferramentas** (v5.21.5).
+com o SDK oficial (`mcp`, usando `FastMCP`). **158 ferramentas incondicionais
++ `execute_python` condicional** (v5.21.5) -- ver `TOOL_INVENTORY.csv` para a
+lista completa e `AUDITORIA_COBERTURA_FUNCIONAL.md` para o que cada categoria
+do SolidWorks tem ou não cobertura.
+
+## Auditorias e relatórios deste repositório
+
+- [`AUDIT_REPORT.md`](AUDIT_REPORT.md) -- auditoria de arquitetura/segurança
+  (timeout do executor COM, política de caminhos, anotações MCP), achados
+  classificados confirmado/refutado/pendente.
+- [`AUDITORIA_COBERTURA_FUNCIONAL.md`](AUDITORIA_COBERTURA_FUNCIONAL.md) --
+  cobertura funcional contra 354 capacidades do SolidWorks (esboço, sólidos,
+  montagem, chapa, estruturas, superfícies, movimento, FEA, CAM, desenho
+  técnico...): o que está testado, implementado-não-testado, parcial,
+  experimental ou ausente, por categoria, com prioridade de lacunas.
+- [`BUGS_AND_FIXES.md`](BUGS_AND_FIXES.md) -- bugs confirmados e corrigidos,
+  com reprodução, causa e teste de regressão.
+- [`LIVE_TESTS_REQUIRED.md`](LIVE_TESTS_REQUIRED.md) -- passos exatos para
+  um operador com SolidWorks real confirmar o que a auditoria não pôde
+  (nenhum destes ambientes de auditoria tinha SolidWorks instalado).
+- [`TOOL_INVENTORY.csv`](TOOL_INVENTORY.csv) -- inventário mecânico das 159
+  ferramentas (categoria, schema, tipo leitura/escrita/destrutiva, status
+  OK/EXP/não documentado, referências de teste).
 
 ## Para quem so quer usar
 
