@@ -179,6 +179,40 @@ cliente MCP real, não só por inspeção de código (que já foi feita e está 
 
 ---
 
+## LT-09 — `apply_texture`: assinatura corrigida de `CreateTexture` + relevo/blend best-effort (15/10/2026)
+
+**Por quê:** a correção presume que `IModelDocExtension::CreateTexture`
+recebe `(FileName, Width, Height, Angle)` — documentado na API do
+SolidWorks, mas **nunca confirmado contra uma instalação real** por este
+projeto. Se a suposição estiver errada, a textura pode sair com proporção,
+rotação ou granularidade diferentes do esperado.
+
+**Passos:**
+1. Criar uma peça descartável com uma face plana grande (ex. 200x100mm).
+2. Chamar `apply_texture(texture_path="<imagem com padrão assimétrico, ex.
+   um retângulo com uma seta>", u_scale=2.0, v_scale=8.0, angle=30.0,
+   target="face", face_x=..., face_y=..., face_z=...)`.
+3. Capturar a vista (`capture_standard_views`) e inspecionar visualmente:
+   a textura deve aparecer **esticada ~4x mais no eixo V que no U** (não
+   quadrada) e **rotacionada ~30°** em relação à orientação padrão.
+4. Repetir com `blend_with_color=True` e `blend_with_color=False`, comparando
+   visualmente se a cor do material por baixo influencia o resultado.
+5. Repetir com `bump_texture_path` apontando para uma imagem em
+   escala de cinza (ex. um padrão de ondas) e inspecionar visualmente se
+   algum relevo aparece — **resultado esperado real é incerto**: o retorno
+   da ferramenta (`bump.applied_via_property`) dirá se algum dos nomes de
+   propriedade tentados existe nesta instalação; se vier `None`, não há
+   relevo nenhum, apenas a textura de cor.
+
+**Critério de aprovação:** proporção U/V e ângulo da textura na vista capturada
+correspondem visualmente aos valores pedidos (não aos valores antigos —
+comparar com uma textura aplicada pela UI do SolidWorks com os mesmos
+números, usando "Editar Aparência › Mapeamento", como referência). Se não
+corresponder, a suposição sobre a assinatura de `CreateTexture` está errada
+e a função precisa ser corrigida de novo com a ordem real.
+
+---
+
 ## Observação geral
 
 Nenhum destes testes deve ser considerado "aprovado" só porque uma chamada

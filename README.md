@@ -333,6 +333,44 @@ testado ao vivo e não deve ser assumido pela IA que lê este resource):
 `create_tube_part`, `add_mate_by_name`, `interference_report`,
 `set_view_direction`.
 
+### `apply_texture`: mapeamento U/V real + relevo/blend best-effort (15/10/2026, não verificado ao vivo)
+`apply_texture` chamava `extension.CreateTexture(path, scale, angle,
+bool(blend_with_color))`. A assinatura documentada de
+`IModelDocExtension::CreateTexture` é `(FileName, Width, Height, Angle)` --
+ou seja, o `angle` do chamador ia para o slot de `Height` e um booleano
+0.0/1.0 ia para o slot de `Angle`, então a rotação pedida nunca era
+realmente enviada. Corrigido, e a correção abriu espaço para expor
+`u_scale`/`v_scale` (mapeamento U/V independente por eixo) em vez de um
+único `scale` para os dois eixos -- `scale` continua funcionando (aplica o
+mesmo valor aos dois eixos, comportamento idêntico ao de antes).
+
+`blend_with_color` e o novo `bump_texture_path` (textura de relevo) não
+fazem parte da assinatura de `CreateTexture` -- são, no máximo, propriedades
+no objeto que `CreateTexture` devolve, e nenhum nome de propriedade está
+documentado neste repositório nem foi confirmado ao vivo. Em vez de
+inventar um nome e declarar sucesso, cada um tenta uma lista curta de
+nomes plausíveis (`BlendColor`/`Blend`/`UseColor` e
+`BumpMapFileName`/`BumpFileName`/`BumpTextureFileName`) e o retorno informa
+exatamente qual funcionou (`applied_via_property`) ou `None` se nenhum
+funcionou -- nunca afirma "aplicado" sem confirmação. `bump_texture_path`
+não é relevo PBR real (sem normal map); é uma segunda imagem aplicada pelo
+mesmo mecanismo de textura de cor, a aproximação mais próxima que esta API
+expõe.
+
+**Esta correção/extensão não foi testada contra um SolidWorks real** --
+ver `LIVE_TESTS_REQUIRED.md`, item LT-09.
+
+### `list_p2m_appearances`: `pbr_extended` (15/10/2026, não verificado ao vivo)
+Cada aparência agora traz um bloco `pbr_extended` com `roughness`,
+`reflectivity` e `bump_map_path`, cada um como
+`{"value": ..., "source_property": ...}`. Quando o objeto COM de material
+de renderização desta instalação não expõe esse canal, `source_property` e
+`value` vêm `None` -- a resposta honesta para "materiais PBR avançados",
+sem inventar um valor padrão. Nenhum nome de propriedade usado aqui
+(`Roughness`/`Smoothness`/`Blurriness`, `Reflectivity`/`ReflectionAmount`/
+`Reflection`, `BumpMapFileName`/`BumpFileName`/`BumpTextureFileName`) está
+documentado neste repositório nem foi confirmado ao vivo.
+
 Ver `TOOL_INVENTORY.csv` (gerado nesta auditoria) para a lista completa das
 158+1 ferramentas com categoria, schema, tipo leitura/escrita/destrutiva e
 referências de teste unitário/live -- derivado mecanicamente do código atual,
