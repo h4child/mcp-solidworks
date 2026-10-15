@@ -9540,6 +9540,119 @@ def _layout_dict(doc, config: Optional["ad.SheetConfig"] = None) -> dict:
     return {"drawing": _doc_title(doc), "sheets": sheets}
 
 
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+async def set_sheet_scale(sheet_name: str = "", scale1: float = 1.0, scale2: float = 1.0,
+                           update_view_scale: bool = True) -> dict:
+    """Set a drawing sheet's scale (e.g. 1:2 -> scale1=1, scale2=2).
+
+    sheet_name: empty uses the current/active sheet. update_view_scale also
+    rescales views already set to use the sheet's scale (not views with
+    their own explicit scale).
+
+    UNVERIFIED: ISheet::SetScale has never been confirmed against a live
+    SolidWorks session in this repo (unlike get_drawing_layout's read path,
+    which reuses the already-confirmed GetProperties2). See
+    LIVE_TESTS_REQUIRED.md.
+    """
+
+    if scale1 <= 0 or scale2 <= 0:
+        raise ValueError("scale1 and scale2 must both be positive.")
+
+    def _impl():
+        doc = _active_drawing()
+        if sheet_name:
+            sheet, _views = _sheet_and_views(doc, sheet_name)
+        else:
+            sheet = win32com.client.Dispatch(_com_member(doc, "GetCurrentSheet"))
+        resolved_name = sheet_name or str(_com_member(sheet, "GetName") or "")
+        ok = bool(sheet.SetScale(float(scale1), float(scale2), bool(update_view_scale), False))
+        if ok:
+            doc.ForceRebuild3(False)
+        result = {"sheet": resolved_name, "scale": [scale1, scale2], "applied": ok}
+        if ok:
+            new_props = _sheet_properties(sheet)
+            result["scale_read_back"] = list(new_props["sheet_scale"])
+        return result
+
+    return await _run(_impl)
+
+
+# swImportAnnotationTypes_e, used by InsertModelAnnotations2's ImportFlag.
+# NOT documented anywhere in this repo and never confirmed against a live
+# SolidWorks session -- unlike _sheet_properties' GetProperties2 fields,
+# these bit values are recalled from general SolidWorks API familiarity,
+# not verified here. If insert_model_items inserts the wrong annotation
+# kinds (or none), these are the values to re-check first (see
+# LIVE_TESTS_REQUIRED.md).
+_MODEL_ITEMS_FLAGS = {
+    "dimensions": 1,
+    "notes": 2,
+    "surface_finish": 4,
+    "weld_symbols": 8,
+    "geometric_tolerances": 16,
+    "datum_targets": 32,
+    "datum_features": 64,
+    "auto_balloons": 128,
+    "cosmetic_threads": 256,
+}
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def insert_model_items(view_name: str,
+                              dimensions: bool = True,
+                              notes: bool = False,
+                              surface_finish: bool = False,
+                              weld_symbols: bool = False,
+                              geometric_tolerances: bool = False,
+                              datum_targets: bool = False,
+                              datum_features: bool = False,
+                              auto_balloons: bool = False,
+                              cosmetic_threads: bool = False) -> dict:
+    """Auto-insert dimensions/annotations from the 3D model into a drawing view.
+
+    Same as SolidWorks' "Insert > Model Items" command: pulls dimensions
+    (and optionally notes, surface finish symbols, weld symbols, GD&T,
+    datum targets/features, auto-balloons, or cosmetic threads) that were
+    defined on the model itself, instead of dimensioning the drawing by
+    hand with add_drawing_dimension.
+
+    UNVERIFIED: the bit values behind each flag above are not documented in
+    this repo and have never been confirmed live -- if nothing is inserted,
+    or the wrong kind is, that mapping (``_MODEL_ITEMS_FLAGS``) is the first
+    thing to re-check. See LIVE_TESTS_REQUIRED.md.
+    """
+
+    requested = {
+        "dimensions": dimensions, "notes": notes, "surface_finish": surface_finish,
+        "weld_symbols": weld_symbols, "geometric_tolerances": geometric_tolerances,
+        "datum_targets": datum_targets, "datum_features": datum_features,
+        "auto_balloons": auto_balloons, "cosmetic_threads": cosmetic_threads,
+    }
+    flag = 0
+    for name, wanted in requested.items():
+        if wanted:
+            flag |= _MODEL_ITEMS_FLAGS[name]
+    if flag == 0:
+        raise ValueError("Enable at least one annotation kind.")
+
+    def _impl():
+        doc = _active_drawing()
+        _find_view(doc, view_name)  # raises with available names if missing
+        try:
+            doc.ActivateView(view_name)
+        except Exception:
+            log.warning("ActivateView(%r) failed; continuing", view_name, exc_info=True)
+        ok = bool(doc.InsertModelAnnotations2(flag, 0, 0, False, ""))
+        return {
+            "view": view_name,
+            "requested": {k: v for k, v in requested.items() if v},
+            "flag": flag,
+            "applied": ok,
+        }
+
+    return await _run(_impl)
+
+
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def get_drawing_layout() -> dict:
     """Describe every sheet of the active drawing as data.
