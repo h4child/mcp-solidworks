@@ -386,6 +386,39 @@ Sete ferramentas novas:
 **Nenhuma destas 7 ferramentas foi testada contra um SolidWorks real** -- ver
 `LIVE_TESTS_REQUIRED.md`, item LT-10.
 
+### Desenho técnico 2D: escala de folha, cota automática e carimbo (17/10/2026, não verificado ao vivo)
+Fechando lacunas do `AUDITORIA_COBERTURA_FUNCIONAL.md` categoria O:
+
+- `set_sheet_scale` -- grava a escala de uma folha (`ISheet::SetScale`). A
+  leitura (`get_drawing_layout`) já existia e é confirmada ao vivo; o
+  caminho de escrita é novo e não verificado.
+- `insert_model_items` -- equivalente a "Inserir > Itens do Modelo" do
+  SolidWorks: traz cotas/anotações já definidas no modelo 3D para a vista de
+  desenho, em vez de cotar à mão com `add_drawing_dimension`. Os valores de
+  bit de `_MODEL_ITEMS_FLAGS` (quais tipos de anotação cada flag liga) **não
+  estão documentados neste repositório nem foram confirmados ao vivo**.
+- **Carimbo (title block):** não foi criada uma ferramenta nova -- o carimbo
+  padrão do SolidWorks é texto vinculado a propriedades customizadas (ex.
+  `$PRPSHEET:"Title"`), e `set_custom_property`/`get_custom_properties` já
+  aceitam um parâmetro `config`; para uma folha de desenho, passar o NOME DA
+  FOLHA nesse parâmetro (ex. `set_custom_property("Title", "Suporte X",
+  config="Folha1")`) grava a propriedade no escopo da folha, que é o que o
+  carimbo costuma exibir. Isso não foi confirmado ao vivo especificamente
+  para desenhos.
+- **Tolerância dimensional (± numa cota já existente) -- avaliada e NÃO
+  implementada.** Precisaria de três etapas encadeadas e nenhuma delas tem
+  precedente confirmado neste código: selecionar uma cota já existente por
+  ponto (nenhuma ferramenta aqui faz isso -- `add_drawing_dimension` só
+  cria cotas novas), obter o `IDisplayDimension` dela, e então chamar um
+  método de tolerância cujo nome não é citado em nenhum lugar deste
+  repositório. Encadear três suposições não confirmadas é diferente de
+  arriscar uma só (como em `set_section_view`) -- preferi não implementar
+  isso a entregar uma ferramenta com alta chance de falhar nas três etapas.
+  Ver `LIVE_TESTS_REQUIRED.md` LT-10 para como descobrir a API real via
+  Macro Recorder, se isso for prioridade depois.
+
+**Nenhuma destas ferramentas foi testada contra um SolidWorks real.**
+
 ### `apply_texture`: mapeamento U/V real + relevo/blend best-effort (15/10/2026, não verificado ao vivo)
 `apply_texture` chamava `extension.CreateTexture(path, scale, angle,
 bool(blend_with_color))`. A assinatura documentada de

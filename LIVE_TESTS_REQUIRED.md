@@ -253,6 +253,35 @@ não um "talvez funcione".
 
 ---
 
+## LT-11 — `set_sheet_scale` e `insert_model_items` (17/10/2026)
+
+**Por quê:** `ISheet::SetScale` e `IDrawingDoc::InsertModelAnnotations2` (e,
+dentro dela, os valores de bit de `_MODEL_ITEMS_FLAGS`) nunca foram
+confirmados ao vivo neste repositório.
+
+**Passos:**
+1. Com um desenho de uma peça aberto, `set_sheet_scale(scale1=1, scale2=2)`
+   — confirmar na UI (SolidWorks > Propriedades da Folha) que a escala
+   mudou para 1:2, e que as vistas que seguiam a escala da folha
+   redimensionaram.
+2. `insert_model_items(view_name="<nome de uma vista>", dimensions=True)`
+   numa peça que tenha cotas definidas no modelo 3D (via `add_sketch_dimension`
+   por exemplo) — confirmar que as cotas aparecem na vista do desenho. Se
+   nada aparecer, ou aparecer o tipo errado de anotação, o mapa de bits em
+   `_MODEL_ITEMS_FLAGS` (server.py) está errado — descobrir o valor real
+   gravando uma macro ao clicar em "Inserir > Itens do Modelo" manualmente
+   e lendo o `ImportFlag` passado para `InsertModelAnnotations2` no `.swp`
+   gerado.
+3. Repetir o passo 2 com `notes=True`/`geometric_tolerances=True` etc.
+   isoladamente, para confirmar cada bit individualmente em vez de só a
+   combinação default.
+
+**Critério de aprovação:** escala da folha e cotas inseridas conferidas
+visualmente na UI do SolidWorks, não só pelo retorno `applied: true` da
+ferramenta.
+
+---
+
 ## Observação geral
 
 Nenhum destes testes deve ser considerado "aprovado" só porque uma chamada

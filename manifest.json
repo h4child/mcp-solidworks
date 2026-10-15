@@ -693,6 +693,14 @@
     {
       "name": "clear_section_view",
       "description": "Turn off a section view previously shown by set_section_view."
+    },
+    {
+      "name": "set_sheet_scale",
+      "description": "Set a drawing sheet scale (e.g. 1:2)."
+    },
+    {
+      "name": "insert_model_items",
+      "description": "Auto-insert dimensions/annotations from the model into a drawing view."
     }
   ],
   "keywords": [
