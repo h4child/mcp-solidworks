@@ -324,18 +324,64 @@ def _shutdown():
 atexit.register(_shutdown)
 
 
+# A timed-out COM call does not actually stop running: it keeps occupying
+# the SOLE worker thread of ``_executor``. ``asyncio.wait_for`` below can
+# only abandon the *asyncio* future when a call overruns its budget -- a
+# ThreadPoolExecutor job that is actually blocked inside a COM call cannot be
+# force-cancelled, so it keeps running on that one thread after _run has
+# already reported it as timed out. Because the executor has exactly one
+# worker, every call made afterwards queues behind it and -- if it hasn't
+# started by the time ITS OWN budget elapses -- times out too, with the same
+# generic message, even though it never got a chance to run. This tracks
+# that a call is in that state so later ones can say so plainly instead of
+# each re-discovering the same timeout on its own.
+_stuck_call = None  # type: Optional[dict]
+
+
 async def _run(fn, *args, **kwargs):
+    global _stuck_call
     fn_name = fn.__name__ if hasattr(fn, "__name__") else str(fn)
-    timeout = _timeout_budget_for(_current_tool_name.get())
+    tool_name = _current_tool_name.get()
+    timeout = _timeout_budget_for(tool_name)
+
+    if _stuck_call is not None:
+        stuck = _stuck_call
+        elapsed = time.monotonic() - stuck["since"]
+        raise RuntimeError(
+            f"SolidWorks is still blocked on an earlier call to "
+            f"'{stuck['tool']}' that exceeded its {stuck['timeout']:.0f}s "
+            f"timeout {elapsed:.0f}s ago and has not returned (a COM call "
+            "cannot be safely cancelled once it is running, so it keeps "
+            "occupying the single COM worker thread). This call has not "
+            "started and cannot until that one finishes or the server is "
+            "restarted. Close any open SolidWorks dialog, or restart the "
+            "MCP server if it does not clear."
+        )
+
     log.debug("COM call: %s (timeout budget %ss)", fn_name, timeout)
-    loop = asyncio.get_event_loop()
-    future = loop.run_in_executor(_executor, functools.partial(fn, *args, **kwargs))
+    # Submitted directly against the executor (not via loop.run_in_executor)
+    # so the raw concurrent.futures.Future is in hand below: when
+    # asyncio.wait_for cancels the *asyncio*-side wrapper on timeout, that
+    # wrapper flips to cancelled immediately regardless of whether the real
+    # thread actually stopped -- a done-callback on it would fire right
+    # away and say "finished" about work that is still running. The raw
+    # future only completes when the submitted call actually returns.
+    cf_future = _executor.submit(functools.partial(fn, *args, **kwargs))
     try:
-        result = await asyncio.wait_for(future, timeout=timeout)
+        result = await asyncio.wait_for(asyncio.wrap_future(cf_future), timeout=timeout)
         log.debug("COM call OK: %s", fn_name)
         return result
     except asyncio.TimeoutError:
         log.error("COM operation timed out after %ds: %s", timeout, fn_name)
+        _stuck_call = {"tool": tool_name or fn_name, "since": time.monotonic(),
+                        "timeout": timeout}
+
+        def _clear_stuck(_future, _marker=_stuck_call):
+            global _stuck_call
+            if _stuck_call is _marker:
+                _stuck_call = None
+
+        cf_future.add_done_callback(_clear_stuck)
         raise RuntimeError(
             f"SolidWorks operation timed out after {timeout}s. "
             "The application may be blocked by a dialog or heavy computation. "
@@ -14079,12 +14125,17 @@ async def rebuild_model(force: bool = True, top_only: bool = False) -> dict:
     return await _run(_impl)
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 async def validate_model() -> dict:
     """Rebuild and inspect the feature tree for SolidWorks errors and warnings.
 
     This is a production gate: it returns ``valid: false`` when a feature has a
     non-zero ``IFeature.GetErrorCode2`` result after rebuilding.
+
+    Not read-only: like ``rebuild_model``, this calls ``ForceRebuild3`` before
+    inspecting the tree (was incorrectly annotated ``readOnlyHint=True`` --
+    fixed because a client may otherwise call it speculatively/repeatedly on
+    the strength of that annotation).
     """
 
     def _impl():
