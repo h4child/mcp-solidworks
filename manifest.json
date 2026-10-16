@@ -163,6 +163,10 @@
       "description": "Chamfer every edge of the solid body."
     },
     {
+      "name": "chamfer_edges_two_distances",
+      "description": "Apply a two-distance chamfer (two different setbacks, one per face) to"
+    },
+    {
       "name": "circular_pattern",
       "description": "Repeat a feature in a circular pattern."
     },
@@ -259,6 +263,10 @@
       "description": "Create a reference plane offset or angled from an existing plane."
     },
     {
+      "name": "create_reference_point",
+      "description": "Create a standalone reference-geometry point (tree feature, not a sketch"
+    },
+    {
       "name": "create_sketch",
       "description": "Create a sketch on a standard plane (front/top/right)."
     },
@@ -285,6 +293,14 @@
     {
       "name": "cut_part_end",
       "description": "End cut / miter: slice a tube or profile part with a plane (normal + offset or point) so its end is one flat angled face that can sit on another member; measures volume removed and the new face."
+    },
+    {
+      "name": "cut_up_to_entity",
+      "description": "Cut-extrude the last sketch drawn, stopping at an existing face or"
+    },
+    {
+      "name": "delete_body",
+      "description": "Delete one named solid body from the active part document."
     },
     {
       "name": "delete_component",
@@ -387,6 +403,10 @@
       "description": "Boss-extrude the last sketch."
     },
     {
+      "name": "extrude_up_to_entity",
+      "description": "Boss-extrude the last sketch drawn, stopping at an existing face or"
+    },
+    {
       "name": "fillet_edges",
       "description": "Fillet every edge of the solid body."
     },
@@ -405,6 +425,10 @@
     {
       "name": "get_appearance_properties",
       "description": "Read RGB, reflection, transparency, and emission channels from the active model."
+    },
+    {
+      "name": "get_body_bounding_box",
+      "description": "Read one solid body's bounding box and overall size. Read-only."
     },
     {
       "name": "get_component_transform",
@@ -513,6 +537,10 @@
     {
       "name": "linear_pattern",
       "description": "Repeat a feature in a linear pattern."
+    },
+    {
+      "name": "list_bodies",
+      "description": "List every solid body in the active part document. Read-only."
     },
     {
       "name": "list_components",

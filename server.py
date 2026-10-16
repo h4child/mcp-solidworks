@@ -6762,6 +6762,367 @@ async def chamfer_edges(distance: float = 2, angle: float = 45, unit: Optional[s
 
     return await _run(_impl)
 
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def create_reference_point(x: float = 0, y: float = 0, z: float = 0,
+                                  unit: Optional[str] = None) -> dict:
+    """Create a standalone reference-geometry point (tree feature, not a sketch
+    entity) at an existing vertex/sketch point near (x, y, z).
+
+    Reference points are used as mate anchors, pattern seed points, and
+    as the datum some drawing GD&T frames need. Pick an existing vertex or
+    sketch point close to (x, y, z); this does not create free-floating
+    geometry at arbitrary coordinates -- for that, draw a point in a sketch
+    (add_sketch_point) instead.
+
+    NEEDS LIVE VERIFICATION: this uses ``IModelDoc2::InsertPoint2`` by analogy
+    with ``InsertAxis2`` (create_reference_axis) -- SolidWorks' "Point"
+    reference-geometry command was not available to confirm the exact method
+    name/signature in this session. See NOVAS_ACOES_IMPLEMENTADAS.md."""
+
+    def _impl():
+        doc = _active_doc()
+        doc.ClearSelection2(True)
+        x_m, y_m, z_m = to_meters(x, unit), to_meters(y, unit), to_meters(z, unit)
+        empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+        selected = (
+            doc.Extension.SelectByID2("", "VERTEX", x_m, y_m, z_m, False, 0, empty, 0)
+            or doc.Extension.SelectByID2("", "SKETCHPOINT", x_m, y_m, z_m, False, 0, empty, 0)
+            or doc.Extension.SelectByID2("", "EXTSKETCHPOINT", x_m, y_m, z_m, False, 0, empty, 0)
+        )
+        if not selected:
+            raise RuntimeError(
+                f"No vertex or sketch point found at ({x}, {y}, {z}). "
+                f"Reference points attach to existing geometry."
+            )
+
+        point_count_before = sum(
+            1
+            for raw_feature in doc.FeatureManager.GetFeatures(False) or ()
+            if win32com.client.Dispatch(raw_feature).GetTypeName2 == "RefPoint"
+        )
+        try:
+            doc.InsertPoint2(True)
+        except Exception as exc:
+            raise RuntimeError(
+                f"InsertPoint2 failed ({exc}). This COM call is an educated "
+                f"guess (see NOVAS_ACOES_IMPLEMENTADAS.md) and may need a "
+                f"different method name on this SolidWorks build."
+            ) from exc
+
+        points_after = [
+            win32com.client.Dispatch(raw_feature)
+            for raw_feature in doc.FeatureManager.GetFeatures(False) or ()
+            if win32com.client.Dispatch(raw_feature).GetTypeName2 == "RefPoint"
+        ]
+        if len(points_after) <= point_count_before:
+            raise RuntimeError(
+                f"Reference point creation produced no new 'RefPoint' feature "
+                f"at ({x}, {y}, {z})."
+            )
+        return {"point": points_after[-1].Name, "picked_at": [x, y, z],
+                "unit": unit or _default_unit}
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def extrude_up_to_entity(x: float, y: float, z: float,
+                                both_directions: bool = False, merge: bool = True,
+                                unit: Optional[str] = None) -> dict:
+    """Boss-extrude the last sketch drawn, stopping at an existing face or
+    reference plane picked by a point (x, y, z), instead of a fixed depth.
+
+    Equivalent to SolidWorks' "Up To Surface"/"Up To Face" end condition
+    (extrude_sketch only offers Blind/MidPlane). Use this for a boss that
+    must land exactly on an uneven or angled face rather than a flat depth
+    that may be wrong if that face ever moves.
+
+    THERE IS NO DEPTH TO VERIFY: unlike extrude_sketch, the end condition
+    (not a number) decides where the extrusion stops, so ``verified`` is not
+    reported -- check the result with measure_body/list_faces instead."""
+
+    def _impl():
+        doc = _active_doc()
+        sketch_name = _select_last_sketch(doc)
+        x_m, y_m, z_m = to_meters(x, unit), to_meters(y, unit), to_meters(z, unit)
+        empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+        if not doc.Extension.SelectByID2("", "FACE", x_m, y_m, z_m, True, 4, empty, 0):
+            if not doc.Extension.SelectByID2("", "PLANE", x_m, y_m, z_m, True, 4, empty, 0):
+                raise RuntimeError(f"No face or plane found at ({x}, {y}, {z}) to extrude up to.")
+
+        end_cond = 4  # swEndCondUpToSurface (also used for "up to face")
+        feat = doc.FeatureManager.FeatureExtrusion2(
+            True, False, False, end_cond, (6 if both_directions else end_cond), 0.0, 0.0,
+            False, False, False, False, 0.0, 0.0,
+            False, False, False, False,
+            merge, True, True, 0, 0.0, False,
+        )
+        if feat is None:
+            raise RuntimeError(
+                f"Up-to-entity extrusion failed on sketch '{sketch_name}'. The "
+                f"target face/plane may not fully bound the swept profile."
+            )
+        feature = win32com.client.Dispatch(feat)
+        return {
+            "sketch": sketch_name, "up_to": [x, y, z], "both_directions": both_directions,
+            "merge": merge, "unit": unit or _default_unit,
+            "feature": feature.Name if hasattr(feature, "Name") else "Boss-Extrude",
+            "verified": None,
+            "verification_skipped": (
+                "an up-to-entity extrusion has no fixed depth to compare against "
+                "a request -- check the resulting geometry with measure_body"),
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def cut_up_to_entity(x: float, y: float, z: float,
+                            both_directions: bool = False,
+                            unit: Optional[str] = None) -> dict:
+    """Cut-extrude the last sketch drawn, stopping at an existing face or
+    reference plane picked by a point (x, y, z), instead of a fixed depth or
+    through_all.
+
+    Equivalent to SolidWorks' "Up To Surface"/"Up To Face" end condition for a
+    cut (cut_extrude only offers Blind/ThroughAll/MidPlane). Useful for a
+    pocket or step that must stop exactly at an existing internal face."""
+
+    def _impl():
+        doc = _active_doc()
+        sketch_name = _select_last_sketch(doc)
+        x_m, y_m, z_m = to_meters(x, unit), to_meters(y, unit), to_meters(z, unit)
+        empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+        if not doc.Extension.SelectByID2("", "FACE", x_m, y_m, z_m, True, 4, empty, 0):
+            if not doc.Extension.SelectByID2("", "PLANE", x_m, y_m, z_m, True, 4, empty, 0):
+                raise RuntimeError(f"No face or plane found at ({x}, {y}, {z}) to cut up to.")
+
+        end_cond = 4  # swEndCondUpToSurface
+        feat = doc.FeatureManager.FeatureCut4(
+            True, False, False, end_cond, (6 if both_directions else end_cond), 0.0, 0.0,
+            False, False, False, False, 0.0, 0.0,
+            False, False, False, False,
+            False, True, True,
+            False, False, False,
+            0, 0.0, False, False,
+        )
+        if feat is None:
+            raise RuntimeError(
+                f"Up-to-entity cut failed on sketch '{sketch_name}'. The target "
+                f"face/plane may not fully bound the cut profile."
+            )
+        feature = win32com.client.Dispatch(feat)
+        return {
+            "sketch": sketch_name, "up_to": [x, y, z], "both_directions": both_directions,
+            "unit": unit or _default_unit,
+            "feature": feature.Name if hasattr(feature, "Name") else "Cut-Extrude",
+            "verified": None,
+            "verification_skipped": (
+                "an up-to-entity cut has no fixed depth to compare against a "
+                "request -- check the resulting geometry with measure_body"),
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def chamfer_edges_two_distances(distance1: float = 2, distance2: float = 4,
+                                       unit: Optional[str] = None, force: bool = False,
+                                       tolerance: float = 0.01) -> dict:
+    """Apply a two-distance chamfer (two different setbacks, one per face) to
+    every edge of the solid body/bodies -- distinct from chamfer_edges, which
+    only does the distance/angle variant.
+
+    force: required (set True) on a part with sheet-metal bends, same
+    reason as fillet_edges/chamfer_edges.
+
+    NEEDS LIVE VERIFICATION: the two-distance chamfer is reached through the
+    same ``InsertFeatureChamfer`` call as chamfer_edges with a different
+    ``Type`` code (0 here, vs 1 for distance/angle there); the exact slot
+    each distance lands in was not confirmed against a live install -- see
+    NOVAS_ACOES_IMPLEMENTADAS.md. ``actual_distance1``/``actual_distance2``
+    are read back so a wrong slot shows up as a verification failure rather
+    than a silently wrong chamfer."""
+
+    def _impl():
+        if distance1 <= 0 or distance2 <= 0:
+            raise ValueError(f"Both distances must be positive, got {distance1}, {distance2}.")
+        doc = _active_doc()
+        if not force and _has_sheet_metal_bends(doc):
+            raise RuntimeError(_BEND_FILLET_CHAMFER_WARNING.format(
+                bend_types="SMBaseFlange/EdgeFlange/OneBend", tool="chamfer_edges_two_distances"))
+        active_unit, factor = _unit_factor(unit)
+        d1_m, d2_m = to_meters(distance1, unit), to_meters(distance2, unit)
+        edge_count = _select_all_edges(doc)
+        # swChamferType_e: 0 = distance-distance (two-distance), 1 = distance-angle
+        # (the type chamfer_edges already uses and has confirmed live).
+        feat = doc.FeatureManager.InsertFeatureChamfer(0, 0, d1_m, 0.0, d2_m, 0, 0, 0)
+        if feat is None:
+            raise RuntimeError("Failed to create two-distance chamfer.")
+        feature = win32com.client.Dispatch(feat)
+        raw_d1, d1_how = _measured_feature_value(doc, feature, ["Distance", "D1"], "D1")
+        raw_d2, d2_how = _measured_feature_value(doc, feature, ["Distance2", "D2"], "D2")
+        actual_d1 = None if raw_d1 is None else raw_d1 * factor
+        actual_d2 = None if raw_d2 is None else raw_d2 * factor
+        result = {
+            "distance1": distance1, "distance2": distance2,
+            "unit": active_unit, "edges": edge_count,
+            "actual_distance1": actual_d1, "actual_distance2": actual_d2,
+        }
+        result.update(_feature_verdict(
+            "the two-distance chamfer",
+            (("distance1", distance1, actual_d1, d1_how),
+             ("distance2", distance2, actual_d2, d2_how)),
+            tolerance, active_unit,
+        ))
+        return result
+
+    return await _run(_impl)
+
+
+# ===========================================================================
+# Multibody tools (additions)
+# ===========================================================================
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def list_bodies(unit: Optional[str] = None) -> dict:
+    """List every solid body in the active part document. Read-only.
+
+    Each entry reports the body's name, face count, edge count, and whether
+    it currently has material/appearance assigned at the BODY level (as
+    opposed to the document-level material set_material writes). Use this
+    before a multibody operation (combine_bodies, move_copy_body, split_body)
+    that needs a body name, instead of guessing one from the feature tree.
+    """
+
+    def _impl():
+        doc = _active_doc()
+        active_unit, factor = _unit_factor(unit)
+        bodies = []
+        for raw in doc.GetBodies2(0, True) or ():
+            body = win32com.client.Dispatch(raw)
+            entry = {}
+            try:
+                name = body.Name
+                entry["name"] = name() if callable(name) else name
+            except Exception:
+                entry["name"] = None
+            try:
+                entry["face_count"] = int(_com_member(body, "GetFaceCount"))
+            except Exception:
+                entry["face_count"] = None
+            try:
+                entry["edge_count"] = int(_com_member(body, "GetEdgeCount"))
+            except Exception:
+                entry["edge_count"] = None
+            try:
+                visible = _com_member(body, "Visible")
+                entry["visible"] = bool(visible)
+            except Exception:
+                entry["visible"] = None
+            try:
+                box = tuple(_com_member(body, "GetBodyBox"))
+                if len(box) >= 6:
+                    entry["bounding_box"] = {
+                        "min": [round(c * factor, 6) for c in box[0:3]],
+                        "max": [round(c * factor, 6) for c in box[3:6]],
+                    }
+            except Exception:
+                entry["bounding_box"] = None
+            bodies.append(entry)
+        return {"count": len(bodies), "unit": active_unit, "bodies": bodies}
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def get_body_bounding_box(body_name: Optional[str] = None,
+                                 unit: Optional[str] = None) -> dict:
+    """Read one solid body's bounding box and overall size. Read-only.
+
+    body_name: name as reported by list_bodies; omitted uses the first solid
+    body found (the common case for a single-body part). Returns min/max
+    corners and the box's width/height/depth, which is the cheap check for
+    "did this come out the overall size it was supposed to" without
+    measure_body's full mass/volume/material requirements (measure_body
+    needs an assigned material; this does not)."""
+
+    def _impl():
+        doc = _active_doc()
+        active_unit, factor = _unit_factor(unit)
+        target = None
+        for raw in doc.GetBodies2(0, True) or ():
+            body = win32com.client.Dispatch(raw)
+            try:
+                name = body.Name
+                name = name() if callable(name) else name
+            except Exception:
+                name = None
+            if body_name is None or name == body_name:
+                target = (name, body)
+                break
+        if target is None:
+            raise RuntimeError(
+                f"Body '{body_name}' not found."
+                if body_name else "No solid bodies found in the active document."
+            )
+        name, body = target
+        box = tuple(_com_member(body, "GetBodyBox"))
+        if len(box) < 6:
+            raise RuntimeError(f"SolidWorks returned an unusable bounding box for body '{name}'.")
+        low = [c * factor for c in box[0:3]]
+        high = [c * factor for c in box[3:6]]
+        return {
+            "body": name, "unit": active_unit,
+            "min": [round(c, 6) for c in low],
+            "max": [round(c, 6) for c in high],
+            "width": round(high[0] - low[0], 6),
+            "height": round(high[1] - low[1], 6),
+            "depth": round(high[2] - low[2], 6),
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False))
+async def delete_body(body_name: str) -> dict:
+    """Delete one named solid body from the active part document.
+
+    body_name: name as reported by list_bodies. Use this to remove a leftover
+    tool body after a multibody boolean operation that was meant to keep only
+    one result (combine_bodies with merge=False / move_copy_body(copy=True)
+    both leave extra bodies around on purpose)."""
+
+    def _impl():
+        doc = _active_doc()
+        doc.ClearSelection2(True)
+        target = None
+        for raw in doc.GetBodies2(0, True) or ():
+            body = win32com.client.Dispatch(raw)
+            try:
+                name = body.Name
+                name = name() if callable(name) else name
+            except Exception:
+                continue
+            if name == body_name:
+                target = body
+                break
+        if target is None:
+            raise RuntimeError(f"Body '{body_name}' not found in the active document.")
+        if not target.Select4(False, pythoncom.Nothing):
+            raise RuntimeError(f"Could not select body '{body_name}' for deletion.")
+        if not bool(doc.Extension.DeleteSelection2(0)):
+            raise RuntimeError(f"SolidWorks could not delete body '{body_name}'.")
+        remaining = [
+            win32com.client.Dispatch(raw).Name
+            for raw in doc.GetBodies2(0, True) or ()
+        ]
+        if body_name in remaining:
+            raise RuntimeError(f"Body '{body_name}' remains in the document after deletion.")
+        return {"deleted": body_name, "remaining_body_count": len(remaining)}
+
+    return await _run(_impl)
+
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def shell_body(thickness: float = 2, remove_face_at_x: Optional[float] = None,
