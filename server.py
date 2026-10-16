@@ -2581,6 +2581,181 @@ async def open_document(filepath: str) -> dict:
 
     return await _run(_impl)
 
+_IMPORT_FORMATS = {".step": 1, ".stp": 1, ".igs": 1, ".iges": 1,
+                   ".x_t": 1, ".x_b": 1, ".stl": 1, ".sat": 1}
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+async def import_model(filepath: str, expected_max_dimension_mm: Optional[float] = None,
+                        dimension_tolerance_percent: float = 5.0) -> dict:
+    """Import a neutral-format model (STEP, IGES, Parasolid, STL, SAT) as a
+    new part document and activate it, then run a basic sanity check on
+    what actually came in.
+
+    This is open_document with the extra checks a neutral import specifically
+    needs: it rejects an unsupported extension up front (open_document would
+    try regardless), and reports the imported part's body count and overall
+    bounding box so a caller can tell the import produced plausible geometry
+    rather than an empty or malformed body.
+
+    expected_max_dimension_mm: if known, the part's largest expected overall
+    dimension in millimeters -- compared against the MEASURED bounding box's
+    largest dimension. This is the cheap catch for the classic neutral-
+    import failure mode: a file authored in inches opened as if it were
+    millimeters (or vice versa) comes in geometrically valid but exactly
+    25.4x the wrong size, with no error from SolidWorks at all."""
+
+    def _impl():
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"File not found: {filepath}")
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext not in _IMPORT_FORMATS:
+            raise ValueError(
+                f"Unsupported import format '{ext}'. Use one of: "
+                f"{', '.join(sorted(_IMPORT_FORMATS))}. For native SolidWorks "
+                f"files (.sldprt/.sldasm/.slddrw) use open_document instead."
+            )
+        app = _connect()
+        doc, errors, _warnings = _open_doc6(app, filepath, _IMPORT_FORMATS[ext])
+        if doc is None:
+            raise RuntimeError(f"Failed to import '{filepath}' (error code {errors}).")
+        title = _doc_title(doc)
+        active_doc, activate_errors = _activate_doc3(app, title, True)
+        if active_doc is None:
+            raise RuntimeError(
+                f"Imported '{filepath}' but could not activate it (error "
+                f"code {activate_errors})."
+            )
+
+        body_count = len(tuple(active_doc.GetBodies2(0, True) or ()))
+        box, _ = _bodies_bounding_box(active_doc)
+        result = {
+            "title": title, "path": filepath, "format": ext.lstrip("."),
+            "body_count": body_count,
+        }
+        if box is None:
+            result["bounding_box_mm"] = None
+            result["warnings"] = [
+                "no measurable solid body was found after import -- the file "
+                "may have imported as a surface body or failed silently"]
+        else:
+            size_mm = [round((box[i + 3] - box[i]) * 1000.0, 4) for i in range(3)]
+            result["bounding_box_mm"] = {
+                "min": [round(c * 1000.0, 4) for c in box[0:3]],
+                "max": [round(c * 1000.0, 4) for c in box[3:6]],
+                "size": size_mm,
+            }
+            result["warnings"] = []
+            if expected_max_dimension_mm is not None:
+                measured_max = max(size_mm)
+                error_percent = (100.0 * (measured_max - expected_max_dimension_mm)
+                                 / expected_max_dimension_mm) if expected_max_dimension_mm else None
+                result["expected_max_dimension_mm"] = expected_max_dimension_mm
+                result["measured_max_dimension_mm"] = measured_max
+                result["dimension_error_percent"] = (
+                    round(error_percent, 2) if error_percent is not None else None)
+                within = (error_percent is not None
+                          and abs(error_percent) <= dimension_tolerance_percent)
+                result["size_plausible"] = within
+                if not within:
+                    result["warnings"].append(
+                        f"measured largest dimension ({measured_max:.4g} mm) is "
+                        f"{error_percent:.3g}% off the expected "
+                        f"{expected_max_dimension_mm} mm -- check for a unit "
+                        f"mismatch (a ~2540% or ~%-96 error is the classic "
+                        f"inch/mm mix-up)")
+        return result
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+async def export_selected_bodies(filepath: str, body_names: list,
+                                  overwrite: bool = True) -> dict:
+    """Export ONLY the named solid bodies of a multibody part, not the whole
+    document -- export_document always exports every body.
+
+    body_names: names as list_bodies reports them.
+
+    MECHANISM, FLAGGED FOR LIVE VERIFICATION: every other body is temporarily
+    hidden (``IBody2.Visible = False``) before calling the same SaveAs path
+    export_document uses, on the premise that SolidWorks' STEP/Parasolid/STL
+    exporters only write visible bodies for a multibody part -- a commonly
+    relied-on behavior that was not re-confirmed live in this session (see
+    NOVAS_ACOES_IMPLEMENTADAS.md). Visibility is restored afterward either
+    way, including if the export itself fails."""
+
+    def _impl():
+        if not body_names:
+            raise ValueError("body_names cannot be empty.")
+        abs_path = _resolve_write_path(filepath)
+        if os.path.exists(abs_path) and not overwrite:
+            raise FileExistsError(
+                f"'{abs_path}' already exists and overwrite=False.")
+        ext = os.path.splitext(abs_path)[1].lower()
+        valid = {".step", ".stp", ".stl", ".igs", ".iges", ".x_t", ".x_b", ".sat", ".3mf"}
+        if ext not in valid:
+            raise ValueError(f"Unsupported export format '{ext}'. Use: {', '.join(sorted(valid))}")
+
+        doc = _active_doc()
+        all_bodies = []
+        for raw in doc.GetBodies2(0, True) or ():
+            body = win32com.client.Dispatch(raw)
+            try:
+                name = body.Name
+                name = name() if callable(name) else name
+            except Exception:
+                name = None
+            all_bodies.append((name, body))
+
+        missing = [n for n in body_names if n not in {name for name, _ in all_bodies}]
+        if missing:
+            raise RuntimeError(f"Body/bodies not found: {', '.join(missing)}.")
+
+        originally_visible = {}
+        for name, body in all_bodies:
+            try:
+                originally_visible[name] = bool(_com_member(body, "Visible"))
+            except Exception:
+                originally_visible[name] = None
+
+        try:
+            for name, body in all_bodies:
+                try:
+                    body.Visible = (name in body_names)
+                except Exception:
+                    pass
+            _redraw_document(doc)
+
+            parent = os.path.dirname(abs_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            errors = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+            warnings = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+            null_disp = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+            ok = bool(doc.Extension.SaveAs(abs_path, 0, 0, null_disp, errors, warnings))
+            if not ok:
+                raise RuntimeError(f"Export failed (error {errors.value}, warning {warnings.value}).")
+        finally:
+            for name, body in all_bodies:
+                was_visible = originally_visible.get(name)
+                if was_visible is not None:
+                    try:
+                        body.Visible = was_visible
+                    except Exception:
+                        pass
+            _redraw_document(doc)
+
+        if not os.path.exists(abs_path):
+            raise RuntimeError(f"SolidWorks reported success but no file was written to {abs_path}.")
+        return {
+            "path": abs_path, "format": ext.lstrip("."),
+            "exported_bodies": body_names,
+            "size_bytes": os.path.getsize(abs_path),
+        }
+
+    return await _run(_impl)
+
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False))
 async def close_document(save: bool = False) -> dict:

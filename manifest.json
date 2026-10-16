@@ -451,6 +451,10 @@
       "description": "Export an active sheet-metal part flat pattern to DXF or DWG."
     },
     {
+      "name": "export_selected_bodies",
+      "description": "Export ONLY the named solid bodies of a multibody part, not the whole"
+    },
+    {
       "name": "extract_assembly_bom",
       "description": "Build a full multi-level BOM of the active assembly: walks every level of the tree, groups rows by file path AND referenced configuration, skips suppressed and excluded components, and totals the mass."
     },
@@ -553,6 +557,10 @@
     {
       "name": "hole_wizard",
       "description": "Create a hole using the Hole Wizard (simple, counterbore, countersink, tapped)."
+    },
+    {
+      "name": "import_model",
+      "description": "Import a neutral-format model (STEP, IGES, Parasolid, STL, SAT) as a"
     },
     {
       "name": "insert_auxiliary_view",
