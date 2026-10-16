@@ -163,6 +163,10 @@
       "description": "Apply a local image texture to the active model or a selected face."
     },
     {
+      "name": "audit_assembly",
+      "description": "Run a battery of read-only assembly health checks in one call: total"
+    },
+    {
       "name": "bulk_set_custom_properties",
       "description": "Set several custom properties on the active document in one call --"
     },
@@ -493,6 +497,10 @@
     {
       "name": "float_component",
       "description": "Float a fixed component."
+    },
+    {
+      "name": "generate_assembly_checklist",
+      "description": "Run the pre-delivery assembly checklist: interference-free, every"
     },
     {
       "name": "generate_model_snapshot",

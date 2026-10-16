@@ -19094,6 +19094,226 @@ async def set_view_direction(
 
     return await _run(_impl)
 
+def _interference_count(assy) -> Optional[int]:
+    """Best-effort interference count, reusing interference_check's approach.
+    Returns None (rather than raising) when the API is unavailable, so a
+    caller composing a larger audit can report "unknown" instead of failing
+    the whole audit over one unavailable sub-check."""
+    assy.ClearSelection2(True)
+    manager = None
+    try:
+        manager = win32com.client.Dispatch(
+            assy.InterferenceDetectionManager,
+            "IInterferenceDetectionMgr",
+            "{EAE282BD-588A-4C1B-AD99-5FE6081C4585}",
+        )
+        manager.TreatCoincidenceAsInterference = False
+        raw_count = manager.GetInterferenceCount
+        if callable(raw_count):
+            raw_count = raw_count()
+        return int(raw_count)
+    except Exception:
+        return None
+    finally:
+        if manager is not None:
+            try:
+                manager.Done()
+            except Exception:
+                pass
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def audit_assembly(config: str = "", max_depth: int = 10) -> dict:
+    """Run a battery of read-only assembly health checks in one call: total
+    components, unique files/configurations, suppressed/hidden counts,
+    components with no material assigned, components no mate references,
+    and the interference count -- the composite view behind
+    generate_assembly_checklist.
+
+    Nothing here is corrected automatically; this only reports."""
+
+    def _impl():
+        assy = _active_assembly()
+        total = 0
+        suppressed_count = 0
+        hidden_count = 0
+        unique_files: set = set()
+        no_material = []
+        for raw in assy.GetComponents(True) or ():
+            comp = win32com.client.Dispatch(raw)
+            total += 1
+            try:
+                path = comp.GetPathName or comp.Name2
+            except Exception:
+                path = comp.Name2
+            unique_files.add(path)
+            try:
+                if bool(comp.IsSuppressed):
+                    suppressed_count += 1
+                    continue
+            except Exception:
+                pass
+            try:
+                visibility = comp.GetVisibility(1, None)
+                state = visibility[0] if isinstance(visibility, (tuple, list)) else visibility
+                if not bool(state):
+                    hidden_count += 1
+            except Exception:
+                pass
+            model_doc = _component_model_doc(comp)
+            if model_doc is not None and _doc_type(model_doc) == 1:
+                native = _native_material_name(model_doc, config)
+                if not native:
+                    no_material.append(comp.Name2)
+
+        mentioned = set()
+        unknown_mates = []
+        for raw_feature in assy.FeatureManager.GetFeatures(False) or ():
+            feat = win32com.client.Dispatch(raw_feature)
+            try:
+                feature_type = feat.GetTypeName2
+                if not str(feature_type).startswith("Mate") or feature_type == "MateGroup":
+                    continue
+            except Exception:
+                continue
+            names = _mate_entity_components(feat)
+            if names:
+                mentioned |= names
+            else:
+                unknown_mates.append(str(getattr(feat, "Name", "?")))
+        unmated = []
+        for raw in assy.GetComponents(True) or ():
+            comp = win32com.client.Dispatch(raw)
+            try:
+                if bool(comp.IsSuppressed):
+                    continue
+            except Exception:
+                pass
+            if comp.Name2 not in mentioned:
+                unmated.append(comp.Name2)
+
+        rows = _bom_rows_with_properties(assy, config, True, max_depth, True, 1.0)
+        total_mass = sum((r["mass_kg"] or 0.0) * r["quantity"] for r in rows if not r["is_assembly"])
+        mass_incomplete = [r["path"] for r in rows if not r["is_assembly"] and r["mass_kg"] is None]
+
+        interference_count = _interference_count(assy)
+
+        return {
+            "assembly": _doc_title(_active_doc()),
+            "total_components": total,
+            "unique_files": len(unique_files),
+            "suppressed_count": suppressed_count,
+            "hidden_count": hidden_count,
+            "components_without_material": no_material,
+            "components_without_material_count": len(no_material),
+            "unmated_components": unmated,
+            "unmated_component_count": len(unmated),
+            "mate_coverage_unknown_count": len(unknown_mates),
+            "total_mass_kg": round(total_mass, 4),
+            "mass_incomplete_for": mass_incomplete,
+            "interference_count": interference_count,
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def generate_assembly_checklist(config: str = "",
+                                       required_properties: Optional[str] = None,
+                                       mass_check_kg: Optional[float] = None,
+                                       mass_tolerance_percent: float = 1.0) -> dict:
+    """Run the pre-delivery assembly checklist: interference-free, every
+    component mated, every component has a material, BOM rows carry the
+    required properties, and (optionally) total mass matches an expected
+    value. Read-only -- reports pass/fail/warning per item; fixes nothing.
+
+    required_properties: same meaning as validate_bom_completeness, default
+    "PartNumber,Description,Material".
+    mass_check_kg: expected total assembly mass; omitted skips that check.
+
+    ``status`` is 'approved' only when every item passed -- the same
+    all-or-nothing gate verify_drawing already uses for drawings."""
+
+    def _impl():
+        assy = _active_assembly()
+        required = [p.strip() for p in
+                    (required_properties or "PartNumber,Description,Material").split(",")
+                    if p.strip()]
+        items = []
+
+        interference_count = _interference_count(assy)
+        items.append({
+            "check": "no_interferences",
+            "status": "fail" if interference_count else (
+                "warning" if interference_count is None else "pass"),
+            "detail": (f"{interference_count} interference(s) detected" if interference_count
+                       else ("interference detection unavailable on this SolidWorks build"
+                             if interference_count is None else "no interferences")),
+        })
+
+        mentioned = set()
+        for raw_feature in assy.FeatureManager.GetFeatures(False) or ():
+            feat = win32com.client.Dispatch(raw_feature)
+            try:
+                feature_type = feat.GetTypeName2
+                if not str(feature_type).startswith("Mate") or feature_type == "MateGroup":
+                    continue
+            except Exception:
+                continue
+            mentioned |= _mate_entity_components(feat)
+        unmated = []
+        for raw in assy.GetComponents(True) or ():
+            comp = win32com.client.Dispatch(raw)
+            try:
+                if bool(comp.IsSuppressed):
+                    continue
+            except Exception:
+                pass
+            if comp.Name2 not in mentioned:
+                unmated.append(comp.Name2)
+        items.append({
+            "check": "every_component_mated",
+            "status": "fail" if unmated else "pass",
+            "detail": f"{len(unmated)} component(s) with no detected mate" if unmated
+                      else "every component is referenced by at least one mate",
+            "components": unmated,
+        })
+
+        rows = _bom_rows_with_properties(assy, config, True, 10, mass_check_kg is not None, 1.0)
+        incomplete = []
+        for row in rows:
+            have = {k.lower() for k in row["properties"]}
+            missing = [name for name in required if name.lower() not in have]
+            if missing:
+                incomplete.append({"path": row["path"], "missing": missing})
+        items.append({
+            "check": "bom_rows_complete",
+            "status": "fail" if incomplete else "pass",
+            "detail": f"{len(incomplete)} row(s) missing required properties" if incomplete
+                      else "every BOM row has the required properties",
+            "rows": incomplete,
+        })
+
+        if mass_check_kg is not None:
+            total_mass = sum((r["mass_kg"] or 0.0) * r["quantity"] for r in rows if not r["is_assembly"])
+            error_percent = (100.0 * (total_mass - mass_check_kg) / mass_check_kg) if mass_check_kg else None
+            within = error_percent is not None and abs(error_percent) <= mass_tolerance_percent
+            items.append({
+                "check": "total_mass_within_tolerance",
+                "status": "pass" if within else "fail",
+                "detail": f"measured {total_mass:.4g} kg vs expected {mass_check_kg} kg "
+                          f"({error_percent:+.3g}%)" if error_percent is not None else "could not compute",
+            })
+
+        approved = all(item["status"] == "pass" for item in items)
+        return {
+            "assembly": _doc_title(_active_doc()),
+            "status": "approved" if approved else "not_approved",
+            "items": items,
+        }
+
+    return await _run(_impl)
+
 
 # ---------------------------------------------------------------------------
 # End cuts (v5.21.0)
