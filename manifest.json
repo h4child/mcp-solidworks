@@ -227,6 +227,10 @@
       "description": "Compare the active document's MEASURED mass (measure_body) against an"
     },
     {
+      "name": "compare_model_snapshots",
+      "description": "Diff two snapshots written by generate_model_snapshot's ``save_path``."
+    },
+    {
       "name": "connect_solidworks",
       "description": "Connect to a running SolidWorks instance, launching it if needed."
     },
@@ -383,6 +387,10 @@
       "description": "Find BOM rows whose 'PartNumber' custom property (falling back to"
     },
     {
+      "name": "detect_unused_sketches",
+      "description": "List sketches that are likely never consumed by any feature. Read-only."
+    },
+    {
       "name": "dimension_by_entity_ids",
       "description": "Dimension one or two entities by the IDs from get_view_entities, placing the text outside the view, and return the value SolidWorks actually measured, optionally asserted against an expected value."
     },
@@ -485,6 +493,10 @@
     {
       "name": "float_component",
       "description": "Float a fixed component."
+    },
+    {
+      "name": "generate_model_snapshot",
+      "description": "Capture a serializable snapshot of the active document's feature tree,"
     },
     {
       "name": "get_appearance_properties",

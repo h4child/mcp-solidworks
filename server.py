@@ -17137,6 +17137,201 @@ async def validate_model() -> dict:
 
     return await _run(_impl)
 
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def detect_unused_sketches() -> dict:
+    """List sketches that are likely never consumed by any feature. Read-only.
+
+    HEURISTIC, NOT A CONFIRMED DEPENDENCY GRAPH: SolidWorks' COM API has no
+    direct "what consumes this sketch" query, so this reports a sketch as
+    ``likely_unused`` when its feature-tree icon is still VISIBLE
+    (``IFeature::Visible``) -- SolidWorks normally hides a sketch's icon
+    automatically once a feature is built from it, so one that stayed
+    visible was probably never used, or was used and then had its visibility
+    turned back on by hand. Confirm visually (or with list_features'
+    ``error_code``) before deleting anything this reports."""
+
+    def _impl():
+        doc = _active_doc()
+        sketches = []
+        for raw_feature in doc.FeatureManager.GetFeatures(False) or ():
+            feat = win32com.client.Dispatch(raw_feature)
+            try:
+                feature_type = feat.GetTypeName2
+            except Exception:
+                continue
+            if feature_type not in ("ProfileFeature", "3DProfileFeature"):
+                continue
+            try:
+                suppressed = feat.IsSuppressed
+                suppressed = bool(suppressed() if callable(suppressed) else suppressed)
+            except Exception:
+                suppressed = None
+            try:
+                visible = feat.Visible
+                visible = bool(visible() if callable(visible) else visible)
+            except Exception:
+                visible = None
+            sketches.append({
+                "name": feat.Name, "type": feature_type,
+                "suppressed": suppressed, "visible": visible,
+                "likely_unused": bool(visible) and not suppressed,
+            })
+        likely_unused = [s for s in sketches if s["likely_unused"]]
+        return {
+            "sketch_count": len(sketches),
+            "likely_unused_count": len(likely_unused),
+            "likely_unused": likely_unused,
+            "all_sketches": sketches,
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def generate_model_snapshot(save_path: Optional[str] = None,
+                                   config: str = "") -> dict:
+    """Capture a serializable snapshot of the active document's feature tree,
+    custom properties, equations, and (where a material is assigned)
+    mass/volume/bounding box -- for later comparison with
+    compare_model_snapshots. Read-only (writes a file only if ``save_path``
+    is given).
+
+    Use this before a risky batch of edits, then again after, and diff the
+    two with compare_model_snapshots instead of eyeballing the tree."""
+
+    def _impl():
+        doc = _active_doc()
+        features = []
+        for raw_feature in doc.FeatureManager.GetFeatures(False) or ():
+            feat = win32com.client.Dispatch(raw_feature)
+            try:
+                entry = {"name": feat.Name, "type": feat.GetTypeName2}
+            except Exception:
+                continue
+            try:
+                suppressed = feat.IsSuppressed
+                entry["suppressed"] = bool(suppressed() if callable(suppressed) else suppressed)
+            except Exception:
+                entry["suppressed"] = None
+            try:
+                error_code = feat.GetErrorCode
+                entry["error_code"] = int(error_code() if callable(error_code) else error_code)
+            except Exception:
+                entry["error_code"] = None
+            features.append(entry)
+
+        try:
+            cpm = doc.Extension.CustomPropertyManager(config)
+            properties = {k: v["resolved"] for k, v in _read_custom_properties(cpm).items()}
+        except Exception:
+            properties = {}
+
+        try:
+            manager = _equation_manager(doc)
+            count_member = manager.GetCount
+            count = int(count_member() if callable(count_member) else count_member)
+            equations = [manager.Equation(i) for i in range(count)]
+        except Exception:
+            equations = None
+
+        measurement = None
+        try:
+            factor = 1.0 / UNIT_TO_METERS.get(_default_unit, 0.001)
+            measurement = _measure_model_doc(doc, factor)
+        except Exception:
+            pass
+
+        try:
+            active_config = _active_config_name(doc)
+        except Exception:
+            active_config = None
+
+        snapshot = {
+            "title": _doc_title(doc),
+            "document_type": _doc_type(doc),
+            "active_configuration": active_config,
+            "feature_count": len(features),
+            "features": features,
+            "custom_properties": properties,
+            "equations": equations,
+            "measurement": measurement,
+        }
+
+        if save_path:
+            abs_path = _resolve_write_path(save_path)
+            parent = os.path.dirname(abs_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(abs_path, "w", encoding="utf-8") as handle:
+                json.dump(snapshot, handle, indent=2, default=str)
+            snapshot["saved_to"] = abs_path
+
+        return snapshot
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def compare_model_snapshots(snapshot_a_path: str, snapshot_b_path: str,
+                                   mass_tolerance_percent: float = 1.0) -> dict:
+    """Diff two snapshots written by generate_model_snapshot's ``save_path``.
+    Read-only, pure data comparison -- touches no SolidWorks document.
+
+    Reports features added/removed, features whose suppressed/error_code
+    changed, custom properties that changed, and whether mass moved by more
+    than ``mass_tolerance_percent`` -- the same per-item checks a human would
+    do scrolling through two FeatureManager trees side by side."""
+
+    def _impl():
+        with open(snapshot_a_path, encoding="utf-8") as handle:
+            a = json.load(handle)
+        with open(snapshot_b_path, encoding="utf-8") as handle:
+            b = json.load(handle)
+
+        features_a = {f["name"]: f for f in a.get("features", [])}
+        features_b = {f["name"]: f for f in b.get("features", [])}
+        added = sorted(set(features_b) - set(features_a))
+        removed = sorted(set(features_a) - set(features_b))
+        changed = []
+        for name in sorted(set(features_a) & set(features_b)):
+            fa, fb = features_a[name], features_b[name]
+            diffs = {k: [fa.get(k), fb.get(k)] for k in ("suppressed", "error_code", "type")
+                     if fa.get(k) != fb.get(k)}
+            if diffs:
+                changed.append({"name": name, "changed_fields": diffs})
+
+        props_a = a.get("custom_properties") or {}
+        props_b = b.get("custom_properties") or {}
+        property_diff = {
+            k: [props_a.get(k), props_b.get(k)]
+            for k in sorted(set(props_a) | set(props_b))
+            if props_a.get(k) != props_b.get(k)
+        }
+
+        mass_a = (a.get("measurement") or {}).get("mass_kg")
+        mass_b = (b.get("measurement") or {}).get("mass_kg")
+        mass_comparison = None
+        if mass_a is not None and mass_b is not None:
+            error_percent = (100.0 * (mass_b - mass_a) / mass_a) if mass_a else None
+            mass_comparison = {
+                "mass_a_kg": mass_a, "mass_b_kg": mass_b,
+                "error_percent": round(error_percent, 4) if error_percent is not None else None,
+                "within_tolerance": (
+                    error_percent is not None and abs(error_percent) <= mass_tolerance_percent),
+            }
+
+        return {
+            "snapshot_a": {"path": snapshot_a_path, "title": a.get("title")},
+            "snapshot_b": {"path": snapshot_b_path, "title": b.get("title")},
+            "features_added": added, "features_removed": removed,
+            "features_changed": changed,
+            "custom_properties_changed": property_diff,
+            "mass_comparison": mass_comparison,
+            "identical": not (added or removed or changed or property_diff),
+        }
+
+    return await _run(_impl)
+
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def get_document_dependencies(
