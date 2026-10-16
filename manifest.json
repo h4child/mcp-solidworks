@@ -67,6 +67,10 @@
       "description": "Add and evaluate a SolidWorks equation or global variable."
     },
     {
+      "name": "add_exploded_step",
+      "description": "Add ONE explode step moving a single named component, to an exploded"
+    },
+    {
       "name": "add_gdt_symbol",
       "description": "Add a geometric tolerance (GD&T) feature control frame to a drawing."
     },
@@ -187,8 +191,16 @@
       "description": "Exit the active sketch."
     },
     {
+      "name": "collapse_exploded_view",
+      "description": "Collapse (un-explode) the active assembly's exploded view back to its"
+    },
+    {
       "name": "combine_bodies",
       "description": "Boolean combine bodies (add/union, subtract, common/intersection)."
+    },
+    {
+      "name": "compare_bom_configurations",
+      "description": "Compare two assembly configurations' TOP-LEVEL part lists: which parts"
     },
     {
       "name": "connect_solidworks",
@@ -337,6 +349,10 @@
     {
       "name": "detect_components_without_mates",
       "description": "List top-level assembly components that no mate references. Read-only."
+    },
+    {
+      "name": "detect_duplicate_bom_items",
+      "description": "Find BOM rows whose 'PartNumber' custom property (falling back to"
     },
     {
       "name": "dimension_by_entity_ids",
@@ -697,6 +713,10 @@
     {
       "name": "set_appearance_properties",
       "description": "Set native SolidWorks RGB, reflection, transparency, and emission appearance channels."
+    },
+    {
+      "name": "set_component_suppression_by_configuration",
+      "description": "Suppress or unsuppress a component, but only in ONE named configuration"
     },
     {
       "name": "set_component_transform",

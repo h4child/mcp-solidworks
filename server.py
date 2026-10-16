@@ -11962,6 +11962,318 @@ async def create_exploded_view(
 
     return await _run(_impl)
 
+def _active_config_name(doc) -> str:
+    active = doc.ConfigurationManager.ActiveConfiguration
+    name = active.Name
+    return name() if callable(name) else name
+
+
+def _exploded_view_names(assy) -> list:
+    names = assy.GetExplodedViewNames
+    if callable(names):
+        names = names()
+    if isinstance(names, str):
+        return [names] if names else []
+    return list(names or ())
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def add_exploded_step(component_name: str, distance: float = 100,
+                             direction: str = "y", explode_view: str = "",
+                             unit: Optional[str] = None) -> dict:
+    """Add ONE explode step moving a single named component, to an exploded
+    view that already exists (create one first with create_exploded_view,
+    which builds a whole view in one call -- this is for refining it
+    afterward, e.g. pulling one more part out along a different axis).
+
+    component_name: the component to move in this step (as list_components
+    reports it). distance: how far to move it, along ``direction`` ('x',
+    'y', or 'z'). explode_view: name of the exploded view to add to; empty
+    uses the assembly's only/most recent one."""
+
+    def _impl():
+        assy = _active_assembly()
+        axis = direction.lower()
+        if axis not in ("x", "y", "z"):
+            raise ValueError(f"direction must be 'x', 'y', or 'z', got '{direction}'.")
+        if distance <= 0:
+            raise ValueError(f"distance must be positive, got {distance}.")
+        dist_m = to_meters(distance, unit)
+        dir_index = {"x": 0, "y": 1, "z": 2}[axis]
+
+        views = _exploded_view_names(assy)
+        if not views:
+            raise RuntimeError(
+                "No exploded view exists in this configuration. Call "
+                "create_exploded_view first."
+            )
+        target_view = explode_view or views[-1]
+        if target_view not in views:
+            raise RuntimeError(
+                f"Exploded view '{explode_view}' not found. Available: "
+                f"{', '.join(views)}."
+            )
+        if not assy.ShowExploded2(True, target_view):
+            raise RuntimeError(f"Could not activate exploded view '{target_view}'.")
+
+        configuration = win32com.client.Dispatch(
+            assy.ConfigurationManager.ActiveConfiguration,
+            "IConfiguration",
+            "{83A33D98-27C5-11CE-BFD4-00400513BB57}",
+        )
+        _select_component(assy, component_name)
+        result = configuration.AddExplodeStep2(
+            dist_m, dir_index, False, 0.0, 0, False, False, False)
+        step, outputs = _split_com_result(result)
+        error_code = int(outputs[0]) if outputs else 0
+        if step is None or error_code != 0:
+            raise RuntimeError(
+                f"Could not add an explode step for '{component_name}' "
+                f"(error {error_code})."
+            )
+        assy.EditRebuild3()
+        return {
+            "exploded_view": target_view, "component": component_name,
+            "distance": distance, "direction": direction, "unit": unit or _default_unit,
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+async def collapse_exploded_view(explode_view: str = "") -> dict:
+    """Collapse (un-explode) the active assembly's exploded view back to its
+    normal assembled state, without deleting the explode steps -- they can be
+    shown again with the same view name.
+
+    explode_view: name of the view to collapse; empty uses the assembly's
+    only/most recent one."""
+
+    def _impl():
+        assy = _active_assembly()
+        views = _exploded_view_names(assy)
+        if not views:
+            return {"collapsed": False, "message": "No exploded view exists."}
+        target_view = explode_view or views[-1]
+        if target_view not in views:
+            raise RuntimeError(
+                f"Exploded view '{explode_view}' not found. Available: "
+                f"{', '.join(views)}."
+            )
+        if not assy.ShowExploded2(False, target_view):
+            raise RuntimeError(f"Could not collapse exploded view '{target_view}'.")
+        return {"collapsed": True, "exploded_view": target_view}
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+async def set_component_suppression_by_configuration(
+    component_name: str, configuration: str, suppressed: bool = True,
+) -> dict:
+    """Suppress or unsuppress a component, but only in ONE named configuration
+    -- distinct from suppress_component/unsuppress_component, which act on
+    whichever configuration is currently active, leaving it on the caller to
+    remember to switch first and switch back.
+
+    Switches to ``configuration``, applies the suppression state, then
+    restores whichever configuration was active before this call -- so the
+    document is left exactly as it was found, only this one configuration's
+    stored suppression state differs."""
+
+    def _impl():
+        assy = _active_assembly()
+        original_config = _active_config_name(assy)
+
+        available = list(assy.GetConfigurationNames or ())
+        target_config = configuration
+        for cfg in available:
+            if cfg.lower() == configuration.lower():
+                target_config = cfg
+                break
+        if target_config.lower() not in [c.lower() for c in available]:
+            raise RuntimeError(
+                f"Configuration '{configuration}' not found. Available: "
+                f"{', '.join(available)}."
+            )
+
+        assy.ShowConfiguration2(target_config)
+        try:
+            component = _find_component(assy, component_name)
+            if component is None:
+                raise RuntimeError(
+                    f"Component '{component_name}' not found in configuration "
+                    f"'{target_config}'."
+                )
+            status = component.SetSuppression2(0 if suppressed else 2)
+            if status not in (2, None):
+                raise RuntimeError(
+                    f"Failed to set suppression for '{component_name}' in "
+                    f"configuration '{target_config}' (status {status})."
+                )
+            applied_state = bool(component.IsSuppressed)
+        finally:
+            assy.ShowConfiguration2(original_config)
+
+        return {
+            "component": component_name, "configuration": target_config,
+            "suppressed": applied_state, "restored_to_configuration": original_config,
+        }
+
+    return await _run(_impl)
+
+
+def _config_component_rows(assy) -> dict:
+    """{(path, referenced_configuration): quantity} for the active configuration."""
+    rows: dict = {}
+    for raw in assy.GetComponents(True) or ():
+        comp = win32com.client.Dispatch(raw)
+        try:
+            if bool(comp.IsSuppressed):
+                continue
+        except Exception:
+            pass
+        try:
+            path = comp.GetPathName or comp.Name2
+        except Exception:
+            path = comp.Name2
+        try:
+            ref_config = str(_com_member(comp, "ReferencedConfiguration") or "")
+        except Exception:
+            ref_config = ""
+        key = (path, ref_config)
+        rows[key] = rows.get(key, 0) + 1
+    return rows
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def compare_bom_configurations(configuration_a: str, configuration_b: str) -> dict:
+    """Compare two assembly configurations' TOP-LEVEL part lists: which parts
+    appear in one but not the other, and whether the quantity of a shared
+    part differs. Read-only (switches configuration internally, then
+    restores the one active before this call).
+
+    This is a lighter, structural comparison (file + referenced
+    configuration + instance count) -- not a full property/mass diff. For
+    that, call extract_assembly_bom once per configuration (via
+    switch_configuration) and diff the results yourself."""
+
+    def _impl():
+        assy = _active_assembly()
+        original_config = _active_config_name(assy)
+        available = list(assy.GetConfigurationNames or ())
+        lower_map = {c.lower(): c for c in available}
+        for label, requested in (("configuration_a", configuration_a),
+                                 ("configuration_b", configuration_b)):
+            if requested.lower() not in lower_map:
+                raise RuntimeError(
+                    f"{label}='{requested}' not found. Available: "
+                    f"{', '.join(available)}."
+                )
+
+        try:
+            assy.ShowConfiguration2(lower_map[configuration_a.lower()])
+            rows_a = _config_component_rows(assy)
+            assy.ShowConfiguration2(lower_map[configuration_b.lower()])
+            rows_b = _config_component_rows(assy)
+        finally:
+            assy.ShowConfiguration2(original_config)
+
+        only_in_a, only_in_b, quantity_changed = [], [], []
+        for key in sorted(set(rows_a) | set(rows_b)):
+            path, ref_config = key
+            qty_a, qty_b = rows_a.get(key, 0), rows_b.get(key, 0)
+            if qty_a and not qty_b:
+                only_in_a.append({"path": path, "configuration": ref_config or None, "quantity": qty_a})
+            elif qty_b and not qty_a:
+                only_in_b.append({"path": path, "configuration": ref_config or None, "quantity": qty_b})
+            elif qty_a != qty_b:
+                quantity_changed.append({
+                    "path": path, "configuration": ref_config or None,
+                    "quantity_in_a": qty_a, "quantity_in_b": qty_b,
+                })
+
+        return {
+            "configuration_a": configuration_a, "configuration_b": configuration_b,
+            "restored_to_configuration": original_config,
+            "identical": not (only_in_a or only_in_b or quantity_changed),
+            "only_in_a": only_in_a, "only_in_b": only_in_b,
+            "quantity_changed": quantity_changed,
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def detect_duplicate_bom_items(max_depth: int = 10) -> dict:
+    """Find BOM rows whose 'PartNumber' custom property (falling back to
+    'Description') is the same text, but whose underlying FILE is different.
+    Read-only.
+
+    This catches the real BOM problem -- the same catalog part modeled twice
+    as separate files, which inflates a cut list and risks ordering/making
+    the part twice -- as opposed to two instances of the SAME file, which is
+    just normal quantity > 1 and not reported here.
+
+    Rows whose custom properties could not be read at all are listed under
+    ``unreadable`` rather than silently left out of the duplicate check."""
+
+    def _impl():
+        assy = _active_assembly()
+        tree: list = []
+        visited: set = set()
+        for raw in assy.GetComponents(True) or ():
+            try:
+                comp = win32com.client.Dispatch(raw)
+            except Exception:
+                continue
+            _walk_assembly(comp, 0, None, tree, max_depth, visited)
+
+        by_key: dict = {}
+        unreadable = []
+        seen_paths = set()
+        for node in tree:
+            comp = node.pop("component")
+            if node["excluded_from_bom"] or node["is_assembly"]:
+                continue
+            path = node["path"] or node["name"]
+            if path in seen_paths:
+                continue  # already read this file once
+            seen_paths.add(path)
+            model_doc = _component_model_doc(comp)
+            if model_doc is None:
+                unreadable.append({"path": path, "reason": "component document not loaded"})
+                continue
+            try:
+                cpm = model_doc.Extension.CustomPropertyManager("")
+                props = _read_custom_properties(cpm)
+            except Exception as exc:
+                unreadable.append({"path": path, "reason": str(exc)})
+                continue
+            key_value = None
+            for candidate_key in ("PartNumber", "Part Number", "Número de peça", "Description"):
+                match = next((v for k, v in props.items() if k.lower() == candidate_key.lower()), None)
+                if match and match.get("resolved"):
+                    key_value = match["resolved"]
+                    break
+            if not key_value:
+                continue
+            by_key.setdefault(key_value, set()).add(path)
+
+        duplicates = [
+            {"identifier": key, "files": sorted(paths)}
+            for key, paths in by_key.items() if len(paths) > 1
+        ]
+        return {
+            "assembly": _doc_title(_active_doc()),
+            "distinct_files_checked": len(seen_paths),
+            "duplicate_count": len(duplicates),
+            "duplicates": duplicates,
+            "unreadable": unreadable,
+        }
+
+    return await _run(_impl)
+
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False))
 async def delete_mate(name: str) -> dict:
