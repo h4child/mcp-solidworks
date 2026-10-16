@@ -3220,6 +3220,210 @@ async def extract_assembly_bom(config: str = "",
 
     return await _run(_impl)
 
+def _bom_rows_with_properties(assy, config: str, include_subassemblies: bool,
+                               max_depth: int, measure: bool, factor: float) -> list:
+    """One row per distinct (file, referenced configuration), with custom
+    properties and, optionally, mass -- the shared traversal behind
+    export_bom_to_csv, validate_bom_completeness and create_fastener_list.
+
+    Deliberately lighter than extract_assembly_bom's full tree (which this
+    does not replace: use that when the caller needs the per-instance tree
+    and bounding boxes too). Suppressed and excluded-from-BOM components are
+    always left out, matching extract_assembly_bom's defaults."""
+    tree: list = []
+    visited: set = set()
+    for raw in assy.GetComponents(True) or ():
+        try:
+            comp = win32com.client.Dispatch(raw)
+        except Exception:
+            continue
+        _walk_assembly(comp, 0, None, tree, max_depth, visited)
+
+    rows: dict = {}
+    order: list = []
+    for node in tree:
+        comp = node.pop("component")
+        if node["excluded_from_bom"] or node["suppressed"]:
+            continue
+        if node["is_assembly"] and not include_subassemblies:
+            continue
+        key = (node["path"] or node["name"], node["configuration"] or "")
+        if key in rows:
+            rows[key]["quantity"] += 1
+            continue
+        entry = {
+            "path": node["path"], "configuration": node["configuration"],
+            "name": node["name"], "is_assembly": node["is_assembly"],
+            "quantity": 1, "properties": {}, "mass_kg": None,
+        }
+        model_doc = _component_model_doc(comp)
+        if model_doc is not None:
+            try:
+                cpm = model_doc.Extension.CustomPropertyManager(config)
+                entry["properties"] = {
+                    k: v["resolved"] for k, v in _read_custom_properties(cpm).items()
+                }
+            except Exception:
+                pass
+            if not node["is_assembly"] and not any(
+                k.lower() == "material" for k in entry["properties"]
+            ):
+                native = _native_material_name(model_doc, config)
+                if native:
+                    entry["properties"]["Material"] = native
+            if measure and not node["is_assembly"]:
+                try:
+                    entry["mass_kg"] = _measure_model_doc(model_doc, factor).get("mass_kg")
+                except Exception:
+                    entry["mass_kg"] = None
+        rows[key] = entry
+        order.append(key)
+    return [rows[k] for k in order]
+
+
+_FASTENER_KEYWORDS = (
+    "parafuso", "porca", "arruela", "anel elastico", "anel elástico",
+    "pino", "chaveta", "rolamento", "retentor", "bucha",
+    "screw", "bolt", "nut", "washer", "pin", "key", "bearing", "retaining ring",
+    "circlip", "rivet", "rebite",
+)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False))
+async def export_bom_to_csv(filepath: str, config: str = "",
+                             include_subassemblies: bool = False,
+                             overwrite: bool = True, max_depth: int = 10) -> dict:
+    """Export the active assembly's BOM straight to a CSV file -- no drawing
+    or BOM table required (insert_bom_table only works inside a .slddrw).
+
+    Columns: Path, Configuration, Quantity, PartNumber, Description,
+    Material, MassKg (MassKg is blank where no material is assigned).
+    include_subassemblies: list subassemblies as their own rows too, same
+    meaning as in extract_assembly_bom.
+    overwrite: False raises instead of replacing an existing file at
+    ``filepath`` (R15 protection -- the audit flagged export_document's lack
+    of this as a real risk of silently discarding a prior export)."""
+
+    def _impl():
+        abs_path = _resolve_write_path(filepath)
+        if os.path.exists(abs_path) and not overwrite:
+            raise FileExistsError(
+                f"'{abs_path}' already exists and overwrite=False. Pass "
+                f"overwrite=True to replace it, or choose a different path."
+            )
+        assy = _active_assembly()
+        factor = 1.0 / UNIT_TO_METERS.get(_default_unit, 0.001)
+        rows = _bom_rows_with_properties(assy, config, include_subassemblies, max_depth, True, factor)
+
+        import csv as _csv
+        parent = os.path.dirname(abs_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(abs_path, "w", newline="", encoding="utf-8") as handle:
+            writer = _csv.writer(handle)
+            writer.writerow(["Path", "Configuration", "Quantity", "PartNumber",
+                              "Description", "Material", "MassKg"])
+            for row in rows:
+                props = row["properties"]
+                part_number = next((v for k, v in props.items()
+                                    if k.lower() in ("partnumber", "part number", "número de peça")), "")
+                description = next((v for k, v in props.items() if k.lower() == "description"), "")
+                material = next((v for k, v in props.items() if k.lower() == "material"), "")
+                writer.writerow([
+                    row["path"], row["configuration"] or "", row["quantity"],
+                    part_number, description, material,
+                    "" if row["mass_kg"] is None else round(row["mass_kg"], 6),
+                ])
+        if not os.path.exists(abs_path):
+            raise RuntimeError(f"CSV export reported success but '{abs_path}' does not exist.")
+        return {
+            "path": abs_path, "row_count": len(rows),
+            "size_bytes": os.path.getsize(abs_path),
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def validate_bom_completeness(config: str = "", required_properties: Optional[str] = None,
+                                     max_depth: int = 10) -> dict:
+    """Check every counted BOM row for missing required custom properties.
+    Read-only.
+
+    required_properties: comma-separated property names to require (case-
+    insensitive); default "PartNumber,Description,Material" -- the minimum a
+    purchasing/fabrication BOM needs per row. A row missing any of them is
+    listed in ``incomplete_rows`` with exactly which ones are missing."""
+
+    def _impl():
+        required = [p.strip() for p in
+                    (required_properties or "PartNumber,Description,Material").split(",")
+                    if p.strip()]
+        if not required:
+            raise ValueError("required_properties must name at least one property.")
+        assy = _active_assembly()
+        rows = _bom_rows_with_properties(assy, config, True, max_depth, False, 1.0)
+
+        incomplete = []
+        for row in rows:
+            have = {k.lower() for k in row["properties"]}
+            missing = [name for name in required if name.lower() not in have]
+            if missing:
+                incomplete.append({
+                    "path": row["path"], "configuration": row["configuration"],
+                    "missing": missing,
+                })
+        return {
+            "assembly": _doc_title(_active_doc()),
+            "row_count": len(rows),
+            "required_properties": required,
+            "incomplete_row_count": len(incomplete),
+            "incomplete_rows": incomplete,
+            "complete": not incomplete,
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def create_fastener_list(config: str = "", max_depth: int = 10) -> dict:
+    """List BOM rows that LOOK like standard fasteners/bearings/retaining
+    elements -- screws, nuts, washers, pins, keys, bearings, seals, circlips,
+    rivets -- by matching their PartNumber/Description/file name against a
+    fixed keyword list. Read-only.
+
+    THIS IS A HEURISTIC, NOT AN AUTHORITATIVE CLASSIFICATION: a fastener
+    whose description does not contain one of the matched words (in
+    Portuguese or English) is NOT listed here, and a custom part whose name
+    happens to contain one of these words IS. Use it as a starting point for
+    a purchasing list, not as the final one -- cross-check against
+    .claude/knowledge/elementos_de_maquina.md and the actual BOM."""
+
+    def _impl():
+        assy = _active_assembly()
+        rows = _bom_rows_with_properties(assy, config, False, max_depth, False, 1.0)
+
+        fasteners = []
+        for row in rows:
+            haystack = " ".join([
+                row["name"] or "", row["path"] or "",
+                *[str(v) for v in row["properties"].values()],
+            ]).lower()
+            matched = [kw for kw in _FASTENER_KEYWORDS if kw in haystack]
+            if matched:
+                fasteners.append({
+                    "path": row["path"], "quantity": row["quantity"],
+                    "properties": row["properties"], "matched_keywords": matched,
+                })
+        return {
+            "assembly": _doc_title(_active_doc()),
+            "fastener_row_count": len(fasteners),
+            "fasteners": fasteners,
+            "total_rows_scanned": len(rows),
+        }
+
+    return await _run(_impl)
+
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def get_component_transform(name: str, unit: Optional[str] = None) -> dict:

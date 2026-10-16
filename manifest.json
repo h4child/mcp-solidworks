@@ -267,6 +267,10 @@
       "description": "Create an exploded (blown-apart) view of the active assembly."
     },
     {
+      "name": "create_fastener_list",
+      "description": "List BOM rows that LOOK like standard fasteners/bearings/retaining"
+    },
+    {
       "name": "create_gear",
       "description": "Create an external spur gear with involute teeth. Kept for callers bound to this name; builds the gear through create_spur_gear, which is the tool to use directly."
     },
@@ -433,6 +437,10 @@
     {
       "name": "execute_python",
       "description": "Run privileged local Python with sw/doc in scope; disabled unless SOLIDWORKS_MCP_ENABLE_EXECUTE_PYTHON=1."
+    },
+    {
+      "name": "export_bom_to_csv",
+      "description": "Export the active assembly's BOM straight to a CSV file -- no drawing"
     },
     {
       "name": "export_document",
@@ -821,6 +829,10 @@
     {
       "name": "unsuppress_component",
       "description": "Unsuppress a previously suppressed component."
+    },
+    {
+      "name": "validate_bom_completeness",
+      "description": "Check every counted BOM row for missing required custom properties."
     },
     {
       "name": "validate_model",
