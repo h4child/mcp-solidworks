@@ -13730,6 +13730,132 @@ async def bulk_set_custom_properties(properties: dict, config: str = "") -> dict
 
     return await _run(_impl)
 
+def _cylindrical_face_at(doc, x_m: float, y_m: float, z_m: float, append: bool, label: str):
+    """(origin, direction, radius) of the cylindrical face at a model point.
+
+    Shared by verify_bearing_fit and verify_bolt_hole_fit; check_axis_alignment
+    keeps its own inline copy (written and live-tested before this helper
+    existed) rather than being refactored onto it."""
+    empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+    if not doc.Extension.SelectByID2("", "FACE", x_m, y_m, z_m, append, 0, empty, 0):
+        raise RuntimeError(f"No face found at {label} ({x_m}, {y_m}, {z_m}) in meters.")
+    selected = doc.SelectionManager.GetSelectedObject6(
+        doc.SelectionManager.GetSelectedObjectCount2(-1), -1)
+    face = win32com.client.Dispatch(selected)
+    surface = win32com.client.Dispatch(face.GetSurface)
+    if not _com_member(surface, "IsCylinder"):
+        raise RuntimeError(f"The face at {label} is not cylindrical.")
+    params = tuple(_com_member(surface, "CylinderParams"))
+    if len(params) < 7:
+        raise RuntimeError(f"Could not read cylinder parameters at {label}.")
+    return params[0:3], params[3:6], params[6]
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def verify_bearing_fit(shaft_x: float, shaft_y: float, shaft_z: float,
+                              bore_x: float, bore_y: float, bore_z: float,
+                              unit: Optional[str] = None) -> dict:
+    """Check a shaft/bearing-bore pair: diametral clearance (or interference)
+    and axis alignment, each picked by a point on its cylindrical face.
+    Read-only.
+
+    shaft_x/y/z: point on the shaft (or bearing inner-ring bore) face.
+    bore_x/y/z: point on the mating bore (housing or bearing outer ring).
+
+    Reports ``diametral_clearance`` (bore diameter minus shaft diameter --
+    negative means interference, which is correct for a press fit and wrong
+    for a sliding one) and the axis angle/offset (see check_axis_alignment).
+    This tool does NOT know which ISO fit class (H7/g6, etc.) applies --
+    compare the reported clearance against
+    .claude/knowledge/tolerancias_e_ajustes.md yourself."""
+
+    def _impl():
+        doc = _active_doc()
+        active_unit, factor = _unit_factor(unit)
+        sx, sy, sz = to_meters(shaft_x, unit), to_meters(shaft_y, unit), to_meters(shaft_z, unit)
+        bx, by, bz = to_meters(bore_x, unit), to_meters(bore_y, unit), to_meters(bore_z, unit)
+
+        doc.ClearSelection2(True)
+        shaft_origin, shaft_dir, shaft_radius = _cylindrical_face_at(doc, sx, sy, sz, False, "shaft")
+        bore_origin, bore_dir, bore_radius = _cylindrical_face_at(doc, bx, by, bz, False, "bore")
+        doc.ClearSelection2(True)
+
+        angle = _angle_between_degrees(shaft_dir, bore_dir)
+        cross = (
+            shaft_dir[1] * bore_dir[2] - shaft_dir[2] * bore_dir[1],
+            shaft_dir[2] * bore_dir[0] - shaft_dir[0] * bore_dir[2],
+            shaft_dir[0] * bore_dir[1] - shaft_dir[1] * bore_dir[0],
+        )
+        cross_norm = math.sqrt(sum(c * c for c in cross))
+        delta = tuple(bore_origin[i] - shaft_origin[i] for i in range(3))
+        if cross_norm > 1e-9:
+            axis_offset = abs(sum(delta[i] * cross[i] for i in range(3))) / cross_norm
+        else:
+            along = sum(delta[i] * shaft_dir[i] for i in range(3))
+            perp = tuple(delta[i] - along * shaft_dir[i] for i in range(3))
+            axis_offset = math.sqrt(sum(p * p for p in perp))
+
+        diametral_clearance = 2.0 * (bore_radius - shaft_radius) * factor
+        return {
+            "unit": active_unit,
+            "shaft_diameter": round(2.0 * shaft_radius * factor, 6),
+            "bore_diameter": round(2.0 * bore_radius * factor, 6),
+            "diametral_clearance": round(diametral_clearance, 6),
+            "fit": "interference" if diametral_clearance < 0 else "clearance",
+            "axis_angle_degrees": angle,
+            "axis_offset": round(axis_offset * factor, 6),
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def verify_bolt_hole_fit(bolt_x: float, bolt_y: float, bolt_z: float,
+                                hole_x: float, hole_y: float, hole_z: float,
+                                nominal_diameter: Optional[float] = None,
+                                unit: Optional[str] = None) -> dict:
+    """Check a bolt/hole pair: measured diametral clearance between a bolt's
+    (or pin's) cylindrical surface and the hole it passes through, each
+    picked by a point on its face. Read-only.
+
+    nominal_diameter: the bolt's nominal size (e.g. 8 for M8), if known --
+    compared against the MEASURED bolt diameter to catch a bolt modeled at
+    the wrong size before it ever reaches a drawing.
+
+    Does not by itself say whether the clearance is correct for the
+    intended fit class -- see .claude/knowledge/elementos_de_maquina.md and
+    .claude/knowledge/tolerancias_e_ajustes.md."""
+
+    def _impl():
+        doc = _active_doc()
+        active_unit, factor = _unit_factor(unit)
+        bx, by, bz = to_meters(bolt_x, unit), to_meters(bolt_y, unit), to_meters(bolt_z, unit)
+        hx, hy, hz = to_meters(hole_x, unit), to_meters(hole_y, unit), to_meters(hole_z, unit)
+
+        doc.ClearSelection2(True)
+        _, _, bolt_radius = _cylindrical_face_at(doc, bx, by, bz, False, "bolt")
+        _, _, hole_radius = _cylindrical_face_at(doc, hx, hy, hz, False, "hole")
+        doc.ClearSelection2(True)
+
+        bolt_diameter = round(2.0 * bolt_radius * factor, 6)
+        hole_diameter = round(2.0 * hole_radius * factor, 6)
+        result = {
+            "unit": active_unit,
+            "bolt_diameter": bolt_diameter,
+            "hole_diameter": hole_diameter,
+            "diametral_clearance": round(hole_diameter - bolt_diameter, 6),
+            "fits_through": hole_diameter >= bolt_diameter,
+        }
+        if nominal_diameter is not None:
+            error = bolt_diameter - nominal_diameter
+            result["nominal_diameter"] = nominal_diameter
+            result["bolt_diameter_error"] = round(error, 6)
+            tolerance_in_unit = 0.1 * (UNIT_TO_METERS["mm"] / UNIT_TO_METERS[active_unit])
+            result["bolt_matches_nominal"] = abs(error) <= tolerance_in_unit
+        return result
+
+    return await _run(_impl)
+
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def create_assembly_pattern(

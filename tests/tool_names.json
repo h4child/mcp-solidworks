@@ -202,6 +202,8 @@
   "validate_bom_completeness",
   "validate_model",
   "verify_assembly_positions",
+  "verify_bearing_fit",
+  "verify_bolt_hole_fit",
   "verify_drawing",
   "zoom_to_area",
   "zoom_to_fit"

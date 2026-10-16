@@ -843,6 +843,14 @@
       "description": "Verify where every assembly component actually is: real positions, plus unconstrained, origin-stuck, stacked, over-constrained and wrongly-fixed moving components."
     },
     {
+      "name": "verify_bearing_fit",
+      "description": "Check a shaft/bearing-bore pair: diametral clearance (or interference)"
+    },
+    {
+      "name": "verify_bolt_hole_fit",
+      "description": "Check a bolt/hole pair: measured diametral clearance between a bolt's"
+    },
+    {
       "name": "verify_drawing",
       "description": "Check the active drawing for overlapping views, views off the sheet or over the title block, non-normalised scales, missing hole and overall dimensions, duplicates, badly placed dimension text and dangling dimensions. Read-only."
     },
