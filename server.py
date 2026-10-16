@@ -12115,6 +12115,317 @@ async def add_advanced_mate(
 
     return await _run(_impl)
 
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def replace_component(name: str, filepath: str, configuration: str = "") -> dict:
+    """Replace one assembly component with a different file, preserving the
+    mates that reference it where their geometry still resolves.
+
+    name: the component instance to replace (as list_components reports it).
+    filepath: the new part/assembly file to substitute in.
+    configuration: configuration of the new file to reference; empty uses its
+    default/active configuration.
+
+    THE MATES ARE NOT RE-VERIFIED HERE: SolidWorks attempts to re-map each
+    existing mate's entities onto the new component's geometry by name/
+    position, and any that cannot resolve becomes a dangling/failed mate
+    without raising an error from this call. Always follow this with
+    list_mates and rebuild_model/validate_model, not just a visual check.
+
+    NEEDS LIVE VERIFICATION: uses ``IAssemblyDoc::ReplaceComponents2`` with a
+    best-effort argument order -- see NOVAS_ACOES_IMPLEMENTADAS.md."""
+
+    def _impl():
+        if not os.path.isfile(filepath):
+            raise FileNotFoundError(f"Replacement file not found: {filepath}")
+        assy = _active_assembly()
+        component = _find_component(assy, name)
+        if component is None:
+            raise RuntimeError(f"Component '{name}' not found in the assembly.")
+        _select_component(assy, name)
+
+        # ReplaceComponents2(FileName, ConfName, UseConfName, PreserveMoveAndRename,
+        #   UseMatchedComponentReplace) -- reconstructed from the SolidWorks API's
+        # documented intent for this command; not confirmed live in this session.
+        try:
+            result = assy.ReplaceComponents2(filepath, configuration or "",
+                                              bool(configuration), True, True)
+        except Exception as exc:
+            raise RuntimeError(f"ReplaceComponents2 failed: {exc}") from exc
+        if not result:
+            raise RuntimeError(
+                f"SolidWorks refused to replace '{name}' with '{filepath}'. The "
+                f"new file may not expose the same mate-reference geometry."
+            )
+        assy.EditRebuild3()
+        still_present = _find_component(assy, name) is not None
+        return {
+            "replaced": name, "new_file": filepath, "configuration": configuration or None,
+            "warnings": [
+                "mates referencing this component were NOT independently re-verified; "
+                "call list_mates and validate_model next"],
+            "original_name_still_in_tree": still_present,
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def count_component_instances(unit: Optional[str] = None) -> dict:
+    """Count assembly component instances grouped by source file and
+    referenced configuration. Read-only.
+
+    Distinct from list_components (every instance individually) and
+    extract_assembly_bom (a full BOM with mass/custom properties): this is
+    the cheap version for a quick "how many distinct parts, how many of
+    each" answer without walking the whole tree's properties."""
+
+    def _impl():
+        assy = _active_assembly()
+        groups: dict = {}
+        total = 0
+        for raw in assy.GetComponents(True) or ():
+            comp = win32com.client.Dispatch(raw)
+            total += 1
+            try:
+                path = comp.GetPathName or "(virtual/in-context)"
+            except Exception:
+                path = "(unknown)"
+            try:
+                config = str(_com_member(comp, "ReferencedConfiguration") or "")
+            except Exception:
+                config = ""
+            key = (path, config)
+            entry = groups.setdefault(key, {
+                "path": path, "configuration": config or None, "count": 0, "names": [],
+            })
+            entry["count"] += 1
+            entry["names"].append(comp.Name2)
+
+        rows = sorted(groups.values(), key=lambda r: r["path"] or "")
+        return {
+            "assembly": _doc_title(_active_doc()),
+            "total_instances": total,
+            "unique_file_configuration_pairs": len(rows),
+            "rows": rows,
+        }
+
+    return await _run(_impl)
+
+
+def _mate_entity_components(feat):
+    """Best-effort: the IComponent2 objects a mate feature's entities reference.
+
+    Walks GetSpecificFeature2 -> IMateFeatureData -> Mates(i) -> MateEntities(j)
+    -> ReferenceComponent. Any step that is unavailable on this SolidWorks
+    build is swallowed and simply yields nothing for that mate -- this is a
+    best-effort reconstruction, not a confirmed API path (flagged in
+    detect_components_without_mates and NOVAS_ACOES_IMPLEMENTADAS.md)."""
+    names = set()
+    try:
+        mate_data = win32com.client.Dispatch(_com_member(feat, "GetSpecificFeature2"))
+    except Exception:
+        return names
+    mates = None
+    for attr in ("Mates",):
+        try:
+            mates = _com_member(mate_data, attr)
+            break
+        except Exception:
+            continue
+    candidates = [mate_data] if mates is None else list(mates or ())
+    for candidate in candidates:
+        try:
+            mate2 = win32com.client.Dispatch(candidate)
+        except Exception:
+            mate2 = candidate
+        try:
+            entities = _com_member(mate2, "MateEntities") or ()
+        except Exception:
+            entities = ()
+        for raw_entity in entities:
+            try:
+                entity = win32com.client.Dispatch(raw_entity)
+                ref_component = win32com.client.Dispatch(
+                    _com_member(entity, "ReferenceComponent"))
+                names.add(str(ref_component.Name2))
+            except Exception:
+                continue
+    return names
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def detect_components_without_mates() -> dict:
+    """List top-level assembly components that no mate references. Read-only.
+
+    A component with no mate at all is either the one deliberately fixed
+    base part (expected -- excluded automatically when it is both fixed AND
+    unreferenced), or something the user forgot to constrain, which will
+    drift the moment anything else in the assembly moves.
+
+    BEST-EFFORT: identifying which components a mate touches walks
+    GetSpecificFeature2 -> Mates -> MateEntities -> ReferenceComponent, a
+    COM path reconstructed from the SolidWorks object model rather than
+    confirmed live -- see NOVAS_ACOES_IMPLEMENTADAS.md. ``coverage_unknown``
+    lists any mate this could not read, so a clean result is not mistaken
+    for a confirmed one if some mates were unreadable."""
+
+    def _impl():
+        assy = _active_assembly()
+        mentioned = set()
+        unknown_mates = []
+        for raw_feature in assy.FeatureManager.GetFeatures(False) or ():
+            feat = win32com.client.Dispatch(raw_feature)
+            try:
+                feature_type = feat.GetTypeName2
+                if not str(feature_type).startswith("Mate") or feature_type == "MateGroup":
+                    continue
+            except Exception:
+                continue
+            names = _mate_entity_components(feat)
+            if names:
+                mentioned |= names
+            else:
+                unknown_mates.append(str(getattr(feat, "Name", "?")))
+
+        unmated = []
+        for raw in assy.GetComponents(True) or ():
+            comp = win32com.client.Dispatch(raw)
+            name = comp.Name2
+            if name in mentioned:
+                continue
+            try:
+                fixed = bool(comp.IsFixed)
+            except Exception:
+                fixed = False
+            try:
+                suppressed = bool(comp.IsSuppressed)
+            except Exception:
+                suppressed = False
+            if suppressed:
+                continue
+            unmated.append({"name": name, "fixed": fixed})
+
+        return {
+            "assembly": _doc_title(_active_doc()),
+            "unmated_component_count": len(unmated),
+            "unmated_components": unmated,
+            "coverage_unknown": unknown_mates,
+            "warnings": (
+                [f"{len(unknown_mates)} mate(s) could not be read for their "
+                 f"referenced components, so some components reported as "
+                 f"'unmated' might actually be mated through one of those"]
+                if unknown_mates else []
+            ),
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def add_mechanical_mate(
+    mate_type: str,
+    x1: float, y1: float, z1: float,
+    x2: float, y2: float, z2: float,
+    align: str = "closest",
+    unit: Optional[str] = None,
+) -> dict:
+    """Add one of the less common "mechanical" mate types: 'slot', 'hinge',
+    'universal_joint', 'path', or 'linear_coupler' -- not covered by add_mate
+    (basic types) or add_advanced_mate (distance/angle/width/symmetric/gear/
+    lock).
+
+    x1/y1/z1 and x2/y2/z2: points on the first and second entities (a slot
+    edge/face, the two cylindrical faces of a hinge, etc).
+
+    THE RESULT IS MEASURED AND THE MATE TYPE IS CONFIRMED, NOT ASSUMED: the
+    swMateType_e numeric code for each of these mate types is a best-effort
+    reconstruction (NOT confirmed against a live SolidWorks install -- see
+    NOVAS_ACOES_IMPLEMENTADAS.md), so after AddMate5 returns, the created
+    mate's own ``.Type`` is read back and compared with what was requested.
+    ``type_confirmed: false`` means SolidWorks created A mate, but not
+    necessarily the one asked for by name -- treat the result as unverified
+    and check it in the SolidWorks UI before relying on it.
+
+    ``components`` reports each picked component's position before/after,
+    the same as add_mate/add_advanced_mate."""
+
+    def _impl():
+        assy = _active_assembly()
+        # Best-effort swMateType_e codes for mechanical mates not already
+        # covered by add_mate/add_advanced_mate/add_screw_mate/
+        # add_rack_pinion_mate/add_cam_follower_mate. NONE of these are
+        # confirmed against a live SolidWorks install.
+        types = {
+            "slot": 22, "path": 19, "linear_coupler": 20,
+            "universal_joint": 23, "hinge": 24,
+        }
+        mate_key = mate_type.lower().strip()
+        code = types.get(mate_key)
+        if code is None:
+            raise ValueError(f"Unknown mate_type '{mate_type}'. Use one of: {', '.join(types)}")
+        align_code = MATE_ALIGN.get(align.lower().strip())
+        if align_code is None:
+            raise ValueError(f"Unknown align '{align}'. Use one of: {', '.join(MATE_ALIGN)}")
+
+        active_unit, factor = _unit_factor(unit)
+        x1_m, y1_m, z1_m = to_meters(x1, unit), to_meters(y1, unit), to_meters(z1, unit)
+        x2_m, y2_m, z2_m = to_meters(x2, unit), to_meters(y2, unit), to_meters(z2, unit)
+
+        assy.ClearSelection2(True)
+        empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+        if not assy.Extension.SelectByID2("", "FACE", x1_m, y1_m, z1_m, False, 1, empty, 0):
+            if not assy.Extension.SelectByID2("", "EDGE", x1_m, y1_m, z1_m, False, 1, empty, 0):
+                raise RuntimeError(f"No entity found at point 1 ({x1}, {y1}, {z1}).")
+        if not assy.Extension.SelectByID2("", "FACE", x2_m, y2_m, z2_m, True, 1, empty, 0):
+            if not assy.Extension.SelectByID2("", "EDGE", x2_m, y2_m, z2_m, True, 1, empty, 0):
+                raise RuntimeError(f"No entity found at point 2 ({x2}, {y2}, {z2}).")
+
+        picked, before = _capture_picked_components(assy, factor)
+
+        mate_err = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+        mate = assy.AddMate5(
+            code, align_code, False,
+            0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0,
+            False, False, 0, mate_err,
+        )
+        if mate is None or mate_err.value != 1:
+            raise RuntimeError(
+                f"Mechanical mate '{mate_type}' failed (error {mate_err.value}). "
+                f"Confirm both entities support this mate type, and that this "
+                f"SolidWorks version numbers it the way this tool guessed "
+                f"(code {code})."
+            )
+
+        mate_dispatch = win32com.client.Dispatch(mate)
+        try:
+            actual_type_code = int(_com_member(mate_dispatch, "Type"))
+        except Exception:
+            actual_type_code = None
+        type_confirmed = actual_type_code == code
+
+        components, warnings = _report_component_movement(
+            picked, before, factor, active_unit, f"the {mate_key} mate")
+        if not type_confirmed:
+            warnings.append(
+                f"SolidWorks reports this mate's Type as {actual_type_code}, not "
+                f"the {code} this tool guessed for '{mate_key}' -- the mate "
+                f"created may not be the one requested. Inspect it in the "
+                f"Mates tree before relying on it, and report the real code "
+                f"back so this tool's table can be corrected.")
+        warnings.append(_mechanism_pose_reminder(f"a '{mate_key}' mechanical mate"))
+
+        return {
+            "mate_type": mate_key, "align": align.lower().strip(),
+            "error_code": mate_err.value, "unit": active_unit,
+            "requested_type_code": code, "actual_type_code": actual_type_code,
+            "type_confirmed": type_confirmed,
+            "components": components,
+            "warnings": warnings,
+        }
+
+    return await _run(_impl)
+
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def add_cam_follower_mate(

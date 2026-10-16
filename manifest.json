@@ -83,6 +83,10 @@
       "description": "Mate entities chosen by name, including the origin planes of components, and measure the resulting movement."
     },
     {
+      "name": "add_mechanical_mate",
+      "description": "Add one of the less common \"mechanical\" mate types: 'slot', 'hinge',"
+    },
+    {
       "name": "add_rack_pinion_mate",
       "description": "Create a rack-and-pinion mate from a linear rack edge and cylindrical pinion entity."
     },
@@ -193,6 +197,10 @@
     {
       "name": "convert_sketch_entities",
       "description": "Project an existing 3D edge or face onto the active sketch plane as new"
+    },
+    {
+      "name": "count_component_instances",
+      "description": "Count assembly component instances grouped by source file and"
     },
     {
       "name": "create_3d_sketch",
@@ -325,6 +333,10 @@
     {
       "name": "delete_mate",
       "description": "Delete a named assembly mate and verify its removal from the feature tree."
+    },
+    {
+      "name": "detect_components_without_mates",
+      "description": "List top-level assembly components that no mate references. Read-only."
     },
     {
       "name": "dimension_by_entity_ids",
@@ -645,6 +657,10 @@
     {
       "name": "rename_display_state",
       "description": "Rename an existing display state."
+    },
+    {
+      "name": "replace_component",
+      "description": "Replace one assembly component with a different file, preserving the"
     },
     {
       "name": "resolve_persistent_reference",
