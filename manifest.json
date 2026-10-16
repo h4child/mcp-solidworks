@@ -51,6 +51,14 @@
       "description": "Add a cosmetic thread (dashed circles in drawings, no real geometry cut)."
     },
     {
+      "name": "add_datum_feature_symbol",
+      "description": "Add a datum feature symbol (the boxed letter with a filled triangle,"
+    },
+    {
+      "name": "add_dimension_tolerance",
+      "description": "Apply a +/- tolerance to the dimension at sketch/drawing location (x, y)."
+    },
+    {
       "name": "add_drawing_annotation",
       "description": "Add a free text note to a drawing (notes, standards, specs)."
     },
@@ -155,6 +163,10 @@
       "description": "Apply a local image texture to the active model or a selected face."
     },
     {
+      "name": "bulk_set_custom_properties",
+      "description": "Set several custom properties on the active document in one call --"
+    },
+    {
       "name": "capture_assembly_pose",
       "description": "Record the exact pose of every component of a moving assembly (mechanism) as a restorable snapshot, optionally to a JSON file."
     },
@@ -173,6 +185,14 @@
     {
       "name": "chamfer_edges_two_distances",
       "description": "Apply a two-distance chamfer (two different setbacks, one per face) to"
+    },
+    {
+      "name": "check_axis_alignment",
+      "description": "Check how well-aligned two cylindrical faces' axes are -- each picked by"
+    },
+    {
+      "name": "check_minimum_clearance",
+      "description": "Measure the minimum distance between two faces, each picked by a point"
     },
     {
       "name": "circular_pattern",
@@ -201,6 +221,10 @@
     {
       "name": "compare_bom_configurations",
       "description": "Compare two assembly configurations' TOP-LEVEL part lists: which parts"
+    },
+    {
+      "name": "compare_mass_properties",
+      "description": "Compare the active document's MEASURED mass (measure_body) against an"
     },
     {
       "name": "connect_solidworks",
@@ -453,6 +477,10 @@
     {
       "name": "get_appearance_properties",
       "description": "Read RGB, reflection, transparency, and emission channels from the active model."
+    },
+    {
+      "name": "get_applied_material",
+      "description": "Read the material ACTUALLY assigned to the active part (via"
     },
     {
       "name": "get_body_bounding_box",
@@ -749,6 +777,10 @@
     {
       "name": "set_sheet_scale",
       "description": "Set a drawing sheet scale (e.g. 1:2)."
+    },
+    {
+      "name": "set_sheet_size",
+      "description": "Set a drawing sheet's paper size/format -- distinct from set_sheet_scale,"
     },
     {
       "name": "set_units",

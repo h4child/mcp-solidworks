@@ -13107,6 +13107,425 @@ async def interference_check() -> dict:
 
     return await _run(_impl)
 
+# ===========================================================================
+# Interference/clearance tools (additions) -- purely geometric, NOT physical
+# motion simulation (SolidWorks Motion/Simulation remain out of scope).
+# ===========================================================================
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def check_minimum_clearance(x1: float, y1: float, z1: float,
+                                   x2: float, y2: float, z2: float,
+                                   unit: Optional[str] = None) -> dict:
+    """Measure the minimum distance between two faces, each picked by a point
+    that lies on it -- in a part (two faces of the same body) or an assembly
+    (faces on two different components). Read-only.
+
+    Uses SolidWorks' own ``IMeasure`` object (``Extension.CreateMeasure`` +
+    ``Calculate``), the same engine behind Tools > Measure, so the number
+    matches what a human would get picking the same two faces in the UI.
+
+    A clearance of 0 (or negative, if SolidWorks reports it) means the faces
+    touch or overlap -- pair this with interference_check/interference_report
+    for a full picture of whether two parts actually collide, since a zero
+    clearance here does not by itself say how much volume overlaps."""
+
+    def _impl():
+        doc = _active_doc()
+        active_unit, factor = _unit_factor(unit)
+        x1_m, y1_m, z1_m = to_meters(x1, unit), to_meters(y1, unit), to_meters(z1, unit)
+        x2_m, y2_m, z2_m = to_meters(x2, unit), to_meters(y2, unit), to_meters(z2, unit)
+
+        doc.ClearSelection2(True)
+        empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+        if not doc.Extension.SelectByID2("", "FACE", x1_m, y1_m, z1_m, False, 0, empty, 0):
+            raise RuntimeError(f"No face found at point 1 ({x1}, {y1}, {z1}).")
+        if not doc.Extension.SelectByID2("", "FACE", x2_m, y2_m, z2_m, True, 0, empty, 0):
+            raise RuntimeError(f"No face found at point 2 ({x2}, {y2}, {z2}).")
+
+        try:
+            measure = doc.Extension.CreateMeasure()
+            if not measure.Calculate(None):
+                raise RuntimeError(
+                    "SolidWorks' Measure tool could not calculate a result for "
+                    "these two faces (CreateMeasure().Calculate returned False)."
+                )
+            distance = float(_com_member(measure, "Distance")) * factor
+        except Exception as exc:
+            doc.ClearSelection2(True)
+            raise RuntimeError(f"Measurement failed: {exc}") from exc
+        doc.ClearSelection2(True)
+        return {
+            "point1": [x1, y1, z1], "point2": [x2, y2, z2], "unit": active_unit,
+            "minimum_clearance": round(distance, 6),
+            "touching_or_overlapping": distance <= 1e-6,
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def check_axis_alignment(x1: float, y1: float, z1: float,
+                                x2: float, y2: float, z2: float,
+                                unit: Optional[str] = None) -> dict:
+    """Check how well-aligned two cylindrical faces' axes are -- each picked by
+    a point that lies on it (a bore, a shaft, a bearing seat). Read-only.
+
+    Reports the measured angle between the two axes (0 = parallel/coaxial,
+    90 = perpendicular) and the shortest distance between the two axis
+    LINES, which for parallel axes is the radial offset -- the number that
+    matters for "will this shaft actually go through these two bores in
+    line", which interference_check alone does not answer (two coaxial
+    bores of different diameter never 'interfere' yet may still be
+    seriously misaligned if one is not where the other expects it).
+
+    Uses the same cylindrical-face parameter extraction (ISurface::
+    CylinderParams) already confirmed live for the mate tools' geometry
+    checks (see add_mate's ``geometry_check``)."""
+
+    def _impl():
+        doc = _active_doc()
+        active_unit, factor = _unit_factor(unit)
+        x1_m, y1_m, z1_m = to_meters(x1, unit), to_meters(y1, unit), to_meters(z1, unit)
+        x2_m, y2_m, z2_m = to_meters(x2, unit), to_meters(y2, unit), to_meters(z2, unit)
+
+        def _axis(x, y, z, label):
+            doc.ClearSelection2(True)
+            empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
+            if not doc.Extension.SelectByID2("", "FACE", x, y, z, False, 0, empty, 0):
+                raise RuntimeError(f"No face found at {label} ({x}, {y}, {z}).")
+            selected = doc.SelectionManager.GetSelectedObject6(1, -1)
+            face = win32com.client.Dispatch(selected)
+            surface = win32com.client.Dispatch(face.GetSurface)
+            is_cylinder = _com_member(surface, "IsCylinder")
+            if not is_cylinder:
+                raise RuntimeError(f"The face at {label} ({x}, {y}, {z}) is not cylindrical.")
+            params = tuple(_com_member(surface, "CylinderParams"))
+            if len(params) < 7:
+                raise RuntimeError(f"Could not read cylinder parameters at {label}.")
+            return params[0:3], params[3:6], params[6]  # origin, direction, radius
+
+        origin1, dir1, radius1 = _axis(x1_m, y1_m, z1_m, "point1")
+        origin2, dir2, radius2 = _axis(x2_m, y2_m, z2_m, "point2")
+        doc.ClearSelection2(True)
+
+        angle = _angle_between_degrees(dir1, dir2)
+        # Shortest distance between two skew (or parallel) 3D lines, each
+        # given as (point, direction). Standard closed-form; the parallel
+        # case is handled separately since the cross-product degenerates.
+        cross = (
+            dir1[1] * dir2[2] - dir1[2] * dir2[1],
+            dir1[2] * dir2[0] - dir1[0] * dir2[2],
+            dir1[0] * dir2[1] - dir1[1] * dir2[0],
+        )
+        cross_norm = math.sqrt(sum(c * c for c in cross))
+        delta = tuple(origin2[i] - origin1[i] for i in range(3))
+        if cross_norm > 1e-9:
+            axis_distance = abs(sum(delta[i] * cross[i] for i in range(3))) / cross_norm
+        else:
+            # Parallel axes: distance is the component of delta perpendicular
+            # to dir1.
+            along = sum(delta[i] * dir1[i] for i in range(3))
+            perp = tuple(delta[i] - along * dir1[i] for i in range(3))
+            axis_distance = math.sqrt(sum(p * p for p in perp))
+
+        axis_distance *= factor
+        return {
+            "point1": [x1, y1, z1], "point2": [x2, y2, z2], "unit": active_unit,
+            "angle_degrees": angle,
+            "axis_distance": round(axis_distance, 6),
+            "radius1": round(radius1 * factor, 6), "radius2": round(radius2 * factor, 6),
+            "parallel": angle is not None and (angle <= 0.5 or angle >= 179.5),
+            "note": (
+                "parallel=true and a small axis_distance together mean the two "
+                "axes are effectively coaxial; this tool reports the measured "
+                "values rather than judging a pass/fail threshold, since what "
+                "counts as 'aligned enough' depends on the fit (see "
+                ".claude/knowledge/tolerancias_e_ajustes.md)"),
+        }
+
+    return await _run(_impl)
+
+
+# ===========================================================================
+# Drawing tools (additions)
+# ===========================================================================
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+async def set_sheet_size(sheet_name: str = "", paper_size: str = "a3",
+                          width: float = 0, height: float = 0,
+                          landscape: bool = True, unit: Optional[str] = None) -> dict:
+    """Set a drawing sheet's paper size/format -- distinct from set_sheet_scale,
+    which only changes the view scale.
+
+    paper_size: 'a4', 'a3', 'a2', 'a1', 'a0', 'letter', 'legal', or 'custom'
+    (pass width/height for 'custom'). sheet_name: empty uses the active sheet.
+
+    NEEDS LIVE VERIFICATION: uses ``ISheet::SetupSheet5``, reconstructed from
+    the SolidWorks API's documented "set up this sheet's format" call -- the
+    exact argument order was not confirmed against a live install in this
+    session. See NOVAS_ACOES_IMPLEMENTADAS.md."""
+
+    # swDwgPaperSizes_e (standard values; width/height in meters for 'custom').
+    _SIZES = {
+        "a4": (1, 0.210, 0.297), "a3": (2, 0.297, 0.420), "a2": (3, 0.420, 0.594),
+        "a1": (4, 0.594, 0.841), "a0": (5, 0.841, 1.189),
+        "letter": (6, 0.2159, 0.2794), "legal": (7, 0.2159, 0.3556),
+        "custom": (12, None, None),
+    }
+
+    def _impl():
+        key = paper_size.lower()
+        if key not in _SIZES:
+            raise ValueError(f"paper_size must be one of {', '.join(_SIZES)}, got '{paper_size}'.")
+        size_code, default_w, default_h = _SIZES[key]
+        doc = _active_drawing()
+        sheets = _sheet_names(doc)
+        if sheet_name:
+            if sheet_name not in sheets:
+                raise RuntimeError(f"Sheet '{sheet_name}' not found. Available: {', '.join(sheets)}.")
+            target_sheet = sheet_name
+        else:
+            current = win32com.client.Dispatch(_com_member(doc, "GetCurrentSheet"))
+            target_sheet = str(_com_member(current, "GetName") or "")
+
+        if key == "custom":
+            if width <= 0 or height <= 0:
+                raise ValueError("width and height must both be positive for paper_size='custom'.")
+            w_m, h_m = to_meters(width, unit), to_meters(height, unit)
+        else:
+            w_m, h_m = default_w, default_h
+            if landscape and w_m < h_m:
+                w_m, h_m = h_m, w_m
+
+        sheet = win32com.client.Dispatch(doc.Sheet(target_sheet))
+        if sheet is None:
+            raise RuntimeError(f"Could not resolve sheet '{target_sheet}'.")
+        try:
+            ok = sheet.SetupSheet5(
+                target_sheet, size_code, "", 1.0, 1.0, False, "", w_m, h_m, "", "",
+            )
+        except Exception as exc:
+            raise RuntimeError(f"SetupSheet5 failed: {exc}") from exc
+        if not ok:
+            raise RuntimeError(f"SolidWorks refused to set up sheet '{target_sheet}'.")
+        doc.EditRebuild3()
+        return {
+            "sheet": target_sheet, "paper_size": paper_size,
+            "width": round(w_m / UNIT_TO_METERS[unit or _default_unit], 4),
+            "height": round(h_m / UNIT_TO_METERS[unit or _default_unit], 4),
+            "unit": unit or _default_unit,
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+async def add_dimension_tolerance(x: float, y: float, tolerance_type: str = "bilateral",
+                                   upper: float = 0.1, lower: float = -0.1,
+                                   unit: Optional[str] = None) -> dict:
+    """Apply a +/- tolerance to the dimension at sketch/drawing location (x, y).
+
+    tolerance_type: 'bilateral' (different +/- values, the common case),
+    'symmetric' (one value, +/- the same), or 'none' (remove tolerance,
+    back to a plain basic dimension).
+    upper/lower: the tolerance values (lower is normally negative). For
+    'symmetric', only ``upper`` is used (as +/-).
+
+    NEEDS LIVE VERIFICATION: uses ``IDimension::Tolerance`` (an
+    ``IDimTolerance`` object) with best-effort swTolType_e codes --
+    'none'=0 is the one value this tool is confident about; 'bilateral' and
+    'symmetric' are reconstructed from the SolidWorks API's documented
+    intent, not confirmed live. See NOVAS_ACOES_IMPLEMENTADAS.md. The
+    tolerance is read back after being set, so a type SolidWorks did not
+    accept shows up as ``verified: false`` rather than a silent no-op."""
+
+    _TYPES = {"none": 0, "bilateral": 2, "symmetric": 4}
+
+    def _impl():
+        key = tolerance_type.lower()
+        if key not in _TYPES:
+            raise ValueError(f"tolerance_type must be one of {', '.join(_TYPES)}, got '{tolerance_type}'.")
+        doc = _active_doc()
+        x_m, y_m = to_meters(x, unit), to_meters(y, unit)
+        doc.ClearSelection2(True)
+        if not _select_by_id(doc, "", "DIMENSION", x_m, y_m, 0):
+            raise RuntimeError(f"No dimension found near ({x}, {y}).")
+        selected = doc.SelectionManager.GetSelectedObject6(1, -1)
+        display_dim = win32com.client.Dispatch(selected)
+        dim = win32com.client.Dispatch(display_dim.GetDimension2(0))
+        tol = win32com.client.Dispatch(dim.Tolerance)
+
+        type_code = _TYPES[key]
+        tol.Type = type_code
+        if key == "bilateral":
+            tol.SetMaxValue2(0, to_meters(upper, unit))
+            tol.SetMinValue2(0, to_meters(lower, unit))
+        elif key == "symmetric":
+            tol.SetMaxValue2(0, to_meters(abs(upper), unit))
+            tol.SetMinValue2(0, -to_meters(abs(upper), unit))
+        doc.ClearSelection2(True)
+
+        actual_type = int(_com_member(tol, "Type"))
+        return {
+            "picked_at": [x, y], "unit": unit or _default_unit,
+            "tolerance_type": key, "upper": upper if key != "none" else None,
+            "lower": lower if key == "bilateral" else (-abs(upper) if key == "symmetric" else None),
+            "verified": actual_type == type_code,
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def add_datum_feature_symbol(x: float, y: float, label: str = "A",
+                                    unit: Optional[str] = None) -> dict:
+    """Add a datum feature symbol (the boxed letter with a filled triangle,
+    e.g. 'A') to the drawing at a point on an edge -- distinct from
+    add_gdt_symbol, which adds the feature-control FRAME that references a
+    datum, not the datum label itself.
+
+    label: the datum letter (A, B, C, ...). Create this before referencing
+    it with add_gdt_symbol's ``datum`` parameter.
+
+    NEEDS LIVE VERIFICATION: uses ``IDrawingDoc::InsertDatumTag2`` by
+    analogy with add_gdt_symbol's InsertGtol -- not confirmed live. See
+    NOVAS_ACOES_IMPLEMENTADAS.md."""
+
+    def _impl():
+        doc = _active_drawing()
+        x_m, y_m = to_meters(x, unit), to_meters(y, unit)
+        _select_drawing_edge_near(doc, x_m, y_m)
+        try:
+            tag = doc.InsertDatumTag2(label, False)
+        except Exception as exc:
+            raise RuntimeError(
+                f"InsertDatumTag2 failed ({exc}). This COM call is a "
+                f"best-effort guess -- see NOVAS_ACOES_IMPLEMENTADAS.md."
+            ) from exc
+        if tag is None:
+            raise RuntimeError(
+                f"Datum feature symbol creation failed at ({x}, {y}). Ensure "
+                f"an edge is selectable at that point."
+            )
+        return {"label": label, "placed_at": [x, y], "unit": unit or _default_unit}
+
+    return await _run(_impl)
+
+
+# ===========================================================================
+# Materials/properties tools (additions)
+# ===========================================================================
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def get_applied_material(config: str = "") -> dict:
+    """Read the material ACTUALLY assigned to the active part (via
+    set_material), as opposed to lookup_material_properties, which reads a
+    material's properties straight from the SolidWorks library regardless of
+    whether it is applied to anything.
+
+    This fills a real gap: nothing else in this server answers "what
+    material is this part set to right now" directly -- get_custom_properties
+    does not include it (SetMaterialPropertyName2 is a separate native slot),
+    and measure_body needs a material to already be assigned just to run.
+    Returns ``material: null`` (not an error) when no material is assigned."""
+
+    def _impl():
+        doc = _active_doc()
+        if _doc_type(doc) != 1:
+            raise RuntimeError("get_applied_material only works on a part document (SLDPRT).")
+        database_out = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_BSTR, "")
+        try:
+            name = doc.GetMaterialPropertyName2(config, database_out)
+        except Exception as exc:
+            raise RuntimeError(f"Could not read the applied material: {exc}") from exc
+        return {
+            "material": name or None,
+            "database": database_out.value or None,
+            "config": config or "(document)",
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def compare_mass_properties(expected_mass_kg: float, tolerance_percent: float = 1.0) -> dict:
+    """Compare the active document's MEASURED mass (measure_body) against an
+    expected value, so a caller gets a direct pass/fail instead of reading
+    two numbers and subtracting them by hand.
+
+    expected_mass_kg: the target mass in kilograms.
+    tolerance_percent: allowed deviation, as a percentage of expected_mass_kg
+    (the default 1.0 matches this project's own quality-gate convention --
+    see .claude/knowledge/verificacao_e_qa.md)."""
+
+    def _impl():
+        if expected_mass_kg <= 0:
+            raise ValueError(f"expected_mass_kg must be positive, got {expected_mass_kg}.")
+        if tolerance_percent < 0:
+            raise ValueError(f"tolerance_percent must not be negative, got {tolerance_percent}.")
+        doc = _active_doc()
+        factor = 1.0 / UNIT_TO_METERS.get(_default_unit, 0.001)
+        measured = _measure_model_doc(doc, factor)
+        actual_mass = measured.get("mass_kg")
+        if actual_mass is None:
+            raise RuntimeError(
+                "measure_body returned no mass -- assign a material first "
+                "(set_material)."
+            )
+        allowed = expected_mass_kg * (tolerance_percent / 100.0)
+        error = actual_mass - expected_mass_kg
+        return {
+            "expected_mass_kg": expected_mass_kg,
+            "actual_mass_kg": actual_mass,
+            "error_kg": round(error, 6),
+            "error_percent": round(100.0 * error / expected_mass_kg, 4),
+            "tolerance_percent": tolerance_percent,
+            "within_tolerance": abs(error) <= allowed,
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+async def bulk_set_custom_properties(properties: dict, config: str = "") -> dict:
+    """Set several custom properties on the active document in one call --
+    e.g. PartNumber, Description, Material, Revision, Author all at once --
+    instead of one set_custom_property call per field.
+
+    properties: {"PropertyName": "value", ...}. Every value is written as
+    text, same as set_custom_property. config: configuration name (empty =
+    document-level properties)."""
+
+    def _impl():
+        if not properties:
+            raise ValueError("properties cannot be empty.")
+        doc = _active_doc()
+        cpm = doc.Extension.CustomPropertyManager(config)
+        applied, failed = {}, {}
+        for name, value in properties.items():
+            text = str(value)
+            try:
+                ret = cpm.Add3(name, 30, text, 1)
+            except Exception:
+                ret = -1
+            if ret != 0:
+                try:
+                    cpm.Set2(name, text)
+                except Exception:
+                    try:
+                        cpm.Set(name, text)
+                    except Exception as exc:
+                        failed[name] = str(exc)
+                        continue
+            applied[name] = text
+        return {
+            "config": config or "(document)",
+            "applied_count": len(applied), "applied": applied,
+            "failed_count": len(failed), "failed": failed,
+        }
+
+    return await _run(_impl)
+
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 async def create_assembly_pattern(
