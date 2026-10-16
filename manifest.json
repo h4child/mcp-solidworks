@@ -79,6 +79,10 @@
       "description": "EXPERIMENTAL: mate two faces/planes in the assembly."
     },
     {
+      "name": "add_mate_by_name",
+      "description": "Mate entities chosen by name, including the origin planes of components, and measure the resulting movement."
+    },
+    {
       "name": "add_rack_pinion_mate",
       "description": "Create a rack-and-pinion mate from a linear rack edge and cylindrical pinion entity."
     },
@@ -103,8 +107,16 @@
       "description": "Add a driving dimension to sketch entities."
     },
     {
+      "name": "add_sketch_point",
+      "description": "Add a standalone reference point to the active sketch at (x, y)."
+    },
+    {
       "name": "add_sketch_relation",
       "description": "Add a geometric relation (constraint) between sketch entities."
+    },
+    {
+      "name": "add_sketch_text",
+      "description": "Add free-standing text to the active sketch at (x, y), for later use as"
     },
     {
       "name": "add_surface_finish",
@@ -155,6 +167,10 @@
       "description": "Repeat a feature in a circular pattern."
     },
     {
+      "name": "clear_section_view",
+      "description": "Turn off a section view previously shown by set_section_view."
+    },
+    {
       "name": "close_document",
       "description": "Close the active document."
     },
@@ -169,6 +185,10 @@
     {
       "name": "connect_solidworks",
       "description": "Connect to a running SolidWorks instance, launching it if needed."
+    },
+    {
+      "name": "convert_sketch_entities",
+      "description": "Project an existing 3D edge or face onto the active sketch plane as new"
     },
     {
       "name": "create_3d_sketch",
@@ -191,16 +211,20 @@
       "description": "Create and optionally apply a configuration display state."
     },
     {
+      "name": "create_document_from_template",
+      "description": "Create a new document from a specific template file instead of the configured default."
+    },
+    {
       "name": "create_exploded_view",
       "description": "Create an exploded (blown-apart) view of the active assembly."
     },
     {
-      "name": "create_helix",
-      "description": "Create a helix/spiral curve from a circle sketch (for threads, springs, worms)."
-    },
-    {
       "name": "create_gear",
       "description": "Create an external spur gear with involute teeth. Kept for callers bound to this name; builds the gear through create_spur_gear, which is the tool to use directly."
+    },
+    {
+      "name": "create_helix",
+      "description": "Create a helix/spiral curve from a circle sketch (for threads, springs, worms)."
     },
     {
       "name": "create_knurl",
@@ -223,6 +247,10 @@
       "description": "Create a new part document."
     },
     {
+      "name": "create_profile_part",
+      "description": "Build one finished prismatic part in a single call (sketch outline + holes/slots, extrude, material, save) and verify its measured volume."
+    },
+    {
       "name": "create_reference_axis",
       "description": "Create a reference axis from two planes or a cylindrical face."
     },
@@ -243,12 +271,20 @@
       "description": "Create an involute spur gear with real teeth: the whole toothed profile is computed analytically and drawn as one closed sketch, then verified by volume."
     },
     {
+      "name": "create_tube_part",
+      "description": "Create and save a real hollow rectangular, square or round tube part with a wall thickness, verified by measured volume."
+    },
+    {
       "name": "create_weldment_profile",
       "description": "Create a structural member (I-beam, tube, channel, angle) along sketch segments using weldment profiles."
     },
     {
       "name": "cut_extrude",
       "description": "Cut-extrude the last sketch."
+    },
+    {
+      "name": "cut_part_end",
+      "description": "End cut / miter: slice a tube or profile part with a plane (normal + offset or point) so its end is one flat angled face that can sit on another member; measures volume removed and the new face."
     },
     {
       "name": "delete_component",
@@ -283,12 +319,20 @@
       "description": "Draw an arc in the active sketch."
     },
     {
+      "name": "draw_arc_3point",
+      "description": "Draw an arc in the active sketch through three points: the two ends"
+    },
+    {
       "name": "draw_centerline",
       "description": "Draw a centerline (construction geometry) in a part/assembly sketch; required as the revolve axis for revolve_sketch."
     },
     {
       "name": "draw_circle",
       "description": "Draw a circle in the active sketch."
+    },
+    {
+      "name": "draw_ellipse",
+      "description": "Draw a full ellipse in the active sketch, centered on (cx, cy)."
     },
     {
       "name": "draw_line",
@@ -309,6 +353,10 @@
     {
       "name": "draw_rectangle",
       "description": "Draw a rectangle in the active sketch."
+    },
+    {
+      "name": "draw_rectangle_centered",
+      "description": "Draw a rectangle in the active sketch centered on (cx, cy), with the given"
     },
     {
       "name": "draw_spline",
@@ -367,6 +415,10 @@
       "description": "Read custom properties from the active document."
     },
     {
+      "name": "get_default_templates",
+      "description": "Read SolidWorks' System Options default templates for part/assembly/drawing."
+    },
+    {
       "name": "get_document_dependencies",
       "description": "List referenced model files and identify broken dependencies."
     },
@@ -385,6 +437,10 @@
     {
       "name": "get_selection",
       "description": "Read the current selection: entity types, pick points, and owning components."
+    },
+    {
+      "name": "get_sketch_contours",
+      "description": "Report whether the active (or named) sketch's contours are open or"
     },
     {
       "name": "get_sketch_status",
@@ -439,36 +495,20 @@
       "description": "Insert a standard model view into the active drawing."
     },
     {
+      "name": "insert_model_items",
+      "description": "Auto-insert dimensions/annotations from the model into a drawing view."
+    },
+    {
       "name": "insert_section_view",
       "description": "Insert a section (cut-through) view into a drawing along a cut line."
     },
     {
-      "name": "create_profile_part",
-      "description": "Build one finished prismatic part in a single call (sketch outline + holes/slots, extrude, material, save) and verify its measured volume."
-    },
-    {
-      "name": "create_tube_part",
-      "description": "Create and save a real hollow rectangular, square or round tube part with a wall thickness, verified by measured volume."
-    },
-    {
-      "name": "add_mate_by_name",
-      "description": "Mate entities chosen by name, including the origin planes of components, and measure the resulting movement."
+      "name": "interference_check",
+      "description": "Check the active assembly for overlapping/interfering components."
     },
     {
       "name": "interference_report",
       "description": "Detailed interference detection: which components overlap, overlap volume, and surface contact separated from real overlap."
-    },
-    {
-      "name": "set_view_direction",
-      "description": "Point the camera along an arbitrary direction with a chosen up vector (isometric view for Z-up models) and optionally export a PNG."
-    },
-    {
-      "name": "cut_part_end",
-      "description": "End cut / miter: slice a tube or profile part with a plane (normal + offset or point) so its end is one flat angled face that can sit on another member; measures volume removed and the new face."
-    },
-    {
-      "name": "interference_check",
-      "description": "Check the active assembly for overlapping/interfering components."
     },
     {
       "name": "linear_pattern",
@@ -547,6 +587,10 @@
       "description": "Move or copy a solid body by translation and rotation (in-place move or N copies)."
     },
     {
+      "name": "offset_sketch_entities",
+      "description": "Offset the sketch entity near (x, y) by ``distance``, creating new"
+    },
+    {
       "name": "open_document",
       "description": "Open an existing .sldprt, .sldasm, or .slddrw file."
     },
@@ -555,8 +599,16 @@
       "description": "Create a portable native Pack and Go copy or validated dependency fallback."
     },
     {
+      "name": "query_sketch_relations",
+      "description": "Count the geometric relations in the active (or named) sketch. Read-only."
+    },
+    {
       "name": "rebuild_model",
       "description": "Rebuild the active model and refresh the SolidWorks feature tree."
+    },
+    {
+      "name": "remove_sketch_relation",
+      "description": "Remove a single geometric relation at the sketch location (x, y)."
     },
     {
       "name": "remove_texture",
@@ -579,8 +631,16 @@
       "description": "Revolve the last sketch around its centerline axis."
     },
     {
+      "name": "run_command_by_id",
+      "description": "Run a SolidWorks UI command by its numeric swCommands_e/menu command ID."
+    },
+    {
       "name": "run_macro",
       "description": "Run a procedure from an existing SolidWorks VBA macro (.swp/.swb/.dll); executes untrusted VBA, so only use trusted files."
+    },
+    {
+      "name": "save_as_template",
+      "description": "Save the active document as a .prtdot/.asmdot/.drwdot template."
     },
     {
       "name": "save_document",
@@ -603,6 +663,14 @@
       "description": "Set a custom property on the active document."
     },
     {
+      "name": "set_default_templates",
+      "description": "Set SolidWorks' System Options default templates for part/assembly/drawing."
+    },
+    {
+      "name": "set_dimension_driven",
+      "description": "Toggle a dimension at sketch/drawing location (x, y) between DRIVEN"
+    },
+    {
       "name": "set_equation",
       "description": "Update an equation and verify its evaluated value."
     },
@@ -611,12 +679,24 @@
       "description": "Assign a material to the active part (drives mass and BOM)."
     },
     {
+      "name": "set_section_view",
+      "description": "Show the model cut by a plane in the 3D viewport (display only, not geometry)."
+    },
+    {
+      "name": "set_sheet_scale",
+      "description": "Set a drawing sheet scale (e.g. 1:2)."
+    },
+    {
       "name": "set_units",
       "description": "Set the default unit (mm, cm, m, in, ft)."
     },
     {
       "name": "set_view",
       "description": "Set the camera view orientation (front, isometric, etc.)."
+    },
+    {
+      "name": "set_view_direction",
+      "description": "Point the camera along an arbitrary direction with a chosen up vector (isometric view for Z-up models) and optionally export a PNG."
     },
     {
       "name": "shell_body",
@@ -665,42 +745,6 @@
     {
       "name": "zoom_to_fit",
       "description": "Zoom to fit the entire model in the viewport."
-    },
-    {
-      "name": "get_default_templates",
-      "description": "Read SolidWorks' System Options default templates for part/assembly/drawing."
-    },
-    {
-      "name": "set_default_templates",
-      "description": "Set SolidWorks' System Options default templates for part/assembly/drawing."
-    },
-    {
-      "name": "create_document_from_template",
-      "description": "Create a new document from a specific template file instead of the configured default."
-    },
-    {
-      "name": "save_as_template",
-      "description": "Save the active document as a .prtdot/.asmdot/.drwdot template."
-    },
-    {
-      "name": "run_command_by_id",
-      "description": "Run a SolidWorks UI command by its numeric swCommands_e/menu command ID."
-    },
-    {
-      "name": "set_section_view",
-      "description": "Show the model cut by a plane in the 3D viewport (display only, not geometry)."
-    },
-    {
-      "name": "clear_section_view",
-      "description": "Turn off a section view previously shown by set_section_view."
-    },
-    {
-      "name": "set_sheet_scale",
-      "description": "Set a drawing sheet scale (e.g. 1:2)."
-    },
-    {
-      "name": "insert_model_items",
-      "description": "Auto-insert dimensions/annotations from the model into a drawing view."
     }
   ],
   "keywords": [

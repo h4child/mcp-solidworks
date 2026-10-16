@@ -5738,6 +5738,627 @@ async def add_sketch_relation(relation: str, x1: float, y1: float,
 
     return await _run(_impl)
 
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def draw_rectangle_centered(cx: float = 0, cy: float = 0, width: float = 50, height: float = 30,
+                                   unit: Optional[str] = None, tolerance: float = 0.01) -> dict:
+    """Draw a rectangle in the active sketch centered on (cx, cy), with the given
+    width/height, instead of by two corners (see draw_rectangle).
+
+    Uses ``CreateCenterRectangle`` (SolidWorks' own "Center Rectangle" sketch
+    tool), which also adds the implicit centerpoint relation a corner
+    rectangle does not get -- useful for a profile meant to stay symmetric
+    about a point under later dimension changes.
+
+    THE RESULT IS MEASURED, NOT ECHOED, the same way draw_rectangle is:
+    ``actual_width``/``actual_height`` are read back from the stored segments
+    and ``verified`` is false if the inference engine snapped a corner
+    elsewhere or the shape did not close into 4 segments.
+    """
+
+    def _impl():
+        if width <= 0 or height <= 0:
+            raise ValueError(f"width and height must be positive, got {width}, {height}.")
+        doc = _active_doc()
+        active_unit, factor = _unit_factor(unit)
+        cx_m, cy_m = to_meters(cx, unit), to_meters(cy, unit)
+        half_w_m, half_h_m = to_meters(width / 2, unit), to_meters(height / 2, unit)
+        corner_x_m, corner_y_m = cx_m + half_w_m, cy_m + half_h_m
+
+        def _make():
+            created = doc.SketchManager.CreateCenterRectangle(
+                cx_m, cy_m, 0, corner_x_m, corner_y_m, 0)
+            if created is None:
+                return None
+            return tuple(created) or None
+
+        rect, zoom_retry = _sketch_create(
+            doc, _make,
+            (cx_m - half_w_m, cy_m - half_h_m, cx_m + half_w_m, cy_m + half_h_m),
+            "a centered rectangle",
+        )
+        segments = [_sketch_segment_geometry(raw, factor) for raw in rect]
+        xs, ys = [], []
+        for segment in segments:
+            for key in ("start", "end"):
+                point = segment.get(key)
+                if point:
+                    xs.append(point["x"])
+                    ys.append(point["y"])
+        if xs and ys:
+            actual_width = max(xs) - min(xs)
+            actual_height = max(ys) - min(ys)
+            actual_center = [(max(xs) + min(xs)) / 2, (max(ys) + min(ys)) / 2]
+        else:
+            actual_width = actual_height = actual_center = None
+
+        result = {
+            "center": [cx, cy], "width": width, "height": height, "unit": active_unit,
+            "requested": {"center": [cx, cy], "width": width, "height": height},
+            "segment_count": len(segments),
+            "segments": segments,
+            "actual_center": actual_center,
+            "actual_width": actual_width,
+            "actual_height": actual_height,
+        }
+        verdict = _sketch_verdict(
+            "the centered rectangle",
+            (("center", (cx, cy, 0.0),
+              {"x": actual_center[0], "y": actual_center[1]} if actual_center else None),),
+            (("width", width, actual_width), ("height", height, actual_height)),
+            tolerance, active_unit, zoom_retry,
+        )
+        if len(segments) != 4:
+            verdict["warnings"].append(
+                f"SolidWorks returned {len(segments)} segment(s) instead of 4, so this "
+                f"is not a closed rectangle -- extruding it will fail or produce the "
+                f"wrong solid")
+            verdict["verified"] = False
+        result.update(verdict)
+        return result
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def draw_arc_3point(x1: float, y1: float, x2: float, y2: float, x3: float, y3: float,
+                           unit: Optional[str] = None, tolerance: float = 0.01) -> dict:
+    """Draw an arc in the active sketch through three points: the two ends
+    (x1,y1)/(x2,y2) and a third point (x3,y3) the arc passes through.
+
+    Unlike draw_arc (center + radius + angles), this is the natural way to
+    specify an arc already known by its endpoints and a point along it --
+    e.g. tracing a fillet radius read off a reference drawing. Uses
+    ``Create3PointArc``.
+
+    THE RESULT IS MEASURED, NOT ECHOED: the stored arc's center, radius and
+    endpoints are read back, and ``verified`` is false if any of the three
+    requested points were snapped elsewhere by the sketch inference engine.
+    """
+
+    def _impl():
+        if (x1, y1) == (x2, y2) or (x1, y1) == (x3, y3) or (x2, y2) == (x3, y3):
+            raise ValueError("The three points must be distinct.")
+        doc = _active_doc()
+        active_unit, factor = _unit_factor(unit)
+        x1_m, y1_m = to_meters(x1, unit), to_meters(y1, unit)
+        x2_m, y2_m = to_meters(x2, unit), to_meters(y2, unit)
+        x3_m, y3_m = to_meters(x3, unit), to_meters(y3, unit)
+        xs_m, ys_m = (x1_m, x2_m, x3_m), (y1_m, y2_m, y3_m)
+        arc, zoom_retry = _sketch_create(
+            doc,
+            lambda: doc.SketchManager.Create3PointArc(
+                x1_m, y1_m, 0, x2_m, y2_m, 0, x3_m, y3_m, 0),
+            (min(xs_m), min(ys_m), max(xs_m), max(ys_m)), "a 3-point arc",
+        )
+        actual = _sketch_segment_geometry(arc, factor)
+        start, end = _match_endpoints((x1, y1, 0.0), (x2, y2, 0.0), actual)
+        result = {
+            "point1": [x1, y1], "point2": [x2, y2], "through": [x3, y3],
+            "unit": active_unit,
+            "requested": {"point1": [x1, y1], "point2": [x2, y2], "through": [x3, y3]},
+            "actual": actual,
+        }
+        result.update(_sketch_verdict(
+            "the 3-point arc",
+            (("start", (x1, y1, 0.0), start), ("end", (x2, y2, 0.0), end)),
+            (), tolerance, active_unit, zoom_retry,
+        ))
+        return result
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def draw_ellipse(cx: float = 0, cy: float = 0, major_radius: float = 30,
+                        minor_radius: float = 15, angle: float = 0,
+                        unit: Optional[str] = None, tolerance: float = 0.01) -> dict:
+    """Draw a full ellipse in the active sketch, centered on (cx, cy).
+
+    major_radius/minor_radius: the two semi-axis lengths (major_radius must be
+    the larger one for the result to be a true ellipse rather than a circle
+    drawn oddly). angle: rotation of the major axis from the sketch X axis,
+    in degrees.
+
+    Uses ``CreateEllipse`` (SolidWorks has no separate "create a rotated
+    ellipse" call -- the major-axis endpoint supplied IS the rotation).
+
+    THE RESULT IS MEASURED, NOT ECHOED: the stored center and the two radii
+    are read back from the segment geometry, and ``verified`` is false if
+    the ellipse was snapped off-center or its axes do not match what was
+    requested within ``tolerance``.
+    """
+
+    def _impl():
+        if major_radius <= 0 or minor_radius <= 0:
+            raise ValueError("major_radius and minor_radius must both be positive.")
+        if minor_radius > major_radius:
+            raise ValueError(
+                f"minor_radius ({minor_radius}) must not exceed major_radius "
+                f"({major_radius}); swap them if the ellipse is lying the other way."
+            )
+        doc = _active_doc()
+        active_unit, factor = _unit_factor(unit)
+        cx_m, cy_m = to_meters(cx, unit), to_meters(cy, unit)
+        major_m, minor_m = to_meters(major_radius, unit), to_meters(minor_radius, unit)
+        theta = math.radians(angle)
+        major_x, major_y = cx_m + major_m * math.cos(theta), cy_m + major_m * math.sin(theta)
+        # Minor axis point lies 90 degrees from the major axis.
+        minor_x = cx_m - minor_m * math.sin(theta)
+        minor_y = cy_m + minor_m * math.cos(theta)
+        ellipse, zoom_retry = _sketch_create(
+            doc,
+            lambda: doc.SketchManager.CreateEllipse(
+                cx_m, cy_m, 0, major_x, major_y, 0, minor_x, minor_y, 0),
+            (cx_m - major_m, cy_m - major_m, cx_m + major_m, cy_m + major_m),
+            "an ellipse",
+        )
+        actual = _sketch_segment_geometry(ellipse, factor)
+        result = {
+            "center": [cx, cy], "major_radius": major_radius, "minor_radius": minor_radius,
+            "angle": angle, "unit": active_unit,
+            "requested": {"center": [cx, cy], "major_radius": major_radius,
+                          "minor_radius": minor_radius, "angle": angle},
+            "actual": actual,
+        }
+        result.update(_sketch_verdict(
+            "the ellipse",
+            (("center", (cx, cy, 0.0), actual.get("center")),),
+            (("major_radius", major_radius, actual.get("major_radius")),
+             ("minor_radius", minor_radius, actual.get("minor_radius"))),
+            tolerance, active_unit, zoom_retry,
+        ))
+        return result
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def add_sketch_point(x: float = 0, y: float = 0, unit: Optional[str] = None,
+                            tolerance: float = 0.01) -> dict:
+    """Add a standalone reference point to the active sketch at (x, y).
+
+    A dedicated point entity (as opposed to the implicit endpoints every
+    line/arc already has) is needed as a mate/dimension anchor, or as the
+    seed location for hole_wizard-adjacent geometry. Uses ``CreatePoint``.
+
+    THE RESULT IS MEASURED, NOT ECHOED: the stored point is read back, and
+    ``verified`` is false if it landed more than ``tolerance`` away from the
+    request (SolidWorks' sketch inference can snap a lone point onto nearby
+    geometry exactly as it does for draw_line/draw_circle endpoints).
+    """
+
+    def _impl():
+        doc = _active_doc()
+        active_unit, factor = _unit_factor(unit)
+        x_m, y_m = to_meters(x, unit), to_meters(y, unit)
+        point, zoom_retry = _sketch_create(
+            doc,
+            lambda: doc.SketchManager.CreatePoint(x_m, y_m, 0),
+            (x_m, y_m, x_m, y_m), "a sketch point",
+        )
+        point = win32com.client.Dispatch(point)
+        try:
+            actual = {"x": round(point.X * factor, 6), "y": round(point.Y * factor, 6)}
+        except Exception:
+            actual = None
+        result = {
+            "point": [x, y], "unit": active_unit,
+            "requested": {"point": [x, y]},
+            "actual": actual,
+        }
+        result.update(_sketch_verdict(
+            "the point",
+            (("point", (x, y, 0.0), actual),),
+            (), tolerance, active_unit, zoom_retry,
+        ))
+        return result
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def add_sketch_text(text: str, x: float = 0, y: float = 0, height: float = 5,
+                           angle: float = 0, bold: bool = False, italic: bool = False,
+                           unit: Optional[str] = None) -> dict:
+    """Add free-standing text to the active sketch at (x, y), for later use as
+    an engraved/embossed feature (extrude_sketch/cut_extrude on the resulting
+    sketch profile) rather than a model annotation.
+
+    height: character height. angle: rotation in degrees. This is sketch
+    TEXT, not a drawing note (add_drawing_annotation is for a .slddrw sheet).
+
+    Uses ``InsertSketchText`` with ``UseDocFont=True`` (the document's default
+    font) -- pass a specific font by editing the returned sketch text object
+    in the SolidWorks UI if a non-default face is required; this tool has no
+    font-family parameter.
+
+    THE RESULT REPORTS WHAT SolidWorks STORED: ``created`` is false, with no
+    exception, only if InsertSketchText returned nothing -- the usual cause
+    being an empty ``text``."""
+
+    def _impl():
+        if not text:
+            raise ValueError("text cannot be empty.")
+        if height <= 0:
+            raise ValueError(f"height must be positive, got {height}.")
+        doc = _active_doc()
+        if doc.SketchManager.ActiveSketch is None:
+            raise RuntimeError("No sketch is active. Create a sketch before adding text.")
+        active_unit, factor = _unit_factor(unit)
+        x_m, y_m = to_meters(x, unit), to_meters(y, unit)
+        height_m = to_meters(height, unit)
+        created = doc.SketchManager.InsertSketchText(
+            x_m, y_m, 0, text, bool(italic), bool(bold), True, "",
+            height_m, 1.0, math.radians(angle),
+        )
+        if created is None:
+            raise RuntimeError(
+                "SolidWorks did not create the sketch text. Check that a sketch "
+                "is active and 'text' is not empty."
+            )
+        return {
+            "text": text, "position": [x, y], "height": height, "angle": angle,
+            "bold": bold, "italic": italic, "unit": active_unit, "created": True,
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def offset_sketch_entities(x: float, y: float, distance: float,
+                                  reverse: bool = False, bidirectional: bool = False,
+                                  select_chain: bool = True,
+                                  unit: Optional[str] = None) -> dict:
+    """Offset the sketch entity near (x, y) by ``distance``, creating new
+    parallel geometry -- SolidWorks' "Offset Entities" sketch tool.
+
+    select_chain: also offset the whole connected chain the picked entity
+    belongs to, not just that one segment (SolidWorks' own default).
+    reverse: offset to the other side. bidirectional: offset both sides at
+    once (useful for centering a slot on an existing line).
+
+    NEEDS LIVE VERIFICATION: ``SketchOffset2``'s exact argument order is
+    reconstructed from the SolidWorks API's documented intent, not confirmed
+    against a live install in this session -- see
+    NOVAS_ACOES_IMPLEMENTADAS.md.
+
+    Returns how many new segments appeared in the sketch after the call,
+    which is the only cheap way to confirm something was actually created."""
+
+    def _impl():
+        if distance <= 0:
+            raise ValueError(f"distance must be positive, got {distance}.")
+        doc = _active_doc()
+        sketch = _active_sketch(doc)
+        active_unit, factor = _unit_factor(unit)
+        x_m, y_m = to_meters(x, unit), to_meters(y, unit)
+        distance_m = to_meters(distance, unit)
+
+        before = len(_sketch_segments(sketch))
+        doc.ClearSelection2(True)
+        if not _select_by_id(doc, "", "SKETCHSEGMENT", x_m, y_m, 0):
+            raise RuntimeError(f"No sketch entity found near ({x}, {y}).")
+
+        # SketchOffset2(Distance, Reverse, SelectChain, Style, CapEnds, Bidirectional)
+        # Style: 0 = swSketchOffsetDefault. CapEnds: 0 = none (only meaningful
+        # for an open chain offset bidirectionally into a closed loop).
+        created = doc.SketchManager.SketchOffset2(
+            distance_m, bool(reverse), bool(select_chain), 0, 0, bool(bidirectional))
+        doc.ClearSelection2(True)
+        after = len(_sketch_segments(sketch))
+        if created is None and after <= before:
+            raise RuntimeError(
+                "SketchOffset2 created no new geometry. The picked entity may "
+                "not support offsetting, or the distance may be too large for "
+                "the available space."
+            )
+        return {
+            "picked_at": [x, y], "distance": distance, "reverse": reverse,
+            "bidirectional": bidirectional, "select_chain": select_chain,
+            "unit": active_unit,
+            "segments_before": before, "segments_after": after,
+            "new_segment_count": max(0, after - before),
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+async def convert_sketch_entities(x: float, y: float, z: float = 0,
+                                   entity_type: str = "edge",
+                                   unit: Optional[str] = None) -> dict:
+    """Project an existing 3D edge or face onto the active sketch plane as new
+    sketch geometry -- SolidWorks' "Convert Entities" sketch tool.
+
+    entity_type: 'edge' or 'face' (a face converts its whole outer loop).
+    x/y/z: a point (model space) that lies on the edge/face to convert.
+
+    Typical use: sketch on a new plane coplanar with an existing face, then
+    convert that face's boundary instead of redrawing it, so later changes to
+    the source geometry propagate automatically (SketchConvertEntities keeps
+    an on-edge relation to the source by default).
+
+    Returns how many new segments appeared, which is the cheap confirmation
+    that something was actually converted."""
+
+    def _impl():
+        kind = entity_type.lower()
+        if kind not in {"edge", "face"}:
+            raise ValueError(f"entity_type must be 'edge' or 'face', got '{entity_type}'.")
+        doc = _active_doc()
+        sketch = _active_sketch(doc)
+        x_m, y_m, z_m = to_meters(x, unit), to_meters(y, unit), to_meters(z, unit)
+
+        before = len(_sketch_segments(sketch))
+        doc.ClearSelection2(True)
+        sel_type = "EDGE" if kind == "edge" else "FACE"
+        if not _select_by_id(doc, "", sel_type, x_m, y_m, z_m):
+            raise RuntimeError(f"No {kind} found at ({x}, {y}, {z}).")
+
+        result_obj = doc.SketchManager.SketchConvertEntities()
+        doc.ClearSelection2(True)
+        after = len(_sketch_segments(sketch))
+        if not result_obj and after <= before:
+            raise RuntimeError(
+                f"SketchConvertEntities produced no new geometry from the "
+                f"selected {kind}."
+            )
+        return {
+            "entity_type": kind, "picked_at": [x, y, z], "unit": unit or _default_unit,
+            "segments_before": before, "segments_after": after,
+            "new_segment_count": max(0, after - before),
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def get_sketch_contours(name: Optional[str] = None) -> dict:
+    """Report whether the active (or named) sketch's contours are open or
+    closed, and how many of each. Read-only.
+
+    A sketch meant to be extruded/revolved needs at least one CLOSED, non-
+    self-intersecting outer contour; an open contour fails or behaves
+    unpredictably at extrude time with a message that does not always say
+    which loop is the problem. Call this before extrude_sketch/cut_extrude
+    on a hand-edited or imported sketch to catch that ahead of time.
+
+    Uses ``ISketch::GetSketchContours``. Where SolidWorks will not report
+    per-contour detail, ``contours`` is reported as an empty list with
+    ``detail_available: false`` rather than a guess -- ``closed_count`` /
+    ``open_count`` remain None in that case too, so the caller is never told
+    a profile is safe to extrude on data this tool could not actually read.
+    """
+
+    def _impl():
+        doc = _active_doc()
+        if name:
+            sketch = None
+            for raw_feature in doc.FeatureManager.GetFeatures(False) or ():
+                feature = win32com.client.Dispatch(raw_feature)
+                try:
+                    if feature.Name != name:
+                        continue
+                except Exception:
+                    continue
+                try:
+                    specific = _com_member(feature, "GetSpecificFeature2")
+                    sketch = win32com.client.Dispatch(specific) if specific else None
+                except Exception:
+                    sketch = None
+                break
+            if sketch is None:
+                raise RuntimeError(f"No sketch named '{name}' in this document's feature tree.")
+            sketch_name = name
+        else:
+            sketch = _active_sketch(doc)
+            try:
+                sketch_name = sketch.Name
+            except Exception:
+                sketch_name = None
+
+        try:
+            raw_contours = sketch.GetSketchContours() or ()
+        except Exception as exc:
+            return {
+                "sketch": sketch_name, "detail_available": False,
+                "closed_count": None, "open_count": None, "contours": [],
+                "warnings": [f"GetSketchContours() is unavailable on this "
+                             f"SolidWorks build/version ({exc}); contour "
+                             f"open/closed status is UNKNOWN, not confirmed closed"],
+            }
+
+        contours = []
+        closed_count = 0
+        for raw_contour in raw_contours:
+            try:
+                contour = win32com.client.Dispatch(raw_contour)
+                closed = bool(_com_member(contour, "IsClosed"))
+            except Exception:
+                closed = None
+            if closed:
+                closed_count += 1
+            contours.append({"closed": closed})
+
+        open_count = sum(1 for c in contours if c["closed"] is False)
+        unknown_count = sum(1 for c in contours if c["closed"] is None)
+        warnings = []
+        if unknown_count:
+            warnings.append(
+                f"{unknown_count} contour(s) did not report IsClosed; treat "
+                f"this sketch as UNVERIFIED for extrude/cut, not closed")
+        if not contours:
+            warnings.append("sketch has no contours at all (empty sketch)")
+        return {
+            "sketch": sketch_name, "detail_available": True,
+            "contour_count": len(contours),
+            "closed_count": closed_count, "open_count": open_count,
+            "unknown_count": unknown_count,
+            "contours": contours,
+            "warnings": warnings,
+        }
+
+    return await _run(_impl)
+
+
+# ===========================================================================
+# Relation/dimension tools (additions)
+# ===========================================================================
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False))
+async def remove_sketch_relation(x: float, y: float, unit: Optional[str] = None) -> dict:
+    """Remove a single geometric relation at the sketch location (x, y).
+
+    Pick the RELATION icon itself (the small green/blue symbol SolidWorks
+    draws next to the constrained entities), not the entity it sits on --
+    SelectByID2 is asked for a "SKETCHRELATION" specifically. Use
+    query_sketch_relations or inspect the sketch visually first to find
+    where a relation's icon sits.
+
+    This is the undo for add_sketch_relation when the wrong constraint was
+    added, or when a relation is blocking a dimension/equation from solving
+    (B24-style solver conflicts are often a leftover relation, not the new
+    dimension itself)."""
+
+    def _impl():
+        doc = _active_doc()
+        if doc.SketchManager.ActiveSketch is None:
+            raise RuntimeError("No sketch is active.")
+        x_m, y_m = to_meters(x, unit), to_meters(y, unit)
+        doc.ClearSelection2(True)
+        if not _select_by_id(doc, "", "SKETCHRELATION", x_m, y_m, 0):
+            raise RuntimeError(
+                f"No sketch relation found near ({x}, {y}). Relation icons are "
+                f"small and sit slightly off the constrained entity itself; "
+                f"zoom in and re-check the coordinate."
+            )
+        if not bool(doc.Extension.DeleteSelection2(0)):
+            raise RuntimeError(f"SolidWorks could not delete the relation near ({x}, {y}).")
+        return {"removed_at": [x, y], "unit": unit or _default_unit}
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def query_sketch_relations(name: Optional[str] = None) -> dict:
+    """Count the geometric relations in the active (or named) sketch. Read-only.
+
+    Uses ``ISketch::GetSketchRelationsCount``. SolidWorks' COM API exposes a
+    COUNT cleanly but does not expose a simple per-relation enumeration (type,
+    the entities it binds) the way it does for segments/points -- so this
+    reports the count and, where available, how many relations touch each
+    entity, rather than fabricating per-relation detail this tool cannot
+    actually read. For diagnosing a SPECIFIC conflicting/redundant relation,
+    use the SolidWorks UI's own "Display/Delete Relations" dialog, or
+    remove_sketch_relation once the relation's on-screen location is known.
+    """
+
+    def _impl():
+        doc = _active_doc()
+        if name:
+            sketch = None
+            for raw_feature in doc.FeatureManager.GetFeatures(False) or ():
+                feature = win32com.client.Dispatch(raw_feature)
+                try:
+                    if feature.Name != name:
+                        continue
+                except Exception:
+                    continue
+                try:
+                    specific = _com_member(feature, "GetSpecificFeature2")
+                    sketch = win32com.client.Dispatch(specific) if specific else None
+                except Exception:
+                    sketch = None
+                break
+            if sketch is None:
+                raise RuntimeError(f"No sketch named '{name}' in this document's feature tree.")
+            sketch_name = name
+        else:
+            sketch = _active_sketch(doc)
+            try:
+                sketch_name = sketch.Name
+            except Exception:
+                sketch_name = None
+
+        try:
+            count = int(_com_member(sketch, "GetSketchRelationsCount"))
+            detail_available = True
+        except Exception as exc:
+            count = None
+            detail_available = False
+        return {
+            "sketch": sketch_name,
+            "relation_count": count,
+            "detail_available": detail_available,
+            "warnings": [] if detail_available else [
+                f"GetSketchRelationsCount is unavailable on this SolidWorks "
+                f"build/version ({exc if not detail_available else ''}); "
+                f"relation count is UNKNOWN"],
+        }
+
+    return await _run(_impl)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+async def set_dimension_driven(x: float, y: float, driven: bool = True,
+                                unit: Optional[str] = None) -> dict:
+    """Toggle a dimension at sketch/drawing location (x, y) between DRIVEN
+    (reference, shown in parentheses, cannot change the model) and DRIVING
+    (controls the geometry -- the normal kind add_sketch_dimension creates).
+
+    Works in whichever document is active (part/assembly sketch or drawing):
+    the pick point is in that document's own coordinate system. Use this to
+    add an informational "reference" dimension that documents a computed
+    result without risking it fighting another driving dimension for control
+    of the same geometry.
+
+    Uses ``IDimension::Driven``, read back after setting to confirm it stuck.
+    """
+
+    def _impl():
+        doc = _active_doc()
+        x_m, y_m = to_meters(x, unit), to_meters(y, unit)
+        doc.ClearSelection2(True)
+        if not _select_by_id(doc, "", "DIMENSION", x_m, y_m, 0):
+            raise RuntimeError(f"No dimension found near ({x}, {y}).")
+        selected = doc.SelectionManager.GetSelectedObject6(1, -1)
+        if selected is None:
+            raise RuntimeError(f"Dimension near ({x}, {y}) could not be resolved.")
+        display_dim = win32com.client.Dispatch(selected)
+        dim = win32com.client.Dispatch(display_dim.GetDimension2(0))
+        dim.Driven = bool(driven)
+        after = bool(_com_member(dim, "Driven"))
+        doc.ClearSelection2(True)
+        if after != bool(driven):
+            raise RuntimeError(
+                f"SolidWorks did not apply Driven={driven}; it reads back as "
+                f"{after}. Some dimension types (e.g. the first dimension that "
+                f"fully defines a sketch) cannot be made driven."
+            )
+        return {"picked_at": [x, y], "unit": unit or _default_unit, "driven": after}
+
+    return await _run(_impl)
+
 
 # ===========================================================================
 # Feature tools
