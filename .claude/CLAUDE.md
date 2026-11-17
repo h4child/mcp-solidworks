@@ -59,7 +59,7 @@ Você projeta peças/montagens no SolidWorks via MCP para quem pede. Isso inclui
 | "Isso aqui vai ser usinado/moldado/cortado a laser" | `knowledge/processos_de_fabricacao.md` |
 | Antes de dizer "pronto" pro usuário | `knowledge/verificacao_e_qa.md` |
 | Montar peças que se encaixam (pino, eixo, rosca, mancal) | `knowledge/montagens_mecanicas_reais.md` |
-| O usuário pede algo que pode não ter ferramenta (elipse, offset de esboço, draft, superfície, FEA, CAM, simulação de movimento física...) | `AUDITORIA_COBERTURA_FUNCIONAL.md` (354 capacidades do SolidWorks mapeadas item a item contra o código atual: testado/implementado-não-testado/parcial/experimental/ausente, com `server.py:linha` de evidência) antes de inventar um caminho ou dizer "não dá" de cabeça |
+| O usuário pede algo que pode não ter ferramenta (elipse, offset de esboço, draft, superfície, FEA, CAM, simulação de movimento física...) | `docs/audits/AUDITORIA_COBERTURA_FUNCIONAL.md` (354 capacidades do SolidWorks mapeadas item a item contra o código atual: testado/implementado-não-testado/parcial/experimental/ausente, com `server.py:linha` de evidência) antes de inventar um caminho ou dizer "não dá" de cabeça |
 
 ## O que este MCP NÃO faz (não finja que faz)
 
@@ -87,7 +87,7 @@ Você projeta peças/montagens no SolidWorks via MCP para quem pede. Isso inclui
 - **Sem CAM/fabricação** (fresamento, torneamento, trajetória de ferramenta,
   G-code) — exige SolidWorks CAM/CAMWorks, um add-in licenciado separado
   nunca referenciado neste servidor.
-- Ver `AUDITORIA_COBERTURA_FUNCIONAL.md` para a lista completa e atualizada
+- Ver `docs/audits/AUDITORIA_COBERTURA_FUNCIONAL.md` para a lista completa e atualizada
   do que existe, é parcial, é experimental ou está ausente, categoria por
   categoria do SolidWorks.
 
@@ -96,4 +96,4 @@ Você projeta peças/montagens no SolidWorks via MCP para quem pede. Isso inclui
 Isso já está no `instructions` do servidor (injetado automaticamente ao
 conectar), mas vale repetir: sessão **real**, efeito **imediato**.
 `execute_python` continua desligado por padrão — não peça pro usuário ligar
-"só pra essa peça", resolva pelas 158 ferramentas normais.
+"só pra essa peça", resolva pelas 167 ferramentas normais.

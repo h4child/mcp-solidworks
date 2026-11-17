@@ -1,6 +1,6 @@
 """Live verification: insert_component's origin correction for SUB-ASSEMBLIES.
 
-Documented gap (RELATORIO_ESCADA_INDUSTRIAL.md, "limitacoes conhecidas"):
+Documented gap (docs/reports/RELATORIO_ESCADA_INDUSTRIAL.md, "limitacoes conhecidas"):
 insert_component corrects a PART's placement (origin, not bbox-centre) but
 not a sub-assembly's, because GetBodies2 (what the correction was computed
 from) returns nothing for an assembly document.

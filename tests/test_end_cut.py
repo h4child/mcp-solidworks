@@ -168,10 +168,12 @@ class Rig:
             return {"verified": True, "actual_depth": depth, "warnings": []}
 
         async def save_document(path=None):
-            self.calls.append(("save",)); return {"path": "C:/x/Perna.SLDPRT"}
+            self.calls.append(("save",))
+            return {"path": "C:/x/Perna.SLDPRT"}
 
         async def close_document(save=False):
-            self.calls.append(("close", save)); return {}
+            self.calls.append(("close", save))
+            return {}
 
         monkeypatch.setattr(server, "_run", fake_run)
         for name, fn in (("create_sketch", create_sketch), ("draw_profile", draw_profile),

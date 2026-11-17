@@ -1,12 +1,18 @@
 import asyncio
 import json
 import math
+import sys
 from pathlib import Path
 
-import server
+# Lives in examples/planetary_reducer/ since v5.22.0; the server module and the
+# tests/output folder are still at the repository root.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT))
+
+import server  # noqa: E402
 
 
-ROOT = Path(__file__).resolve().parent / "tests" / "output" / "redutor_planetario_2_estagios"
+ROOT = REPO_ROOT / "tests" / "output" / "redutor_planetario_2_estagios"
 PARTS = ROOT / "parts"
 SUBS = ROOT / "subassemblies"
 REPORT = ROOT / "relatorio_verificacao.json"

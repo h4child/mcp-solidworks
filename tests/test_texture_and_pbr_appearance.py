@@ -2,14 +2,14 @@
 Tests for the texture U/V mapping, best-effort blend/bump, and PBR-extended
 appearance reporting added to close three gaps the audit package flagged as
 "lacuna de evidencia": UV texture mapping, advanced PBR materials, and
-reflection/roughness/relief configuration (see AUDIT_REPORT.md F1 and the
+reflection/roughness/relief configuration (see docs/audits/AUDIT_REPORT.md F1 and the
 docstrings of apply_texture / list_p2m_appearances).
 
 None of this touches a real SolidWorks session: ``_active_doc`` and
 ``_run`` are monkeypatched the same way tests/test_escada_tools.py does it,
 so these are pure-Python tests of argument plumbing and defensive COM
 property probing -- not proof that the real API behaves as documented.
-``LIVE_TESTS_REQUIRED.md`` lists what still needs a live SolidWorks to
+``docs/audits/LIVE_TESTS_REQUIRED.md`` lists what still needs a live SolidWorks to
 confirm, in particular the corrected CreateTexture argument order.
 
 Run with:  python -m pytest tests/test_texture_and_pbr_appearance.py -q

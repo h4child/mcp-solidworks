@@ -9,8 +9,10 @@ name: CI
 # see server.py's _connect(), which raises a clean error when nothing is
 # running instead of hanging).
 on:
+  # Every branch, not just main: work branches used to merge in red because
+  # nothing ran on them until after the merge.
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
 
 jobs:
@@ -41,3 +43,12 @@ jobs:
 
       - name: Test
         run: uv run pytest
+
+      # The tool catalog is sent to the model on every conversation. The
+      # budget starts at the v5.22.0 size and is lowered as descriptions are
+      # trimmed (PLANO_DE_MELHORIA_MCP.txt, phase 3) -- it only goes down.
+      - name: Tool catalog context budget
+        run: uv run python scripts/measure_catalog.py --max-tokens 60000
+
+      - name: Build ChatGPT plugin
+        run: uv run python scripts/build_chatgpt_plugin.py --zip

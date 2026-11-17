@@ -263,12 +263,16 @@ def test_delete_tools_are_destructive_and_not_read_only(name):
     assert annotations.destructiveHint is True
 
 
-def test_run_macro_and_execute_python_are_the_only_open_world_tools():
+def test_only_the_escape_hatch_tools_are_open_world():
     """Every other tool's effect is confined to the local SolidWorks session
-    and the project folder -- a closed world. These two run arbitrary,
-    unreviewed code/macro bodies, which is open-world by definition."""
+    and the project folder -- a closed world. These three are escape hatches
+    whose effect the server cannot bound: run_macro and execute_python run
+    arbitrary, unreviewed code/macro bodies, and run_command_by_id runs
+    whatever UI command the numeric ID happens to map to in the installed
+    SolidWorks version. Adding a fourth must be a deliberate decision made
+    here, not a side effect of a new tool's annotations."""
     open_world = {n for n in TOOLS if TOOLS[n].annotations.openWorldHint}
-    assert open_world == {"run_macro", "execute_python"}
+    assert open_world == {"run_macro", "execute_python", "run_command_by_id"}
 
 
 # ---------------------------------------------------------------------------

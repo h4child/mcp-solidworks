@@ -10,7 +10,13 @@ __pycache__/
 tests/
 .git/
 debug.log
-RELATORIO_TESTES.md
+docs/
+examples/
+scripts/
+packaging/
+CHANGELOG.md
+PLANO_DE_MELHORIA_MCP.txt
+dist/
 RELATORIO_REPOSITORIO.md
 *.mcpb
 .venv/

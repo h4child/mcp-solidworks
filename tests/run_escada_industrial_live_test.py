@@ -172,7 +172,8 @@ async def stage_sub(name, do_mates=True):
     P = parts_table()
     path = os.path.join(OUT, name + ".SLDASM")
     if os.path.exists(path):
-        print(f"[skip] {name} exists"); return
+        print(f"[skip] {name} exists")
+        return
     await server.connect_solidworks()
     await server.create_new_assembly()
     placed = []
@@ -197,7 +198,8 @@ async def stage_main():
     P = parts_table()
     path = os.path.join(OUT, "EscadaIndustrial.SLDASM")
     if os.path.exists(path):
-        print("[skip] main exists"); return
+        print("[skip] main exists")
+        return
     await server.connect_solidworks()
     await server.create_new_assembly()
     await server.save_document(path)
@@ -224,7 +226,6 @@ async def stage_main():
 
 def expected_leaf_boxes():
     """leaf component base name -> list of expected global boxes (mm) from part bbox + insertion point."""
-    P = parts_table()
     log = {}
     for line in Path(OUT, "_parts_log.jsonl").read_text(encoding="utf-8").splitlines():
         d = json.loads(line)
@@ -280,12 +281,15 @@ async def stage_verify():
             if best is None or d < best[0]:
                 best = (d, i)
         if best is None:
-            bad.append((key, "no component")); continue
-        used.add(best[1]); worst = max(worst, best[0])
+            bad.append((key, "no component"))
+            continue
+        used.add(best[1])
+        worst = max(worst, best[0])
         if best[0] > 0.6:
             bad.append((key, leaves[best[1]]["name"], round(best[0], 3), leaves[best[1]]["box"], [round(v, 2) for v in eb]))
     print("matched:", len(used), "of", len(exp), "worst box deviation mm:", round(worst, 3))
-    for b in bad: print("  MISMATCH", b)
+    for b in bad:
+        print("  MISMATCH", b)
     Path(OUT, "_verify_boxes.json").write_text(json.dumps(rows, indent=1), encoding="utf-8")
     return rows
 

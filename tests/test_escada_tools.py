@@ -201,25 +201,30 @@ class Recorder:
 
     def install(self, monkeypatch):
         async def create_new_part():
-            self.calls.append(("new",)); return {"title": "Peca1"}
+            self.calls.append(("new",))
+            return {"title": "Peca1"}
 
         async def create_sketch(plane):
             self.calls.append(("sketch", plane))
 
         async def draw_rectangle(x1, y1, x2, y2, unit, tol):
-            self.calls.append(("rect", x1, y1, x2, y2)); return {}
+            self.calls.append(("rect", x1, y1, x2, y2))
+            return {}
 
         async def draw_circle(x, y, r, unit, tol):
-            self.calls.append(("circle", x, y, r)); return {}
+            self.calls.append(("circle", x, y, r))
+            return {}
 
         async def draw_profile(points, closed, unit, tol):
-            self.calls.append(("poly", len(points))); return {}
+            self.calls.append(("poly", len(points)))
+            return {}
 
         async def close_sketch():
             self.calls.append(("close_sketch",))
 
         async def extrude_sketch(depth, both, merge, unit, tol):
-            self.calls.append(("extrude", depth, both)); return {"verified": True}
+            self.calls.append(("extrude", depth, both))
+            return {"verified": True}
 
         async def move_copy_body(body, dx, dy, dz, rx=0, ry=0, rz=0, unit=None):
             self.calls.append(("rotate", body, rx, ry, rz))
@@ -237,10 +242,12 @@ class Recorder:
                     "bounding_box": {"size": {}}}
 
         async def save_document(path):
-            self.calls.append(("save", path)); return {"path": path}
+            self.calls.append(("save", path))
+            return {"path": path}
 
         async def close_document(save=False):
-            self.calls.append(("close", save)); return {}
+            self.calls.append(("close", save))
+            return {}
 
         monkeypatch.setattr(server, "_first_solid_body_name", lambda doc: "Corpo1")
         monkeypatch.setattr(server, "_active_doc", lambda: None)

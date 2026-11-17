@@ -18,6 +18,27 @@ Metodo ................. (1) leitura do codigo e dos relatorios existentes
                          secao 8).
 
 --------------------------------------------------------------------------------
+ANDAMENTO
+--------------------------------------------------------------------------------
+
+  Fase 0 ......... CONCLUIDA em 5.22.0 (2026-11-17). Ver CHANGELOG.md.
+                   0.1 teste open-world corrigido (inclui run_command_by_id)
+                   0.2 ruff zerado (sem `ruff format`, adiado para a Fase 4)
+                   0.3 copia do plugin removida; scripts/build_chatgpt_plugin.py
+                       + packaging/chatgpt/ + testes em tests/test_packaging.py
+                   0.4 versao 5.22.0, CHANGELOG.md, contagens corrigidas,
+                       teste que compara a contagem documentada com o servidor
+                   0.5 receitas de produto movidas para
+                       examples/recipes/product_recipes.py (server.py -830 linhas)
+                   0.6 docs/audits/, docs/reports/, examples/planetary_reducer/
+                   0.7 CI em toda branch + gate de catalogo (60k tokens) + build
+                       do plugin
+                   Resultado: ruff limpo; pytest 1.448 passados, 0 falhas.
+                   Os caminhos deste plano escritos antes da mudanca (ex.:
+                   AUDIT_REPORT.md na raiz) agora estao em docs/audits/.
+  Fases 1-8 ...... pendentes.
+
+--------------------------------------------------------------------------------
 0. RESUMO EXECUTIVO
 --------------------------------------------------------------------------------
 

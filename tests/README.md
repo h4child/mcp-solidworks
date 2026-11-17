@@ -17,7 +17,7 @@ python -m pytest
 python tests/run_live_test_project.py --dry-run
 ```
 
-Os testes estáticos verificam sintaxe, as 150 funções MCP, a equivalência entre
+Os testes estáticos verificam sintaxe, as 167 ferramentas MCP (+ `execute_python` condicional), a equivalência entre
 `server.py` e `manifest.json`, documentação de versão, regras de `.gitignore`
 e padrões comuns de credenciais.
 

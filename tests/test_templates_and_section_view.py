@@ -6,7 +6,7 @@ unverified) dynamic section-view toggle.
 None of this touches a real SolidWorks session: ``_connect``/``_active_doc``
 and ``_run`` are monkeypatched the same way tests/test_escada_tools.py and
 tests/test_texture_and_pbr_appearance.py already do it. See
-LIVE_TESTS_REQUIRED.md for what still needs a live SolidWorks session,
+docs/audits/LIVE_TESTS_REQUIRED.md for what still needs a live SolidWorks session,
 especially set_section_view/clear_section_view, whose COM method names are
 guesses, not documented API.
 

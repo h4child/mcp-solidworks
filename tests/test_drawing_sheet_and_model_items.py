@@ -1,13 +1,13 @@
 """
 Tests for set_sheet_scale and insert_model_items -- the two tools added to
 close the "folha/tamanho/escala" write-side gap and the "cota automatica"
-gap found in AUDITORIA_COBERTURA_FUNCIONAL.md (category O, items O02/O07).
+gap found in docs/audits/AUDITORIA_COBERTURA_FUNCIONAL.md (category O, items O02/O07).
 
 Both call real SolidWorks API methods (ISheet::SetScale,
 IDrawingDoc::InsertModelAnnotations2) that are NOT reused from an
 already-confirmed-live code path the way get_drawing_layout's read side
 is -- see the "UNVERIFIED" note in each tool's docstring and
-LIVE_TESTS_REQUIRED.md. These tests only confirm the Python-level argument
+docs/audits/LIVE_TESTS_REQUIRED.md. These tests only confirm the Python-level argument
 plumbing and validation against mocked COM objects, never real SolidWorks
 behavior.
 

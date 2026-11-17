@@ -559,7 +559,7 @@ def test_assembly_components_bounding_box_exists_and_recurses():
     """GetBodies2 is a part-document concept: an assembly reports no bodies
     of its own, so _bodies_bounding_box(subassembly_doc) always returned
     None and insert_component silently skipped the origin correction for any
-    sub-assembly (RELATORIO_ESCADA_INDUSTRIAL.md, 'limitacoes conhecidas').
+    sub-assembly (docs/reports/RELATORIO_ESCADA_INDUSTRIAL.md, 'limitacoes conhecidas').
     The fix unions the sub-assembly's own top-level components instead, and
     has to recurse for a sub-assembly nested inside another one."""
     assert hasattr(server, "_assembly_components_bounding_box")
