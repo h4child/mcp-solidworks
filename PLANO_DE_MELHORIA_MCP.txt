@@ -1,0 +1,966 @@
+================================================================================
+PLANO DE MELHORIA DO SOLIDWORKS MCP  (h4child/mcp-solidworks)
+Roteiro de acao para levar o servidor a nivel profissional
+================================================================================
+
+Data da analise ........ 2026-11-17
+Commit analisado ....... e688ac204f0a87b1edd1a2154085f122866684fe (main, 2026-10-15)
+Versao declarada ....... 5.21.5 (pyproject.toml / manifest.json)
+Ambiente da analise .... Linux, sem SolidWorks (COM falseado por tests/conftest.py).
+                         Tudo que depende de SolidWorks real esta marcado [LIVE].
+Metodo ................. (1) leitura do codigo e dos relatorios existentes
+                         (AUDIT_REPORT, AUDITORIA_COBERTURA_FUNCIONAL, BUGS_AND_FIXES,
+                         LIVE_TESTS_REQUIRED, README); (2) execucao real de
+                         `uv sync --group dev`, `ruff check .`, `pytest`;
+                         (3) medicao do catalogo MCP via server.mcp.list_tools();
+                         (4) pesquisa web sobre API SolidWorks, spec MCP, SDK
+                         Python, MCPB e servidores MCP concorrentes (fontes na
+                         secao 8).
+
+--------------------------------------------------------------------------------
+0. RESUMO EXECUTIVO
+--------------------------------------------------------------------------------
+
+O projeto esta funcionalmente maduro (168 ferramentas, 1.439 testes, base de
+conhecimento de engenharia, verificacao pos-operacao em quase toda ferramenta),
+mas tem cinco problemas que o impedem de ser considerado "profissional":
+
+  1. A CI ESTA VERMELHA no commit atual: 1 teste de contrato falha e o linter
+     acusa 21 erros. Ninguem percebeu porque a CI so roda em push para main e
+     o ultimo merge entrou sem passar por ela.
+  2. O CATALOGO DE FERRAMENTAS CUSTA ~58 MIL TOKENS por sessao (201.821
+     caracteres de JSON). Isso e enviado ao modelo em toda conversa, antes do
+     usuario digitar qualquer coisa. Literatura e docs do MCP recomendam que o
+     catalogo fique entre 1% e 5% da janela de contexto; aqui ele e 25-30% de
+     uma janela de 200k.
+  3. O SERVIDOR E UM MONOLITO de 16.869 linhas (772 KB) num unico server.py,
+     com uma COPIA DIVERGENTE em chatgpt-solidworks-mcp-plugin/ (898 linhas de
+     diferenca, versao 5.21.0, bugs ja corrigidos no principal continuam la).
+  4. A DOCUMENTACAO E A VERSAO ESTAO DESATUALIZADAS: README, CLAUDE.md,
+     tests/README e comentarios dizem 158 (ou 150) ferramentas; o servidor
+     registra 167 + execute_python. Nove ferramentas entraram depois da 5.21.5
+     sem bump de versao nem changelog.
+  5. A DEPENDENCIA PRINCIPAL ESTA EM FIM DE VIDA: `mcp<2` (SDK 1.29.0). O SDK
+     2.0 saiu em julho/2026, renomeou FastMCP para MCPServer e colocou a linha
+     1.x em modo manutencao (so correcoes de seguranca). O servidor ainda usa
+     tres APIs privadas do SDK que vao quebrar na migracao.
+
+Alem disso ha bugs confirmados por leitura (politica de caminhos sem
+realpath/normcase, launch do SolidWorks como efeito colateral de ferramentas de
+leitura, ~830 linhas de codigo morto) e lacunas de produto ja mapeadas pela
+auditoria anterior (undo, protecao contra sobrescrita, primitivas de esboco).
+
+O roteiro abaixo esta dividido em 8 fases. As fases 0 e 1 cabem em uma semana
+e deixam o repositorio verde, seguro e honesto. As fases 2-5 (contrato MCP,
+dieta de contexto, modularizacao, migracao de SDK) sao o que transforma o
+projeto em um servidor MCP profissional. As fases 6-8 sao evolucao continua.
+
+--------------------------------------------------------------------------------
+1. DIAGNOSTICO VERIFICADO (medido nesta sessao)
+--------------------------------------------------------------------------------
+
+1.1 Metricas
+
+  server.py ........................... 16.869 linhas / 772 KB
+  Ferramentas registradas ............. 167 incondicionais + execute_python = 168
+  Resources / prompts ................. 14 / 1
+  Testes (pytest) ..................... 1.439 coletados: 1.438 passam, 1 FALHA
+  ruff check . ........................ 21 erros (3 em server.py, 3 na copia do
+                                        plugin, 15 em tests/)
+  Catalogo list_tools (JSON) .......... 201.821 chars ~ 50-58 mil tokens
+  Maior definicao de ferramenta ....... create_spur_gear: 5.933 chars
+                                        (descricao de 4.392 chars)
+  Ferramentas com outputSchema ........ 0 de 168
+  Chamadas SelectByID2 ................ 66
+  Blocos `except Exception` ........... 258 (47 seguidos de `pass`)
+  Funcoes de ferramenta > 150 linhas .. create_spur_gear (421),
+                                        verify_assembly_positions (235),
+                                        hole_wizard (206), cut_part_end (188),
+                                        pack_and_go (170), restore_assembly_pose
+                                        (166)
+  SDK instalado ....................... mcp 1.29.0 (protocolo 2025-11-25),
+                                        pin "mcp>=1.0.0,<2"
+  Commits por autor ................... h4child 60, Claude 27, Bruno Silva 7,
+                                        rodgger 7 (varios autores/sessoes de IA
+                                        editando o mesmo monolito)
+
+1.2 Bugs e defeitos confirmados
+
+  B-01 [CRITICO] CI vermelha: teste de contrato falha
+       tests/test_contract.py:266
+         test_run_macro_and_execute_python_are_the_only_open_world_tools
+       Causa: run_command_by_id (server.py:15273) foi adicionada com
+       openWorldHint=True (decisao deliberada, documentada no docstring), mas
+       o teste que congela "so run_macro e execute_python sao open-world" nao
+       foi atualizado.
+       Correcao: atualizar o conjunto esperado no teste para
+       {"run_macro", "execute_python", "run_command_by_id"} e documentar no
+       docstring do teste por que run_command_by_id entra na lista.
+       (Alternativa: marcar run_command_by_id como openWorldHint=False e
+       destructiveHint=True; nao recomendo, o raciocinio do autor e valido.)
+
+  B-02 [CRITICO] CI vermelha: lint
+       server.py:16600  E731/E741  `extent = lambda lo, hi: ...` com variavel `l`
+       server.py:16614  F841       `sketch = await draw_profile(...)` nunca usado
+       tests/test_escada_tools.py, tests/test_end_cut.py,
+       tests/run_escada_industrial_live_test.py: E701/E702 (varios comandos na
+       mesma linha), F841.
+       chatgpt-solidworks-mcp-plugin/server.py: os mesmos 3 erros do server.py.
+       Correcao: trocar o lambda por `def _extent(lo, hi)`, remover a atribuicao
+       nao usada, quebrar as linhas com `;` nos testes.
+
+  B-03 [ALTO] Contagem de ferramentas e versao desatualizadas
+       README.md:4, :24, :334, :461 -> "158" / "159"
+       .claude/CLAUDE.md:99 -> "158"
+       tests/README.md:20 -> "150"
+       server.py:74, :181, :276 (comentarios) -> "158"
+       Real: 167 + execute_python. As 9 ferramentas novas (get_default_templates,
+       set_default_templates, create_document_from_template, save_as_template,
+       run_command_by_id, set_section_view, clear_section_view,
+       set_sheet_scale, insert_model_items) entraram em commits posteriores a
+       5.21.5 sem bump de versao. O teste
+       test_the_version_is_consistent_across_the_packaging_files so confere
+       que o README MENCIONA a versao, nao a contagem.
+       Correcao: bump para 5.22.0, CHANGELOG.md, e um teste que compara a
+       contagem declarada no README com len(server.mcp._tool_manager._tools).
+
+  B-04 [ALTO] Copia divergente em chatgpt-solidworks-mcp-plugin/
+       server.py difere em 898 linhas; plugin.json e pyproject em 5.21.0;
+       falta .claude/knowledge/campos_de_verificacao.md; chapa_metalica.md e
+       verificacao_e_qa.md desatualizados. Todo bug corrigido no principal
+       (ex.: BUG-01 timeout lockup, BUG-02 validate_model, BUG-03
+       apply_texture) continua presente no plugin distribuido.
+       Correcao: apagar a copia do git; gerar o pacote do plugin a partir do
+       codigo principal por script (scripts/build_chatgpt_plugin.py) que copia
+       server.py, gear_geometry.py, alfa_drawing.py, .claude/ e injeta a
+       versao do pyproject em plugin.json. Rodar na CI para provar que gera.
+
+  B-05 [MEDIO] Codigo morto (~830 linhas)
+       server.py:12579-13410: create_automotive_piston,
+       create_automotive_piston_assembly,
+       create_automotive_piston_with_connecting_rod,
+       create_pedestal_fan_propeller. Nao sao registradas como ferramentas
+       (politica correta do README: "receitas de produto completo nao sao
+       ferramentas publicas"), mas ficaram no arquivo. Sao 5% do server.py
+       que todo leitor/IA precisa pular.
+       Correcao: mover para examples/recipes/ como scripts que usam o cliente
+       MCP (ou apagar; o git guarda o historico). Ajustar
+       tests/test_contract.py:701-704, que hoje so confirma que nao sao tools.
+
+  B-06 [MEDIO/SEGURANCA] Politica de caminhos de escrita fragil
+       server.py:439 _resolve_write_path e :15487 _resolve_macro_path usam
+       os.path.abspath + str.startswith(root + os.sep):
+         - abspath NAO resolve symlink/junction: uma junction dentro da raiz
+           permitida apontando para fora passa (ja previsto em LT-03).
+         - Windows e case-insensitive, mas a comparacao e case-sensitive:
+           "c:\projetos\x.sldprt" com raiz "C:\Projetos" e recusado (falso
+           negativo) e, pior, variacoes de caixa criadas pelo proprio
+           SolidWorks em paths devolvidos por ele podem falhar.
+         - Nao trata caminhos UNC nem prefixo \\?\.
+       Correcao: `os.path.realpath` + `os.path.normcase` nos dois lados e
+       `os.path.commonpath([root, path]) == root`; testes unitarios com
+       tmp_path (symlink em Linux cobre o caso de junction).
+
+  B-07 [ALTO/PRODUTO] Catalogo gigante (~58k tokens)
+       Toda ferramenta carrega um docstring longo (media 1.200 chars, maximo
+       4.392) e todos os parametros tipados. 168 ferramentas e mais que o
+       triplo do ponto (~50) a partir do qual estudos relatam queda na
+       precisao de escolha de ferramenta. Clientes como Claude Desktop enviam
+       o catalogo inteiro em cada turno.
+       Ver Fase 3 (dieta de contexto).
+
+  B-08 [MEDIO] Ferramentas de leitura podem LANCAR o SolidWorks
+       server.py:589 _connect(): se nao ha instancia rodando, qualquer
+       ferramenta (inclusive get_document_info, list_open_documents) chama
+       os.startfile(exe) e bloqueia a thread COM por ate 120 s. Um cliente que
+       so queria inspecionar acaba abrindo um processo pesado. Contradiz a
+       anotacao readOnlyHint=True dessas ferramentas.
+       Correcao: launch so em connect_solidworks(launch=True) (default True
+       apenas ali); nas demais, falhar rapido com "SolidWorks nao esta aberto;
+       chame connect_solidworks".
+
+  B-09 [BAIXO] Logging DEBUG fixo
+       server.py:57 logging.basicConfig(level=logging.DEBUG) sem variavel de
+       ambiente. Em stdio o stderr vai para o log do cliente; cada chamada
+       gera varias linhas DEBUG com exc_info (inclusive tracebacks de
+       tentativas best-effort que falharam de proposito).
+       Correcao: SOLIDWORKS_MCP_LOG_LEVEL (default INFO) e, depois da Fase 2,
+       enviar logs relevantes pelo canal MCP (ctx.info/ctx.warning).
+
+  B-10 [ALTO/CONTRATO] Nenhum outputSchema / structuredContent
+       Desde o protocolo 2025-06-18 ferramentas podem declarar schema de saida
+       e devolver structuredContent validado. Hoje todo retorno e `dict` livre:
+       o campo `verified` ora e bool, ora None; `warnings` ora lista, ora
+       ausente; `unit` ora string, ora dentro de sub-objeto. A propria base de
+       conhecimento (campos_de_verificacao.md) precisou de 7 KB para explicar
+       as variacoes. Ver Fase 2.
+
+  B-11 [ALTO/ROBUSTEZ] Estado global por processo, nao por documento
+       _default_unit (set_units), _last_user_sketch_name/_obj,
+       _ENTITY_REGISTRY, _stuck_call, _app. Nenhuma ferramenta recebe ou
+       confere QUAL documento deve operar: tudo usa app.ActiveDoc. Se o
+       usuario clica em outra janela no meio de uma sequencia, a proxima
+       feature vai para o documento errado sem aviso (T16 da auditoria,
+       LT-04). Ver Fase 1, item 1.4.
+
+  B-12 [ALTO/MANUTENCAO] Dependencia de APIs privadas do SDK
+       server.py:48  ArgModelBase.model_config = ConfigDict(extra="forbid")
+                     (monkeypatch global de classe interna do FastMCP)
+       server.py:179 patch de mcp._tool_manager.call_tool
+       server.py:296 mcp._tool_manager._tools (tambem em tests/test_contract.py)
+       Todas quebram no SDK 2.x (FastMCP virou MCPServer, ToolManager mudou).
+       Correcao: Fase 5; ate la, isolar esses acessos em um unico modulo
+       (sdk_compat.py) para a migracao tocar um arquivo so.
+
+  B-13 [ALTO/MANUTENCAO] SDK 1.x em fim de vida
+       mcp 2.0.0 (jul/2026) suporta o protocolo 2026-07-28 e e o que `pip
+       install mcp` entrega hoje; 1.x recebe so correcoes de seguranca.
+       FastMCP 4 (PrefectHQ) tambem migrou para o SDK 2. Ver Fase 5.
+
+  B-14 [MEDIO/DISTRIBUICAO] manifest.json incompleto para o usuario final
+       - `tools`: lista manual de 168 entradas que precisa ser mantida a mao
+         (ha teste que compara com o servidor, mas e trabalho repetido).
+         O formato MCPB aceita `tools_generated: true`.
+       - Sem `user_config`: SOLIDWORKS_MCP_PROJECT_ROOTS,
+         SOLIDWORKS_MCP_MACRO_ROOTS, SOLIDWORKS_MCP_ENABLE_EXECUTE_PYTHON,
+         SOLIDWORKS_MCP_CALL_LOG e o futuro LOG_LEVEL so podem ser definidos
+         editando variaveis de ambiente do sistema; o Claude Desktop oferece
+         uma UI de configuracao por extensao que o manifest nao usa.
+       - `manifest_version: "0.4"`: a spec publicada do MCPB esta em 0.3
+         (2025-12-02). Confirmar com `npx @anthropic-ai/mcpb validate`
+         [LIVE em Windows] antes de empacotar; se 0.4 nao existir, o pack
+         pode estar sendo aceito por tolerancia do validador.
+
+  B-15 [BAIXO] Ferramentas chamando ferramentas
+       cut_part_end (server.py:16508) chama `await create_sketch(...)`,
+       `await draw_profile(...)`, `await cut_extrude(...)` diretamente. Hoje
+       funciona porque sao corrotinas Python puras; no SDK 2 (e com
+       outputSchema) o retorno pode virar CallToolResult e esse acoplamento
+       quebra. Correcao: extrair a logica interna (_impl) das ferramentas em
+       funcoes sincronas reutilizaveis e compor essas funcoes, nao as tools.
+
+  B-16 [BAIXO/SEGURANCA] execute_python nao e sandbox e nao deve parecer um
+       server.py:15629 _BLOCKED_BUILTINS remove open/__import__/exec..., mas
+       `win32com` esta no escopo: win32com.client.Dispatch("WScript.Shell")
+       da shell completo. O docstring ja diz "privileged"; falta dizer
+       explicitamente "NAO ha sandbox; a lista de builtins bloqueados e so
+       para evitar acidentes, nao ataques". Manter desligado por padrao.
+
+  B-17 [BAIXO] Raiz do repositorio poluida
+       5 RELATORIO_*.md, REDUTOR_PLANETARIO_PROJETO.md,
+       build_planetary_reducer.py, redutor_planetario_spec.json,
+       TOOL_INVENTORY.csv, 4 documentos de auditoria. Mover para docs/ e
+       examples/ (ver Fase 0).
+
+  B-18 [MEDIO] CI incompleta
+       .github/workflows/ci.yml roda ruff + pytest em ubuntu e windows. Falta:
+       `mcpb validate`, gate de tamanho do catalogo, gate de contagem no
+       README, cobertura (pytest-cov) e trigger em push para QUALQUER branch
+       (hoje so main + PR -> branches `ccr-*` entram vermelhas).
+
+  B-19 [MEDIO] Testes ao vivo sem framework
+       13 scripts tests/run_*_live_test.py repetem conexao, criacao de doc
+       descartavel, relatorio JSON e sys.exit. Nao ha matriz de versao do
+       SolidWorks (README so cita 2025 PT-BR) nem um unico relatorio
+       consolidado que alimente a matriz OK/EXP.
+
+  B-20 [BAIXO] Changelog dentro do README (900 linhas)
+       O resource solidworks://tool-status le o README inteiro em runtime;
+       quanto mais changelog, mais tokens o cliente recebe ao consultar o
+       status. Separar CHANGELOG.md e gerar o status de uma fonte estruturada
+       (ver Fase 2, item 2.4).
+
+1.3 Lacunas funcionais relevantes (herdadas de AUDITORIA_COBERTURA_FUNCIONAL,
+    confirmadas na pesquisa de API)
+
+  P0 (seguranca de dados / sucesso falso)
+    - Sobrescrita sem aviso em save_document / export_document / pack_and_go
+      (R15). API: checar os.path.exists antes de SaveAs3; parametro
+      overwrite: bool = False.
+    - Sem undo (S11). API confirmada: IModelDoc2::EditUndo2(n) desfaz n
+      acoes; IModelDocExtension::StartRecordingUndoObject /
+      FinishRecordingUndoObject2(nome, hidden) agrupa varias chamadas num
+      unico passo de undo. Permite "transacao" por ferramenta.
+    - destructiveHint nao protege nada (S10). Spec MCP: a protecao e do
+      cliente; o servidor pode (a) exigir `confirm: true` em ferramentas
+      destrutivas quando SOLIDWORKS_MCP_REQUIRE_CONFIRM=1, (b) usar
+      elicitation (protocolo 2025-06-18+) para pedir confirmacao ao usuario.
+    - Corte que nao intersecta / volume antes-depois (D24, D25): cut_extrude
+      ja mede profundidade; falta medir volume antes/depois e avisar
+      "removed_mm3 = 0".
+    - Falha de solver de esboco (B24): API ISketch::ConstrainedStatus
+      (swConstrainedStatus_e: Undefined/FullyConstrained/OverConstrained/
+      NoSolution/InvalidSolution) -- nome exato a confirmar no help da versao
+      alvo [LIVE]; GetSketchStatus NAO existe como metodo da API.
+
+  P1 (fundamentos de esboco e selecao)
+    - Primitivas ausentes: elipse (ISketchManager::CreateEllipse, centro +
+      ponto do eixo maior + ponto do eixo menor), slot
+      (CreateSketchSlot), retangulo centrado (CreateCenterRectangle), arco de
+      3 pontos (Create3PointArc), ponto (CreatePoint), texto
+      (InsertSketchText), filete/chanfro de esboco (CreateFillet,
+      CreateChamfer), offset (SketchOffset2 -- o SketchOffset antigo e
+      obsoleto), trim (SketchTrim), converter entidades (SketchUseEdge2 --
+      ConvertEntities esta marcado "not implemented" na API).
+    - Selecao robusta: IModelDocExtension::SelectByRay (ponto + direcao +
+      raio + filtro de tipo) e documentado como independente da camera e
+      recomendado pela propria Dassault sobre SelectByID2 por coordenada
+      (que "e propenso a falhar se a vista do modelo for alterada").
+      Hoje ha 66 chamadas SelectByID2; _planar_face_at_point ja contorna
+      para faces planas via GetClosestPointOn.
+    - Estado do esboco (sub/sobre-definido) em get_sketch_status.
+    - Draft, thicken, ponto de referencia, sistema de coordenadas, excluir/
+      substituir face.
+
+  P2/P3 (evolucao)
+    - Document Manager API (swDocumentMgr): ler propriedades, referencias e
+      BOM sem abrir o SolidWorks (exige chave de licenca gratuita por versao,
+      pedida a Dassault). Util para extract_assembly_bom em lote.
+    - Modo background: ISldWorks::UserControl / Visible / FrameState,
+      IModelView::EnableGraphicsUpdate, IFeatureManager::EnableFeatureTree
+      para acelerar lotes (create_spur_gear com 1.000+ CreateLine2).
+    - SolidWorks 2026: API ganhou notificacao de reordenacao de cut list,
+      tabelas de familia em desenhos e mover vista independente das filhas
+      (nada que quebre o codigo atual; registrar na matriz de versoes).
+    - Superficies, Motion fisico, FEA, CAM: fora de escopo, manter
+      documentado como "nao faz".
+
+--------------------------------------------------------------------------------
+2. O QUE A PESQUISA MOSTROU (contexto para as decisoes)
+--------------------------------------------------------------------------------
+
+2.1 Servidores MCP SolidWorks concorrentes (GitHub, nov/2026)
+    - Slacker-LLC/solidworks-mcp: 92 ferramentas, screenshots como feedback,
+      "nunca lanca o SolidWorks, nunca executa codigo arbitrario". Postura de
+      seguranca mais conservadora que a nossa (B-08, B-16).
+    - Radityaaa04/Solidworks-MCP: 52 ferramentas, SolidWorks 2026, STA COM.
+    - tkhosravi/solidworks-mcp: C#/.NET 8, chama via vtable (nao IDispatch),
+      mais rapido e sem problemas de VARIANT byref.
+    - vespo92/SolidworksMCP-TS: gera macros VBA para metodos com 13+
+      parametros (nosso FeatureExtrusion2 tem 23 e FeatureCut4 tem 27).
+    - alisamsam/solidworks-mcp: 22 ferramentas, fallbacks por versao 2023-2025.
+    - kilwizac/solidworks-api-mcp: NAO controla o SolidWorks; e um MCP de
+      BUSCA na documentacao da API (14.000 metodos/enums). Vale integrar como
+      ferramenta auxiliar de desenvolvimento ("qual a assinatura de
+      SketchOffset2?") em vez de adivinhar nomes de metodo (ver
+      _SECTION_VIEW_ON_CANDIDATES, _TEXTURE_BLEND_PROPERTY_CANDIDATES).
+    Posicionamento: este projeto e, de longe, o mais completo (168 vs 92) e o
+    unico com verificacao pos-operacao sistematica e base de conhecimento de
+    engenharia. O diferencial competitivo e confiabilidade, nao quantidade;
+    por isso a dieta de contexto (Fase 3) nao deve remover capacidades, so
+    tokens.
+
+2.2 Spec MCP e SDK Python
+    - 2025-06-18: structured output (outputSchema + structuredContent),
+      elicitation (servidor pergunta ao usuario), fim do batching, versao de
+      protocolo negociada obrigatoria.
+    - 2025-11-25: versao atual suportada pelo mcp 1.29 (LATEST_PROTOCOL_VERSION).
+    - 2026-07-28: versao suportada pelo SDK 2.0. Mudancas: FastMCP ->
+      MCPServer (sem alias), import mcp.server.fastmcp -> mcp.server.mcpserver,
+      tipos de protocolo em pacote mcp_types, transporte configurado em run().
+    - Tool annotations (readOnlyHint, destructiveHint, idempotentHint,
+      openWorldHint) sao DICAS para o cliente; nao impoem nada no servidor.
+    - Progressive disclosure: hosts recomendam expor uma ferramenta de busca
+      quando o catalogo passa de 1-5% da janela; Anthropic adotou "tool
+      search" no Claude Code pelo mesmo motivo.
+
+2.3 MCPB (pacote .mcpb do Claude Desktop)
+    - manifest_version 0.3 e a versao publicada (confirmar se 0.4 e aceita).
+    - user_config com tipos string/directory/boolean/number, `sensitive`,
+      e substituicao ${user_config.chave} em mcp_config.env.
+    - Bug conhecido (nov/2026): campos `sensitive` chegam cifrados em alguns
+      cenarios Windows; evitar `sensitive` para as nossas variaveis (nenhuma e
+      segredo).
+
+2.4 pywin32 e COM
+    - Dispatch dinamico vs makepy (EnsureDispatch): o codigo ja lida com os
+      dois (_split_com_result, _com_member, VARIANT byref). Risco conhecido:
+      com dispatch dinamico, parametros byref podem voltar com o valor do
+      primeiro argumento no ultimo. Recomendacao: um unico ponto de conexao
+      que tenta gencache.EnsureDispatch e registra qual binding esta ativo
+      (`binding: "typelib" | "dynamic"`) em get_solidworks_info, para que
+      relatorios de bug digam qual caminho foi usado.
+    - Out-of-process COM e lento por natureza (20x relatado em foruns);
+      ferramentas com centenas de chamadas (create_spur_gear, draw_profile)
+      devem desligar atualizacao grafica e arvore durante o lote.
+
+--------------------------------------------------------------------------------
+3. ROTEIRO DE ACAO POR FASES
+--------------------------------------------------------------------------------
+Convencao: cada item tem [arquivo] -> acao -> criterio de aceite. "Esforco" e
+estimativa para 1 dev. Itens [LIVE] exigem Windows + SolidWorks real.
+
+================================================================================
+FASE 0 -- HIGIENE IMEDIATA (CI verde, versao honesta)           Esforco: 1-2 dias
+================================================================================
+
+0.1 Corrigir o teste de contrato quebrado (B-01)
+    [tests/test_contract.py:266] -> conjunto esperado passa a incluir
+    run_command_by_id; docstring explica que RunCommand executa qualquer
+    comando da UI, logo open-world.
+    Aceite: `uv run pytest` 100% verde.
+
+0.2 Zerar o ruff (B-02)
+    [server.py:16600,16614] [tests/test_escada_tools.py] [tests/test_end_cut.py]
+    [tests/run_escada_industrial_live_test.py]
+    Aceite: `uv run ruff check .` sem erros. Adicionar `ruff format --check`
+    como segundo passo (opcional, so se a equipe aceitar formatar o monolito
+    de uma vez -- recomendo esperar a Fase 4).
+
+0.3 Eliminar a copia do plugin (B-04)
+    - `git rm -r chatgpt-solidworks-mcp-plugin/` exceto plugin.json e mcp.json
+      (mover para packaging/chatgpt/).
+    - scripts/build_chatgpt_plugin.py: monta dist/chatgpt-plugin/ copiando
+      server.py, gear_geometry.py, alfa_drawing.py, .claude/, README.md e
+      injetando a versao do pyproject em plugin.json.
+    - .gitignore: dist/
+    Aceite: CI executa o script e verifica que a pasta gerada importa
+    (`python -c "import server"` com conftest falso).
+
+0.4 Versao, contagem e changelog (B-03, B-20)
+    - pyproject.toml / manifest.json / plugin.json -> 5.22.0.
+    - CHANGELOG.md novo (Keep a Changelog): mover todo o historico "Novas em
+      vX" do README para la; README fica com link.
+    - README.md: trocar "158"/"159" por "167 + execute_python"; CLAUDE.md:99;
+      tests/README.md:20; comentarios em server.py:74,181,276 -> remover o
+      numero (dizer "todas as ferramentas").
+    - tests/test_contract.py: novo teste que extrai o numero do README (regex
+      "(\d+) ferramentas incondicionais") e compara com o servidor.
+    Aceite: teste novo passa; `grep -n "158" README.md` vazio.
+
+0.5 Remover codigo morto (B-05)
+    [server.py:12579-13410] -> examples/recipes/automotive_piston.py e
+    pedestal_fan.py (reescritos como scripts que chamam o servidor via cliente
+    MCP, ou apagados). Ajustar tests/test_contract.py:701-704.
+    Aceite: server.py perde ~830 linhas; suite verde.
+
+0.6 Organizar a raiz (B-17)
+    docs/audits/   <- AUDIT_REPORT.md, AUDITORIA_COBERTURA_FUNCIONAL.md,
+                      BUGS_AND_FIXES.md, LIVE_TESTS_REQUIRED.md, TOOL_INVENTORY.csv
+    docs/reports/  <- RELATORIO_*.md, REDUTOR_PLANETARIO_PROJETO.md
+    examples/      <- build_planetary_reducer.py, redutor_planetario_spec.json
+    Atualizar links no README e em .claude/CLAUDE.md (a tabela "Por onde
+    comecar" aponta para AUDITORIA_COBERTURA_FUNCIONAL.md).
+    Atencao: .mcpbignore precisa continuar incluindo README.md (o resource
+    tool-status le o README) e excluindo docs/ e examples/.
+    Aceite: `ls` da raiz mostra so server.py, 2 modulos, pyproject, manifest,
+    README, CHANGELOG, COMO_USAR, LICENSE, .claude/, tests/, docs/, examples/,
+    scripts/, packaging/.
+
+0.7 CI em toda branch (B-18, parte 1)
+    [.github/workflows/ci.yml] -> `on: push: branches: ["**"]`; adicionar
+    passo `uv run python scripts/measure_catalog.py --max-tokens 60000`
+    (limite inicial igual ao atual, para nao quebrar; a Fase 3 reduz).
+    Aceite: push nesta branch dispara CI e fica verde.
+
+================================================================================
+FASE 1 -- SEGURANCA E ROBUSTEZ OPERACIONAL                      Esforco: 1 semana
+================================================================================
+
+1.1 Politica de caminhos correta (B-06)
+    [server.py:439, :15487] -> funcao unica `_path_within_roots(path, roots)`
+    com realpath + normcase + commonpath; mensagem de erro mostra o caminho
+    resolvido e a raiz mais proxima.
+    Testes: tests/test_path_policy.py com tmp_path: subpasta ok, `..` fora,
+    symlink para fora recusado, caixa diferente aceita (simular normcase com
+    monkeypatch de os.path.normcase), UNC recusado quando raiz e local.
+    [LIVE] LT-03 com junction real.
+
+1.2 Protecao contra sobrescrita (R15)
+    [save_document, export_document, export_flat_pattern_dxf, pack_and_go,
+     capture_standard_views, capture_viewport, save_as_template]
+    -> parametro `overwrite: bool = False`; se destino existe e overwrite e
+    False, erro claro ANTES de qualquer chamada COM. save_document sem
+    filepath (salvar no proprio arquivo) continua permitido.
+    Aceite: teste unitario por ferramenta (padrao de tests/test_bugfixes.py).
+
+1.3 Lancamento do SolidWorks so sob demanda (B-08)
+    [server.py:589 _connect] -> parametro interno `allow_launch=False`;
+    connect_solidworks(launch: bool = True) e a unica que passa True. Demais
+    ferramentas falham em < 1 s com "SolidWorks nao esta em execucao".
+    Aceite: teste com fake COM que GetActiveObject falha -> get_document_info
+    levanta RuntimeError sem chamar os.startfile.
+
+1.4 Guarda de documento ativo (B-11, P1-1 da auditoria)
+    Desenho minimo, sem mudar a assinatura das 168 ferramentas:
+    - create_new_part/assembly/drawing/open_document gravam
+      `_expected_doc = {"title": ..., "path": ...}`.
+    - _active_doc() compara app.ActiveDoc.GetTitle/GetPathName com o esperado;
+      se divergir, levanta "Documento ativo mudou de X para Y; chame
+      activate_document(Y) ou open_document" (nova ferramenta
+      activate_document(title) que atualiza o esperado).
+    - get_document_info devolve `expected_document` e `matches_active`.
+    - Variavel SOLIDWORKS_MCP_STRICT_ACTIVE_DOC=0 desliga a guarda (compat).
+    Aceite: teste com fake COM simulando troca de ActiveDoc.
+    [LIVE] LT-04.
+
+1.5 Undo e transacoes (S11)
+    - Nova ferramenta `undo(steps: int = 1)` -> IModelDoc2::EditUndo2(steps),
+      devolve `features_before/after` (list_features) para provar o efeito.
+    - Helper `_undo_object(doc, name)` (context manager) usando
+      IModelDocExtension::StartRecordingUndoObject /
+      FinishRecordingUndoObject2(name, False); aplicar primeiro nas
+      ferramentas compostas (create_spur_gear, cut_part_end, hole_wizard,
+      create_profile_part) para que um unico Ctrl+Z desfaca a ferramenta
+      inteira.
+    [LIVE] confirmar que FinishRecordingUndoObject2 existe na versao alvo
+    (documentado 2025) e o comportamento com hidden=False.
+
+1.6 Confirmacao de operacoes destrutivas (S10)
+    - SOLIDWORKS_MCP_REQUIRE_CONFIRM=1 -> ferramentas com destructiveHint=True
+      (16 hoje) exigem `confirm: true`; sem ele, devolvem {needs_confirmation,
+      what_will_happen}. Default desligado (nao quebra clientes atuais).
+    - Apos a Fase 5, trocar por elicitation quando o cliente suportar.
+    Aceite: teste parametrizado sobre as 16 ferramentas destrutivas.
+
+1.7 Log configuravel e sem ruido (B-09)
+    SOLIDWORKS_MCP_LOG_LEVEL (default INFO); exc_info apenas em DEBUG;
+    calls.jsonl continua opcional via SOLIDWORKS_MCP_CALL_LOG (documentar que
+    pode ser desligado com valor vazio).
+
+1.8 Recuperacao de chamada travada (BUG-01 continuado)
+    - Nova ferramenta de leitura `get_server_health()` -> {stuck_call,
+      com_alive, binding, uptime, last_error}.
+    - Watchdog: se _stuck_call persiste > N min, _connect descarta _app e
+      tenta reconectar numa NOVA thread executor (o executor antigo fica
+      orfao com a chamada presa). Documentar que o processo SolidWorks pode
+      precisar ser fechado pelo usuario.
+    [LIVE] LT-01.
+
+1.9 execute_python: deixar claro que nao e sandbox (B-16)
+    Docstring + README: "nao ha isolamento; qualquer objeto COM no escopo da
+    acesso total ao sistema". Manter desligado por padrao.
+
+================================================================================
+FASE 2 -- CONTRATO E OBSERVABILIDADE MCP                       Esforco: 1-2 semanas
+================================================================================
+
+2.1 Envelope de resultado padronizado
+    Definir em `contracts.py` (Python puro, testavel):
+      class ToolResult(TypedDict, total=False):
+          ok: bool                     # a operacao aconteceu
+          verified: bool | None        # medida bateu? None = nao verificavel
+          verification_skipped: str | None
+          measurement_method: str | None
+          unit: str
+          warnings: list[str]
+          errors: list[str]
+          data: dict                   # payload especifico da ferramenta
+    Migrar as ferramentas em ondas (sketch -> features -> assembly -> drawing)
+    mantendo os campos antigos no topo por uma versao (compat) e removendo em
+    6.0. campos_de_verificacao.md passa a documentar UM contrato.
+
+2.2 outputSchema por ferramenta (B-10)
+    FastMCP gera outputSchema a partir da anotacao de retorno (TypedDict /
+    pydantic BaseModel). Meta: 100% das ferramentas de leitura e de medicao
+    na primeira onda (38 + ~25), demais na segunda.
+    Aceite: teste de contrato "toda ferramenta tem outputSchema" (com lista
+    de excecoes que so diminui) e `structuredContent` validado no teste com
+    fake COM para 10 ferramentas representativas.
+
+2.3 Progresso e logs pelo protocolo
+    Ferramentas longas (create_spur_gear, draw_profile, pack_and_go,
+    extract_assembly_bom, interference_report, capture_standard_views) recebem
+    `ctx: Context` e chamam ctx.report_progress(i, n) e ctx.info(...). O
+    cliente mostra barra em vez de "travado por 4 minutos".
+    Obs.: Context precisa chegar ate _impl -> passar callbacks thread-safe
+    (loop.call_soon_threadsafe) porque _impl roda na thread COM.
+
+2.4 Status de confiabilidade como dado, nao como README (B-20)
+    - docs/tool_status.yaml: por ferramenta: status (ok|exp|untested),
+      sw_versions_tested, last_verified (data), evidence (script/relatorio),
+      caveats.
+    - solidworks://tool-status gerado do YAML (markdown curto); README
+      renderizado do YAML por script (scripts/render_status.py) -- fim da
+      edicao manual da matriz.
+    - Cada ferramenta recebe `_meta: {"status": ..., "last_verified": ...}`
+      no catalogo (campo meta do MCP) para o cliente ver sem ler o resource.
+    Aceite: teste que todo nome do YAML existe no servidor e vice-versa.
+
+2.5 Erros tipados
+    Hoje tudo e RuntimeError/ValueError com texto. Criar hierarquia em
+    errors.py: SolidWorksNotRunning, NoActiveDocument, WrongDocumentType,
+    SelectionFailed, FeatureFailed(feature, reason), SketchSnapDetected,
+    PathPolicyViolation, ComTimeout, ComStuck. Mensagens continuam em texto,
+    mas o `code` vai no payload para a IA tratar por tipo (ex.: FeatureFailed
+    -> inspecionar esboco; ComStuck -> parar e avisar o usuario).
+
+================================================================================
+FASE 3 -- DIETA DE CONTEXTO (catalogo de ~58k para <= 15k tokens)  Esforco: 1 sem.
+================================================================================
+
+3.1 Medir e travar
+    scripts/measure_catalog.py (ja proposto em 0.7) imprime tokens totais e
+    por ferramenta; CI falha acima do limite; limite cai por fase:
+    60k -> 30k (apos 3.2) -> 15k (apos 3.3/3.4).
+
+3.2 Descricoes curtas + documentacao longa em resources
+    - Regra: description <= 500 chars: o que faz, pre-condicao, o que
+      verifica. Nada de historico de bugs, datas ou "confirmado ao vivo em
+      2026-10-04" (isso vai para tool_status.yaml e CHANGELOG).
+    - O docstring longo atual vira docs/tools/<nome>.md e e exposto como
+      resource solidworks://docs/<nome> (lazy: o cliente le so quando
+      precisa).
+    - Parametros: descricoes de campo via Annotated[..., Field(description=)]
+      so onde o nome nao e autoexplicativo.
+    Aceite: teste "nenhuma descricao > 500 chars"; medicao <= 30k.
+
+3.3 Consolidar familias de ferramentas (sem perder capacidade)
+    Candidatos claros (mesmo objeto, CRUD):
+      display_state(action: list|create|apply|rename|delete, ...)   5 -> 1
+      equation(action: list|add|set|delete, ...)                    4 -> 1
+      default_templates(action: get|set, ...)                        2 -> 1
+      section_view(enable: bool, plane, offset)                      2 -> 1
+      configuration(action: list|create|switch|delete)               4 -> 1
+      persistent_reference(action: get|resolve)                      2 -> 1
+      texture(action: apply|remove, ...)                             2 -> 1
+      view(set_named|set_direction|zoom_fit|zoom_area|get_state)     5 -> 1
+      component(fix|float|suppress|unsuppress|delete, name)          5 -> 1
+      drawing_annotation(kind: note|centerline|weld|surface_finish|
+                         gdt|balloon, ...)                            6 -> 1
+    Resultado: ~168 -> ~130 sem remover nenhuma operacao. Manter nomes
+    antigos como aliases ocultos por uma versao? Nao: MCP nao tem alias; fazer
+    a quebra em 6.0 com tabela de migracao no CHANGELOG e tool_names.json
+    atualizado no mesmo commit.
+    Atencao: ferramentas com acoes de risco diferente (delete vs list) devem
+    continuar separadas OU a consolidada herda destructiveHint=True --
+    preferir manter `delete_*` separadas e consolidar so leituras/escritas
+    nao destrutivas.
+
+3.4 Descoberta progressiva (opcional, apos 3.3)
+    Ferramenta `search_tools(query)` + `describe_tool(name)` que devolvem o
+    docstring completo de docs/tools/. Permite ao cliente operar com o
+    catalogo curto e pedir detalhe sob demanda. Avaliar com Claude Desktop e
+    Claude Code se a selecao de ferramenta melhora (medir em 10 tarefas de
+    RELATORIO_TESTES.md antes/depois).
+
+================================================================================
+FASE 4 -- MODULARIZACAO DO MONOLITO                            Esforco: 2-3 semanas
+================================================================================
+
+4.1 Estrutura alvo (pacote `solidworks_mcp/`)
+    solidworks_mcp/
+      __init__.py          versao
+      app.py               cria o MCPServer/FastMCP, registra modulos
+      runtime/com.py       executor STA, _run, timeouts, _stuck_call, binding
+      runtime/connect.py   _connect, _find_solidworks_exe, _com_is_alive
+      runtime/paths.py     politica de raizes (1.1)
+      runtime/units.py     to_meters, _unit_factor
+      runtime/errors.py    (2.5)
+      contracts.py         (2.1)
+      selection.py         _select_by_id, select_by_ray, _planar_face_at_point,
+                           _select_last_sketch (+ cache de esboco por documento)
+      tools/documents.py   connect, new/open/save/close, templates, info
+      tools/sketch.py      create_sketch*, draw_*, dimensions, relations, status
+      tools/features.py    extrude, cut, revolve, sweep, loft, fillet, chamfer,
+                           shell, patterns, hole_wizard, mirror, bodies, ref geom
+      tools/sheetmetal.py  base flange, bends, flatten, dxf
+      tools/weldment.py    profiles, gusset, end cap, trim, cut_part_end,
+                           profile/tube parts
+      tools/assembly.py    insert, components, mates, poses, interference,
+                           patterns, exploded, motion
+      tools/drawing.py     views, dimensions, annotations, tables, verify
+      tools/appearance.py  material, appearance, texture, p2m, display states
+      tools/inspection.py  measure, validate, faces, selection, viewport,
+                           persistent refs, dependencies, equations
+      tools/gears.py       create_spur_gear, create_gear (+ gear_geometry)
+      tools/macros.py      list_macro_methods, run_macro, run_command_by_id,
+                           execute_python (condicional)
+      resources.py         knowledge/*, tool-status, docs/<tool>
+      prompts.py           design_from_reference
+    server.py na raiz vira 5 linhas: `from solidworks_mcp.app import mcp;
+    if __name__ == "__main__": mcp.run()` -- manifest.json e configs de
+    cliente nao mudam.
+
+4.2 Regras de migracao
+    - Mover funcao por funcao SEM alterar comportamento; test_contract.py
+      (nomes, assinaturas, anotacoes) e tests/tool_names.json sao a rede de
+      seguranca; rodar a suite a cada modulo movido.
+    - Testes que fazem monkeypatch em `server.<nome>` passam a usar o modulo
+      novo (procurar `monkeypatch.setattr(server,` em tests/).
+    - Cada tools/*.py exporta `register(mcp)`; nada de import circular:
+      modulos de tools importam runtime/selection, nunca uns aos outros
+      (resolve B-15: cut_part_end compoe funcoes de features.py, nao tools).
+    - alfa_drawing.py e gear_geometry.py entram no pacote como
+      solidworks_mcp/geometry/.
+
+4.3 Qualidade apos a quebra
+    - ruff com regras B (bugbear), UP (pyupgrade), SIM; `ruff format`.
+    - Reduzir `except Exception: pass` (47): cada um vira
+      `except Exception: log.debug(...)` ou e justificado em comentario de 1
+      linha; CI com regra ruff S110/BLE001 em modo warning.
+    - mypy em modo leve (runtime/ e contracts.py estritos; tools/ gradual).
+
+================================================================================
+FASE 5 -- MIGRACAO PARA O SDK MCP 2.x                           Esforco: 1 semana
+================================================================================
+Pre-requisito: Fase 4 (os acessos privados ficam em runtime/sdk_compat.py).
+
+5.1 Trocar `mcp>=1.0.0,<2` por `mcp>=2.0,<3`; FastMCP -> MCPServer;
+    `from mcp.server.fastmcp` -> `from mcp.server.mcpserver`; Image/Context
+    nos novos caminhos; transporte em run().
+5.2 Substituir os 3 acessos privados (B-12):
+    - extra="forbid": verificar se o SDK 2 expoe configuracao oficial de
+      validacao estrita; senao, validar args no wrapper de 5.3.
+    - instrumentacao de chamadas: usar middleware/hook oficial do SDK 2 (ou
+      decorar o registro de cada tool via register() da Fase 4).
+    - _tool_manager._tools: usar a API publica de listagem.
+5.3 Protocolo: negociar 2026-07-28; usar elicitation para 1.6; manter
+    compatibilidade com clientes 2025-xx (o SDK negocia para baixo).
+5.4 Validar com Claude Desktop (MCPB), Claude Code, Cursor e um cliente
+    ChatGPT [LIVE/Windows]. Registrar em docs/CLIENTS.md.
+5.5 Enquanto o Claude Desktop estavel nao exigir 2.x, manter branch
+    `compat-sdk1` recebendo so correcoes criticas por 2 releases.
+
+================================================================================
+FASE 6 -- FUNCIONALIDADES (1 item por PR, com teste e entrada no status YAML)
+================================================================================
+Ordem por valor/risco. Toda ferramenta nova nasce `untested` no YAML e so vira
+`ok` com evidencia [LIVE].
+
+6.1 Esboco (Categoria A/B da auditoria)
+    draw_ellipse (CreateEllipse), draw_slot (CreateSketchSlot), draw_rectangle
+    (center=True -> CreateCenterRectangle), draw_arc_3pt (Create3PointArc),
+    draw_point, add_sketch_fillet / add_sketch_chamfer, sketch_offset
+    (SketchOffset2), sketch_trim (SketchTrim), convert_entities
+    (SketchUseEdge2), draw_text (InsertSketchText).
+    get_sketch_status -> incluir constrained_status (ISketch::ConstrainedStatus
+    [LIVE: confirmar nome e enum]) e dof restantes se a API expuser.
+6.2 Selecao robusta
+    select_by_ray(point, direction, radius, type) como ferramenta e como
+    helper interno; migrar hole_wizard, fillet_edges, create_sketch_on_face
+    para preferir SelectByRay quando a entidade nao e plana.
+6.3 Verificacao de corte
+    cut_extrude / revolve(cut) / cut_part_end devolvem volume antes/depois e
+    `removed_mm3`; aviso se zero (D24/D25).
+6.4 Solidos
+    draft (InsertDraft / FeatureManager.InsertMultiFaceDraft), thicken (so se
+    superficies entrarem), reference_point, coordinate_system
+    (InsertCoordinateSystem), extrude/cut "ate a face" (end condition
+    UpToSurface com selecao da face), padrao em 2 direcoes e por curva.
+6.5 Chapa e estrutura
+    hem, corner relief, K-factor por documento; cut list lida da peca
+    (IBodyFolder / cut-list custom properties) sem precisar de desenho.
+6.6 Desenho
+    tamanho/formato de folha, carimbo (title block) via propriedades, tolerancia
+    em cota (IDisplayDimension.Tolerance), promover as 6 EXP de desenho para
+    OK com LT-11.
+6.7 Performance de lote
+    Context manager `_batch_mode(doc)`: IModelView::EnableGraphicsUpdate=False,
+    IFeatureManager::EnableFeatureTree=False, ISldWorks::UserControl=False
+    durante create_spur_gear/draw_profile/create_profile_part; restaurar em
+    finally. Medir tempo antes/depois [LIVE].
+6.8 Document Manager API (opcional, exige chave gratuita por versao)
+    read_file_properties(path) e read_file_references(path) sem abrir o
+    documento; util para BOM de centenas de pecas.
+6.9 Integrar busca na documentacao da API
+    Documentar no CONTRIBUTING que o MCP kilwizac/solidworks-api-mcp deve ser
+    usado por quem (humano ou IA) implementa ferramenta nova, em vez de
+    adivinhar nomes de metodo com listas de candidatos.
+
+================================================================================
+FASE 7 -- TESTES E VALIDACAO AO VIVO (continuo)
+================================================================================
+
+7.1 Framework comum para testes ao vivo (B-19)
+    tests/live/__init__.py: conexao, documento descartavel (tmp dir), captura
+    de screenshot, relatorio JSON por ferramenta {tool, sw_version, locale,
+    result, evidence_path}; cada run_*_live_test.py vira um modulo de casos
+    que o runner descobre. Saida alimenta docs/tool_status.yaml via
+    scripts/update_status_from_live.py.
+7.2 Executar LT-01..LT-11 (docs/audits/LIVE_TESTS_REQUIRED.md) e promover as
+    47 ferramentas sem status; registrar versao do SolidWorks e idioma.
+7.3 Matriz de versoes: 2023, 2024, 2025, 2026 (pelo menos 2025 e 2026); o
+    YAML guarda por versao. Fallback por versao onde a API mudou (modelo de
+    alisamsam/solidworks-mcp).
+7.4 Oraculo por macro gravada: para cada ferramenta EXP, gravar a operacao
+    na UI (Ferramentas > Macro > Gravar) e comparar a sequencia COM com a do
+    servidor; guardar o .swp em tests/live/macros/ como referencia.
+7.5 CI (B-18): cobertura com pytest-cov (meta inicial 70% em runtime/ e
+    contracts.py), gate de catalogo, gate de contagem no README,
+    `npx @anthropic-ai/mcpb validate manifest.json` no job Windows, build do
+    plugin ChatGPT (0.3), e job manual (workflow_dispatch) para runner
+    self-hosted Windows com SolidWorks que roda tests/live.
+
+================================================================================
+FASE 8 -- DISTRIBUICAO, DOCUMENTACAO E GOVERNANCA
+================================================================================
+
+8.1 manifest.json (B-14)
+    - user_config: project_roots (directory, multiple), macro_roots
+      (directory, multiple), enable_execute_python (boolean, default false),
+      log_level (string, default INFO), call_log_path (string, opcional),
+      require_confirm (boolean, default false), strict_active_doc (boolean,
+      default true). mcp_config.env mapeia para SOLIDWORKS_MCP_*.
+    - tools_generated: true e remover a lista manual (ou gerar por script).
+    - confirmar manifest_version com o validador.
+8.2 README enxuto (<= 300 linhas): o que e, instalar, configurar, 5 exemplos,
+    limites ("o que nao faz"), links para docs/. Versao em ingles (README.md)
+    e portugues (README.pt-BR.md) -- o publico de MCP e global.
+8.3 docs/: ARCHITECTURE.md (executor STA, timeouts, verificacao), STATUS.md
+    (gerado), CLIENTS.md, CONTRIBUTING.md (regra: 1 ferramenta por PR, teste
+    unitario + entrada YAML + LT), SECURITY.md (execute_python, run_macro,
+    run_command_by_id, raizes de caminho), CHANGELOG.md.
+8.4 Release: tag vX.Y.Z -> GitHub Action empacota .mcpb e o zip do plugin
+    ChatGPT e anexa ao release; versao lida do pyproject em um unico lugar
+    (scripts/bump_version.py atualiza manifest e plugin.json).
+8.5 Licenca: pyproject diz MIT mas nao ha arquivo LICENSE na raiz; adicionar.
+
+--------------------------------------------------------------------------------
+4. PRIORIZACAO (impacto x esforco)
+--------------------------------------------------------------------------------
+
+  ID    Item                                    Impacto  Esforco  Fase  Ordem
+  ----  --------------------------------------  -------  -------  ----  -----
+  B-01  teste de contrato quebrado              alto     1 h      0     1
+  B-02  ruff 21 erros                           alto     1 h      0     2
+  B-03  versao/contagem/changelog               alto     3 h      0     3
+  B-04  copia divergente do plugin              alto     4 h      0     4
+  B-05  codigo morto                            medio    2 h      0     5
+  B-17  raiz do repositorio                     baixo    2 h      0     6
+  B-18  CI em toda branch + gates               medio    3 h      0/7   7
+  B-06  realpath/normcase na politica de paths  alto     4 h      1     8
+  R15   overwrite protection                    alto     1 d      1     9
+  B-08  launch so em connect_solidworks         medio    3 h      1     10
+  B-11  guarda de documento ativo               alto     2 d      1     11
+  S11   undo + transacoes                       alto     2 d      1     12
+  S10   confirmacao destrutiva                  medio    1 d      1     13
+  B-09  log level                               baixo    1 h      1     14
+  B-10  envelope + outputSchema                 alto     1-2 sem  2     15
+  B-20  status YAML + resource gerado           medio    2 d      2     16
+  B-07  dieta de contexto                       alto     1 sem    3     17
+  mono  modularizacao                           alto     2-3 sem  4     18
+  B-12  isolar APIs privadas                    alto     (na 4)   4     18
+  B-13  migrar SDK 2.x                          alto     1 sem    5     19
+  A/B   primitivas de esboco + status           alto     1 sem    6     20
+  sel   SelectByRay                             medio    3 d      6     21
+  D24   volume antes/depois em cortes           medio    2 d      6     22
+  B-19  framework de testes ao vivo             alto     1 sem    7     23
+  LT    executar LT-01..LT-11 [LIVE]            alto     2-3 d    7     24
+  B-14  manifest user_config/tools_generated    medio    3 h      8     25
+  docs  README/ARCHITECTURE/SECURITY/LICENSE    medio    2 d      8     26
+
+--------------------------------------------------------------------------------
+5. METRICAS DE SUCESSO (medir a cada release)
+--------------------------------------------------------------------------------
+
+  - CI verde em toda branch; 0 erros ruff; cobertura >= 70% em runtime/.
+  - Catalogo list_tools <= 15.000 tokens (hoje ~58.000).
+  - 100% das ferramentas com outputSchema e envelope padrao.
+  - 100% das ferramentas com entrada em tool_status.yaml; 0 ferramentas
+    "untested" ha mais de 2 releases.
+  - Nenhum modulo > 2.500 linhas; nenhuma funcao de ferramenta > 120 linhas.
+  - Versao bump + CHANGELOG em todo merge que adiciona/renomeia ferramenta
+    (teste de contrato garante).
+  - SDK mcp 2.x; 0 acessos a atributos privados do SDK.
+  - Tempo de create_spur_gear (40 dentes) e draw_profile (500 pontos) medido
+    e publicado antes/depois do modo lote.
+  - Zero ferramentas de leitura com efeito colateral (launch, rebuild).
+
+--------------------------------------------------------------------------------
+6. RISCOS E DECISOES QUE CABEM AO MANTENEDOR
+--------------------------------------------------------------------------------
+
+  D1  Consolidar ferramentas (3.3) quebra nomes que clientes/prompts ja usam.
+      Decidir: fazer em um unico release 6.0 com tabela de migracao, ou manter
+      168 nomes e apostar so em descricoes curtas + search_tools (3.2 + 3.4).
+      Recomendacao: 3.2 primeiro (sem quebra), medir; consolidar so se ainda
+      estiver acima de 20k tokens.
+  D2  Migrar para SDK 2 antes de o Claude Desktop/MCPB exigir pode expor bugs
+      novos do SDK. Recomendacao: migrar logo apos a Fase 4, manter branch
+      compat por 2 releases.
+  D3  Guarda de documento ativo (1.4) pode irritar quem alterna janelas de
+      proposito. Por isso a variavel para desligar e a ferramenta
+      activate_document.
+  D4  Modularizacao e o maior risco de regressao silenciosa. Mitigacao: mover
+      sem reescrever; suite + tool_names.json; uma categoria por PR; rodar um
+      live test de fumaca (criar bloco + furo + medir) ao fim de cada PR.
+  D5  Nada marcado [LIVE] pode ser dado como feito sem Windows + SolidWorks.
+      O repositorio ja tem a disciplina certa (EXP ate prova em contrario);
+      manter.
+  D6  Escopo: superficies/Motion fisico/FEA/CAM continuam fora. Qualquer
+      pedido nessa direcao e um projeto a parte, nao um item deste roteiro.
+
+--------------------------------------------------------------------------------
+7. COMANDOS USADOS NA VERIFICACAO (reproduzir antes/depois de cada fase)
+--------------------------------------------------------------------------------
+
+  uv sync --group dev
+  uv run ruff check . --output-format concise
+  uv run pytest -q --timeout=60
+  uv run python - <<'EOF'
+  import sys, json, asyncio
+  sys.path.insert(0, "tests"); import conftest   # fake COM fora do Windows
+  import server
+  tools = asyncio.run(server.mcp.list_tools())
+  s = json.dumps([t.model_dump(exclude_none=True) for t in tools], ensure_ascii=False)
+  print(len(tools), "tools;", len(s), "chars; ~", int(len(s)/3.5), "tokens")
+  EOF
+  diff <(grep -A1 '^@mcp.tool' server.py | grep -o 'async def [a-z_0-9]*' | sort) \
+       <(python3 -c "import json;print('\n'.join(sorted(t['name'] for t in json.load(open('manifest.json'))['tools'])))")
+
+--------------------------------------------------------------------------------
+8. FONTES CONSULTADAS
+--------------------------------------------------------------------------------
+
+Repositorio (lidos integralmente ou por secao):
+  README.md, .claude/CLAUDE.md, AUDIT_REPORT.md, AUDITORIA_COBERTURA_FUNCIONAL.md,
+  BUGS_AND_FIXES.md, LIVE_TESTS_REQUIRED.md, tests/README.md, tests/conftest.py,
+  tests/test_contract.py, pyproject.toml, manifest.json, .github/workflows/ci.yml,
+  server.py (cabecalho, executor, _run, _connect, _resolve_write_path,
+  _select_last_sketch, extrude_sketch, cut_extrude, _measure_model_doc,
+  capture_viewport, validate_model, run_command_by_id, macros, execute_python,
+  resources), chatgpt-solidworks-mcp-plugin/.
+
+Servidores MCP SolidWorks (GitHub):
+  https://github.com/Slacker-LLC/solidworks-mcp
+  https://github.com/Radityaaa04/Solidworks-MCP
+  https://github.com/tkhosravi/solidworks-mcp
+  https://github.com/vespo92/SolidworksMCP-TS
+  https://github.com/alisamsam/solidworks-mcp
+  https://github.com/hjbaard/SolidWorks-MCP
+  https://github.com/Eduardof0nt/Solidworks-MCP-Server
+  https://github.com/MatteoBaisini/solidworks-mcp
+  https://github.com/kilwizac/solidworks-api-mcp   (busca na doc da API)
+
+Spec MCP e SDK Python:
+  https://py.sdk.modelcontextprotocol.io/migration/
+  https://py.sdk.modelcontextprotocol.io/protocol/
+  https://newreleases.io/project/github/modelcontextprotocol/python-sdk/release/v2.0.0
+  https://gofastmcp.com/development/v4-notes
+  https://jacar.es/en/migrate-mcp-server-to-fastmcp-4/
+  https://mcpservers-dev.pages.dev/blog/what-does-mcp-2025-06-18-change-for-server-builders
+  https://modelcontextprotocol.net/docs/develop/clients/client-best-practices
+  https://workos.com/blog/mcp-server-token-cost
+  https://www.klavis.ai/blog/less-is-more-mcp-design-patterns-for-ai-agents
+  https://mcp.directory/blog/mcp-context-bloat-fix-2026-tool-search-code-mode-progressive-disclosure
+
+MCPB (Claude Desktop):
+  https://github.com/modelcontextprotocol/mcpb/blob/main/MANIFEST.md
+  https://data-wise.github.io/himalaya-mcp/reference/mcpb-format-reference
+  https://claudeissues.com/issue/78296-bug-mcpb-sensitive-user-config-injected-as-encrypted-ciphertext-instead-of-decry
+
+API SolidWorks:
+  https://help.solidworks.com/2025/English/api/sldworksapi/SOLIDWORKS.Interop.sldworks~SOLIDWORKS.Interop.sldworks.IModelDoc2~EditUndo2.html
+  https://help.solidworks.com/2025/English/api/sldworksapi/SolidWorks.Interop.sldworks~SolidWorks.Interop.sldworks.IModelDocExtension~FinishRecordingUndoObject2.html
+  https://help.solidworks.com/2015/English/api/sldworksapi/SOLIDWORKS.Interop.sldworks~SOLIDWORKS.Interop.sldworks.IModelDocExtension~StartRecordingUndoObject.html
+  https://help.solidworks.com/2023/English/api/sldworksapi/SolidWorks.Interop.sldworks~SolidWorks.Interop.sldworks.IModelDocExtension~SelectByRay.html
+  https://help.solidworks.com/2022/English/api/sldworksapi/SOLIDWORKS.Interop.sldworks~SOLIDWORKS.Interop.sldworks.iModelDocExtension~SelectByID2.html
+  https://help.solidworks.com/2024/english/api/sldworksapi/solidworks.interop.sldworks~solidworks.interop.sldworks.isketchmanager_methods.html
+  https://help.solidworks.com/2021/English/api/sldworksapi/SOLIDWORKS.Interop.sldworks~SOLIDWORKS.Interop.sldworks.ISketchManager~CreateEllipse.html
+  https://help.solidworks.com/2015/English/api/sldworksapi/SolidWorks.Interop.sldworks~SolidWorks.Interop.sldworks.ISketchManager~CreateSketchSlot.html
+  https://help.solidworks.com/2026/English/WhatsNew/c_wn2026_fundamentals_api.htm
+  https://help.solidworks.com/2025/English/api/swdocmgrapi/Get_Configuration_Information_Example_CSharp.htm
+  https://codestack-net.blogspot.com/2018/04/document-manager-api-getting-started.html
+  https://3dswym.3dexperience.3ds.com/question/solidworks-user-forum/selectbyid2-s-dependence-on-viewport-state_TVVUWD_qR5md9qtPbBlHLA
+  https://3dswym.3dexperience.3ds.com/question/solidworks-user-forum/how-works-selectbyray_B4uljrqPRwmU4-WPJLbuwQ
+
+pywin32 / COM:
+  https://mail.python.org/pipermail/python-win32/2024-August/014920.html
+  https://sourceforge.net/p/pywin32/bugs/622
+  https://brian3johnson.github.io/pywin32/com/variant.html
+  https://jiaqiwang969.github.io/solidworks-GPT/docs/codestack/solidworks-api/troubleshooting/macros/windows-api-functions-incorrect-use/in-process-invoking
+
+================================================================================
+FIM
+================================================================================
